@@ -1,0 +1,22 @@
+// Outline Card
+.v-card--variant-outlined {
+  border-color: rgba(var(--v-theme-borderLight), 0.36);
+  .v-divider {
+    border-color: rgba(var(--v-theme-borderLight), 0.36);
+  }
+}
+
+.v-card-text {
+  padding: $card-text-spacer;
+}
+
+.v-card {
+  width: 100%;
+  overflow: visible;
+  border: 1px solid rgba(var(--v-theme-borderLight), 0.5);
+  box-shadow: 0 8px 20px rgba(20, 34, 61, 0.05) !important;
+}
+
+.v-card-item {
+  padding: $card-item-spacer-xy;
+}

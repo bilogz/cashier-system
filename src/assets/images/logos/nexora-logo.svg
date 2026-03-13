@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 220" role="img" aria-labelledby="title desc">
+  <title id="title">Nexora Medical Center Logo</title>
+  <desc id="desc">Nexora Medical Center logo with blue medical shield icon and brand text.</desc>
+  <defs>
+    <linearGradient id="shieldBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#39d2ff"/>
+      <stop offset="48%" stop-color="#0e8cf7"/>
+      <stop offset="100%" stop-color="#0b3db5"/>
+    </linearGradient>
+    <linearGradient id="bandTop" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#13baff"/>
+      <stop offset="100%" stop-color="#9be8ff"/>
+    </linearGradient>
+    <linearGradient id="bandBottom" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#0e57d8"/>
+      <stop offset="100%" stop-color="#1aa9ff"/>
+    </linearGradient>
+    <linearGradient id="wordGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#8ee8ff"/>
+      <stop offset="52%" stop-color="#23bcff"/>
+      <stop offset="100%" stop-color="#1167f8"/>
+    </linearGradient>
+  </defs>
+
+  <g transform="translate(14,20) scale(0.34)">
+    <path fill="url(#shieldBg)" d="M256 24L426 86v149c0 58-18 110-52 154-30 38-71 70-118 93-47-23-88-55-118-93-34-44-52-96-52-154V86L256 24z"/>
+    <path fill="#06298d" d="M124 126c30-13 81-30 132-30 60 0 107 24 132 43-8 51-47 106-160 106-69 0-111-20-133-42 3-30 9-56 29-77z"/>
+    <path fill="url(#bandTop)" d="M88 226c53 29 130 43 208 35 54-6 103-25 130-47-6 20-17 39-31 56-31 19-72 33-116 38-81 11-156-11-205-57-2-8-4-17-4-25z"/>
+    <path fill="url(#bandBottom)" d="M104 324c43 27 103 40 165 34 50-5 96-23 129-47-25 44-66 83-115 109-80-6-150-38-190-86 3-4 7-7 11-10z"/>
+    <path fill="#ffffff" d="M235 150h42v42h42v42h-42v42h-42v-42h-42v-42h42z"/>
+  </g>
+
+  <text x="220" y="114" font-family="Poppins, Arial, sans-serif" font-size="102" font-weight="700" fill="url(#wordGrad)">Nexora</text>
+  <text x="221" y="170" font-family="Poppins, Arial, sans-serif" font-size="50" font-weight="700" letter-spacing="7" fill="#eaf6ff">MEDICAL CENTER</text>
+</svg>

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 240" role="img" aria-labelledby="title desc">
+  <title id="title">Bestlink College of the Philippines Shield</title>
+  <desc id="desc">Blue shield logo with red border and circular college mark.</desc>
+
+  <defs>
+    <linearGradient id="innerBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1fa7ff"/>
+      <stop offset="100%" stop-color="#0f85e0"/>
+    </linearGradient>
+    <path id="ringPathTop" d="M 39 84 A 61 61 0 0 1 161 84" />
+    <path id="ringPathBottom" d="M 161 84 A 61 61 0 0 1 39 84" />
+  </defs>
+
+  <path d="M100 230c-29-20-48-37-62-57-14-20-21-44-21-72V8h166v93c0 28-7 52-21 72-14 20-33 37-62 57z" fill="#ef2b2d"/>
+  <path d="M100 222c-28-19-45-35-58-54-13-18-19-40-19-67V16h154v85c0 27-6 49-19 67-13 19-30 35-58 54z" fill="#12317f"/>
+  <path d="M100 214c-24-16-40-31-51-47-11-16-16-36-16-60V22h134v85c0 24-5 44-16 60-11 16-27 31-51 47z" fill="url(#innerBlue)"/>
+
+  <circle cx="100" cy="84" r="61" fill="#163b8f"/>
+  <circle cx="100" cy="84" r="50" fill="#0f95eb"/>
+  <circle cx="100" cy="84" r="22" fill="#2a2f9b"/>
+  <circle cx="100" cy="84" r="18" fill="none" stroke="#ffffff" stroke-width="2"/>
+  <ellipse cx="100" cy="84" rx="47" ry="15" transform="rotate(-24 100 84)" fill="none" stroke="#ffffff" stroke-width="4"/>
+  <ellipse cx="100" cy="84" rx="44" ry="11" transform="rotate(24 100 84)" fill="none" stroke="#ef2b2d" stroke-width="5"/>
+  <circle cx="73" cy="91" r="4.5" fill="#ef2b2d" stroke="#ffffff" stroke-width="1.5"/>
+
+  <text font-family="Poppins, Arial, sans-serif" font-size="9" font-weight="700" fill="#ffffff" letter-spacing="1">
+    <textPath href="#ringPathTop" startOffset="50%" text-anchor="middle">BESTLINK COLLEGE OF</textPath>
+  </text>
+  <text font-family="Poppins, Arial, sans-serif" font-size="9" font-weight="700" fill="#ffffff" letter-spacing="1">
+    <textPath href="#ringPathBottom" startOffset="50%" text-anchor="middle">THE PHILIPPINES</textPath>
+  </text>
+
+  <polygon points="150,16 179,16 179,44" fill="#ffffff"/>
+  <text x="169" y="32" font-family="Poppins, Arial, sans-serif" font-size="11" font-weight="700" fill="#12317f" transform="rotate(35 169 32)">
+    2002
+  </text>
+</svg>

@@ -1,0 +1,41 @@
+//
+// Light Buttons
+//
+
+.v-btn {
+  &.bg-lightsecondary {
+    &:hover,
+    &:active,
+    &:focus {
+      background-color: rgb(var(--v-theme-secondary)) !important;
+      color: $white !important;
+    }
+  }
+}
+
+.v-btn {
+  text-transform: capitalize;
+  letter-spacing: $btn-letter-spacing;
+}
+
+.v-btn:not(.v-btn--icon) {
+  padding-inline: 16px;
+}
+
+.v-btn .v-btn__content {
+  gap: 6px;
+}
+
+.v-card-actions .v-btn + .v-btn {
+  margin-inline-start: 8px;
+}
+
+.v-btn-group .v-btn + .v-btn,
+.d-flex.flex-wrap .v-btn + .v-btn {
+  margin-inline-start: 8px;
+}
+
+.v-btn--icon.v-btn--density-default {
+  width: calc(var(--v-btn-height) + 6px);
+  height: calc(var(--v-btn-height) + 6px);
+}
