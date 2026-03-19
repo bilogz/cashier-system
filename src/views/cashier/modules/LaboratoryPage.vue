@@ -11,6 +11,7 @@ import {
   rejectLabRequest,
   releaseLabReport,
   saveLabResults,
+  syncLabRequestToCashier,
   startLabProcessing,
   type LabActivityLog,
   type LabPriority,
@@ -174,7 +175,7 @@ const rejectForm = reactive({
   resampleFlag: false
 });
 
-const pendingAction = ref<'none' | 'start' | 'save_processing' | 'save_draft' | 'finalize' | 'release'>('none');
+const pendingAction = ref<'none' | 'start' | 'save_processing' | 'save_draft' | 'finalize' | 'release' | 'cashier_sync'>('none');
 let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
 let lastAutosaveSignature = '';
 const autosaveInFlight = ref(false);
@@ -362,6 +363,13 @@ const canStartProcessing = computed(() => activeWorkflow.value?.status === 'Pend
 const canFinalize = computed(() => activeWorkflow.value?.status === 'In Progress' || activeWorkflow.value?.status === 'Result Ready');
 const canRelease = computed(() => activeWorkflow.value?.status === 'Result Ready');
 const canExport = computed(() => activeWorkflow.value?.status === 'Result Ready' || activeWorkflow.value?.status === 'Completed');
+const canSendToCashier = computed(() => {
+  const record = activeWorkflow.value;
+  if (!record) return false;
+  if (!canProcessWorkflow.value) return false;
+  if (record.status === 'Cancelled') return false;
+  return Boolean((record.billingReference || '').trim());
+});
 
 onMounted(async () => {
   await loadQueue();
@@ -1475,6 +1483,56 @@ async function onStartProcessing(): Promise<void> {
   showToast('Request moved to In Progress.', 'success');
 }
 
+async function onSendToCashier(): Promise<void> {
+  const record = activeWorkflow.value;
+  if (!record) return;
+  if (!canSendToCashier.value) {
+    showToast('A billing reference is required before this request can be sent to Cashier.', 'warning');
+    return;
+  }
+
+  const confirmed = await requestConfirmModal({
+    title: 'Send To Cashier',
+    message: `Create or sync cashier billing ${record.billingReference} for ${record.patientName}? This will place the record in Student Portal & Billing with an outstanding balance.`,
+    confirmText: 'Send',
+    cancelText: 'Cancel',
+    tone: 'primary'
+  });
+
+  if (!confirmed) return;
+
+  workflowBusy.value = true;
+  pendingAction.value = 'cashier_sync';
+
+  try {
+    const response = await syncLabRequestToCashier({
+      requestId: record.requestId,
+      visitId: record.visitId,
+      patientId: record.patientId,
+      patientName: record.patientName,
+      category: record.category,
+      tests: record.tests,
+      requestedByDoctor: record.requestedByDoctor,
+      billingReference: record.billingReference
+    });
+
+    const current = workflowCache[record.requestId] || record;
+    appendActivity(
+      current,
+      'Forwarded To Cashier',
+      `${response.billingCode} is now ready in Student Portal & Billing with an active outstanding balance.`
+    );
+    updateWorkflowAndQueue(current);
+    markWorkflowAsSynced(current);
+    showToast(response.message || `${response.billingCode} was sent to Cashier.`, 'success');
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : 'Unable to send laboratory billing to Cashier.', 'error');
+  } finally {
+    pendingAction.value = 'none';
+    workflowBusy.value = false;
+  }
+}
+
 function setEncodeFieldValue(key: string, value: unknown): void {
   encodeForm[key] = value == null ? '' : String(value);
   if (encodeErrors[key]) {
@@ -2150,7 +2208,6 @@ function formatAutosavedAt(value: string | null): string {
           <v-card-title>Laboratory Queue</v-card-title>
           <template #append>
             <div class="d-flex align-center ga-2 flex-wrap">
-              <v-btn class="saas-btn saas-btn-ghost" prepend-icon="mdi-refresh" :loading="queueLoading" @click="refreshQueueNow">Refresh</v-btn>
               <v-btn class="saas-btn saas-btn-light" prepend-icon="mdi-plus" :disabled="!canCreateRequest" @click="openCreateRequestDialog">New Lab Request</v-btn>
             </div>
           </template>
@@ -2292,7 +2349,17 @@ function formatAutosavedAt(value: string | null): string {
                           <v-col cols="12"><v-textarea :model-value="activeWorkflow.clinicalDiagnosis || activeWorkflow.notes" label="Clinical Notes / Diagnosis" variant="outlined" density="comfortable" rows="3" readonly /></v-col>
                           <v-col cols="12"><v-textarea :model-value="activeWorkflow.labInstructions" label="Lab Instructions" variant="outlined" density="comfortable" rows="2" readonly /></v-col>
                         </v-row>
-                        <div class="d-flex justify-end mt-4"><v-btn class="saas-btn saas-btn-primary" :loading="workflowBusy && pendingAction === 'start'" :disabled="!canStartProcessing || workflowBusy" @click="onStartProcessing">Start Processing</v-btn></div>
+                        <div class="d-flex justify-end mt-4 ga-2 flex-wrap">
+                          <v-btn
+                            class="saas-btn saas-btn-light"
+                            :loading="workflowBusy && pendingAction === 'cashier_sync'"
+                            :disabled="workflowBusy || !canSendToCashier"
+                            @click="onSendToCashier"
+                          >
+                            Send To Cashier
+                          </v-btn>
+                          <v-btn class="saas-btn saas-btn-primary" :loading="workflowBusy && pendingAction === 'start'" :disabled="!canStartProcessing || workflowBusy" @click="onStartProcessing">Start Processing</v-btn>
+                        </div>
                       </v-window-item>
 
                       <v-window-item value="processing">

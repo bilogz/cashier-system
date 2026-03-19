@@ -2,7 +2,7 @@ import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
-import mysql from 'mysql2/promise';
+import { createDbPool } from './db.mjs';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
 
@@ -21,16 +21,7 @@ const sessionTtlMs = 1000 * 60 * 60 * 12;
 const sessions = new Map();
 const studentSessions = new Map();
 
-const pool = mysql.createPool({
-  host: process.env.MYSQL_HOST || '127.0.0.1',
-  port: Number(process.env.MYSQL_PORT || 3306),
-  user: process.env.MYSQL_USER || 'root',
-  password: process.env.MYSQL_PASSWORD || '',
-  database: process.env.MYSQL_DATABASE || 'cashier_system',
-  waitForConnections: true,
-  connectionLimit: 10,
-  namedPlaceholders: true
-});
+const pool = createDbPool();
 
 app.use(
   cors({
@@ -238,9 +229,9 @@ function toStudentPortalUser(row) {
 
 async function insertActivityLog(userId, action, description, ipAddress = '127.0.0.1', rawActionOverride = null) {
   await pool.query(
-    `INSERT INTO admin_activity_logs (user_id, action, raw_action, description, ip_address, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [userId, action, rawActionOverride || action.toUpperCase().replace(/\s+/g, '_'), description, ipAddress, nowSql()]
+    `INSERT INTO admin_activity_logs (user_id, username, action, raw_action, description, ip_address, created_at)
+     VALUES (?, COALESCE((SELECT username FROM admin_users WHERE id = ?), 'system'), ?, ?, ?, ?, ?)`,
+    [userId, userId, action, rawActionOverride || action.toUpperCase().replace(/\s+/g, '_'), description, ipAddress, nowSql()]
   );
 }
 
@@ -251,15 +242,15 @@ async function seedActivityLog(userId, action, rawAction, description, createdAt
     .replace('T', ' ');
 
   await pool.query(
-    `INSERT INTO admin_activity_logs (user_id, action, raw_action, description, ip_address, created_at)
-     SELECT ?, ?, ?, ?, '127.0.0.1', ?
+    `INSERT INTO admin_activity_logs (user_id, username, action, raw_action, description, ip_address, created_at)
+     SELECT ?, COALESCE((SELECT username FROM admin_users WHERE id = ?), 'system'), ?, ?, ?, '127.0.0.1', ?
      WHERE NOT EXISTS (
        SELECT 1
        FROM admin_activity_logs
        WHERE raw_action = ?
          AND description = ?
      )`,
-    [userId, action, rawAction, description, createdAt, rawAction, description]
+    [userId, userId, action, rawAction, description, createdAt, rawAction, description]
   );
 }
 
@@ -567,51 +558,53 @@ function extractEntityKey(description) {
 async function ensureSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS admin_users (
-      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id BIGSERIAL PRIMARY KEY,
       username VARCHAR(190) NOT NULL UNIQUE,
       email VARCHAR(190) NOT NULL,
       full_name VARCHAR(190) NOT NULL,
       role VARCHAR(120) NOT NULL DEFAULT 'Cashier Admin',
       department VARCHAR(120) DEFAULT 'Cashier',
-      access_exemptions_json JSON NOT NULL,
-      is_super_admin TINYINT(1) NOT NULL DEFAULT 0,
+      access_exemptions_json JSONB NOT NULL,
+      is_super_admin SMALLINT NOT NULL DEFAULT 0,
       password_hash VARCHAR(255) NOT NULL,
       status VARCHAR(20) NOT NULL DEFAULT 'active',
       phone VARCHAR(60) DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      last_login_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_login_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
-  await pool.query(`ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS access_exemptions_json JSON NULL`);
-  await pool.query(`ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS is_super_admin TINYINT(1) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS access_exemptions_json JSONB NULL`);
+  await pool.query(`ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS is_super_admin SMALLINT NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS phone VARCHAR(60) NULL`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS admin_profile_preferences (
       user_id INT NOT NULL PRIMARY KEY,
-      email_notifications TINYINT(1) NOT NULL DEFAULT 1,
-      in_app_notifications TINYINT(1) NOT NULL DEFAULT 1,
-      dark_mode TINYINT(1) NOT NULL DEFAULT 0,
-      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      email_notifications SMALLINT NOT NULL DEFAULT 1,
+      in_app_notifications SMALLINT NOT NULL DEFAULT 1,
+      dark_mode SMALLINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS admin_activity_logs (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       user_id INT NOT NULL,
       action VARCHAR(100) NOT NULL,
       raw_action VARCHAR(100) NOT NULL,
       description TEXT NOT NULL,
       ip_address VARCHAR(80) NOT NULL DEFAULT '127.0.0.1',
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  await pool.query(`ALTER TABLE admin_activity_logs ADD COLUMN IF NOT EXISTS user_id INT NULL`);
+  await pool.query(`ALTER TABLE admin_activity_logs ADD COLUMN IF NOT EXISTS username VARCHAR(190) NULL`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS students (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       student_no VARCHAR(50) NOT NULL UNIQUE,
       full_name VARCHAR(150) NOT NULL,
       course VARCHAR(100) DEFAULT NULL,
@@ -619,24 +612,24 @@ async function ensureSchema() {
       email VARCHAR(150) DEFAULT NULL,
       phone VARCHAR(30) DEFAULT NULL,
       status VARCHAR(20) NOT NULL DEFAULT 'active',
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS student_accounts (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       student_id INT NOT NULL UNIQUE,
       username VARCHAR(190) NOT NULL UNIQUE,
       password_hash VARCHAR(255) NOT NULL,
       status VARCHAR(20) NOT NULL DEFAULT 'active',
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS billing_records (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       student_id INT NOT NULL,
       billing_code VARCHAR(50) NOT NULL UNIQUE,
       semester VARCHAR(50) NOT NULL,
@@ -646,38 +639,38 @@ async function ensureSchema() {
       balance_amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
       billing_status VARCHAR(30) NOT NULL DEFAULT 'unpaid',
       workflow_stage VARCHAR(60) NOT NULL DEFAULT 'student_portal_billing',
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS billing_items (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       billing_id INT NOT NULL,
       item_code VARCHAR(60) DEFAULT NULL,
       item_name VARCHAR(190) NOT NULL,
       category VARCHAR(100) DEFAULT NULL,
       amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
       sort_order INT NOT NULL DEFAULT 1,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS fee_types (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       fee_code VARCHAR(60) NOT NULL UNIQUE,
       fee_name VARCHAR(190) NOT NULL,
       category VARCHAR(100) DEFAULT NULL,
       priority_order INT NOT NULL DEFAULT 1,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS billing_notifications (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       billing_id INT NOT NULL,
       student_id INT NOT NULL,
       notification_type VARCHAR(50) NOT NULL DEFAULT 'billing_reminder',
@@ -687,29 +680,29 @@ async function ensureSchema() {
       recipient_email VARCHAR(150) DEFAULT NULL,
       status VARCHAR(30) NOT NULL DEFAULT 'sent',
       created_by INT DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payment_attempts (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       payment_id INT DEFAULT NULL,
       billing_id INT NOT NULL,
       reference_number VARCHAR(60) DEFAULT NULL,
       gateway_name VARCHAR(120) NOT NULL DEFAULT 'Mock Gateway',
       attempt_status VARCHAR(40) NOT NULL DEFAULT 'processing',
-      request_payload_json JSON DEFAULT NULL,
-      response_payload_json JSON DEFAULT NULL,
+      request_payload_json JSONB DEFAULT NULL,
+      response_payload_json JSONB DEFAULT NULL,
       remarks TEXT DEFAULT NULL,
       created_by INT DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payment_transactions (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       billing_id INT NOT NULL,
       reference_number VARCHAR(50) NOT NULL UNIQUE,
       amount_paid DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
@@ -717,15 +710,15 @@ async function ensureSchema() {
       payment_status VARCHAR(30) NOT NULL DEFAULT 'pending',
       reporting_status VARCHAR(30) NOT NULL DEFAULT 'logged',
       workflow_stage VARCHAR(60) NOT NULL DEFAULT 'payment_processing_gateway',
-      payment_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      payment_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       processed_by INT DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payment_allocations (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       payment_id INT NOT NULL,
       billing_id INT NOT NULL,
       billing_item_id INT NOT NULL,
@@ -733,69 +726,69 @@ async function ensureSchema() {
       allocation_order INT NOT NULL DEFAULT 1,
       allocation_status VARCHAR(30) NOT NULL DEFAULT 'active',
       remarks TEXT DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS receipt_records (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       payment_id INT NOT NULL,
       receipt_number VARCHAR(50) NOT NULL UNIQUE,
-      issued_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      issued_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       receipt_status VARCHAR(30) NOT NULL DEFAULT 'queued',
       workflow_stage VARCHAR(60) NOT NULL DEFAULT 'compliance_documentation',
       remarks VARCHAR(255) DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS receipt_items (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       receipt_id INT NOT NULL,
       billing_item_id INT NOT NULL,
       fee_type VARCHAR(190) NOT NULL,
       allocated_amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS proof_documents (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       receipt_id INT NOT NULL,
       payment_id INT NOT NULL,
       document_type VARCHAR(60) NOT NULL DEFAULT 'proof_of_payment',
       file_name VARCHAR(190) DEFAULT NULL,
       status VARCHAR(30) NOT NULL DEFAULT 'pending',
       verified_by INT DEFAULT NULL,
-      verified_at DATETIME DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      verified_at TIMESTAMP DEFAULT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS reconciliations (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       payment_id INT NOT NULL UNIQUE,
       receipt_id INT DEFAULT NULL,
       status VARCHAR(30) NOT NULL DEFAULT 'pending_review',
       workflow_stage VARCHAR(60) NOT NULL DEFAULT 'reporting_reconciliation',
       discrepancy_note TEXT DEFAULT NULL,
       reconciled_by INT DEFAULT NULL,
-      reconciled_at DATETIME DEFAULT NULL,
-      reported_at DATETIME DEFAULT NULL,
-      archived_at DATETIME DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      reconciled_at TIMESTAMP DEFAULT NULL,
+      reported_at TIMESTAMP DEFAULT NULL,
+      archived_at TIMESTAMP DEFAULT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS notifications (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       recipient_role VARCHAR(60) NOT NULL DEFAULT 'cashier',
       recipient_name VARCHAR(190) DEFAULT NULL,
       channel VARCHAR(40) NOT NULL DEFAULT 'in_app',
@@ -804,15 +797,15 @@ async function ensureSchema() {
       message TEXT NOT NULL,
       entity_type VARCHAR(60) DEFAULT NULL,
       entity_id INT DEFAULT NULL,
-      is_read TINYINT(1) NOT NULL DEFAULT 0,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      read_at DATETIME DEFAULT NULL
+      is_read SMALLINT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      read_at TIMESTAMP DEFAULT NULL
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS audit_logs (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       actor_user_id INT DEFAULT NULL,
       actor_name VARCHAR(190) DEFAULT NULL,
       actor_role VARCHAR(120) DEFAULT NULL,
@@ -825,13 +818,13 @@ async function ensureSchema() {
       before_stage VARCHAR(60) DEFAULT NULL,
       after_stage VARCHAR(60) DEFAULT NULL,
       remarks TEXT DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS auto_debit_arrangements (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       billing_id INT NOT NULL,
       account_name VARCHAR(190) NOT NULL,
       bank_name VARCHAR(190) DEFAULT NULL,
@@ -839,13 +832,13 @@ async function ensureSchema() {
       frequency VARCHAR(40) NOT NULL DEFAULT 'monthly',
       status VARCHAR(30) NOT NULL DEFAULT 'active',
       created_by INT DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS installments (
-      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       billing_id INT NOT NULL,
       payment_id INT DEFAULT NULL,
       installment_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
@@ -855,8 +848,8 @@ async function ensureSchema() {
       status VARCHAR(30) NOT NULL DEFAULT 'active',
       created_by INT DEFAULT NULL,
       updated_by INT DEFAULT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
@@ -866,16 +859,16 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS correction_notes TEXT NULL`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS previous_workflow_stage VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS action_by INT NULL`);
-  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS action_at DATETIME NULL`);
+  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS action_at TIMESTAMP NULL`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS remarks TEXT NULL`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS audit_reference VARCHAR(120) NULL`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS returned_from VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS returned_to VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS returned_by INT NULL`);
-  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS returned_at DATETIME NULL`);
-  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS is_returned TINYINT(1) NOT NULL DEFAULT 0`);
-  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS needs_correction TINYINT(1) NOT NULL DEFAULT 0`);
-  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS is_completed TINYINT(1) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS returned_at TIMESTAMP NULL`);
+  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS is_returned SMALLINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS needs_correction SMALLINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS is_completed SMALLINT NOT NULL DEFAULT 0`);
   await pool.query(
     `ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(60) NOT NULL DEFAULT 'payment_processing_gateway'`
   );
@@ -883,16 +876,16 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS correction_notes TEXT NULL`);
   await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS previous_workflow_stage VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS action_by INT NULL`);
-  await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS action_at DATETIME NULL`);
+  await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS action_at TIMESTAMP NULL`);
   await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS remarks TEXT NULL`);
   await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS audit_reference VARCHAR(120) NULL`);
   await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS returned_from VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS returned_to VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS returned_by INT NULL`);
-  await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS returned_at DATETIME NULL`);
-  await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS is_returned TINYINT(1) NOT NULL DEFAULT 0`);
-  await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS needs_correction TINYINT(1) NOT NULL DEFAULT 0`);
-  await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS is_completed TINYINT(1) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS returned_at TIMESTAMP NULL`);
+  await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS is_returned SMALLINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS needs_correction SMALLINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS is_completed SMALLINT NOT NULL DEFAULT 0`);
   await pool.query(
     `ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(60) NOT NULL DEFAULT 'compliance_documentation'`
   );
@@ -900,15 +893,15 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS correction_notes TEXT NULL`);
   await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS previous_workflow_stage VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS action_by INT NULL`);
-  await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS action_at DATETIME NULL`);
+  await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS action_at TIMESTAMP NULL`);
   await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS audit_reference VARCHAR(120) NULL`);
   await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS returned_from VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS returned_to VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS returned_by INT NULL`);
-  await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS returned_at DATETIME NULL`);
-  await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS is_returned TINYINT(1) NOT NULL DEFAULT 0`);
-  await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS needs_correction TINYINT(1) NOT NULL DEFAULT 0`);
-  await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS is_completed TINYINT(1) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS returned_at TIMESTAMP NULL`);
+  await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS is_returned SMALLINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS needs_correction SMALLINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS is_completed SMALLINT NOT NULL DEFAULT 0`);
   await pool.query(
     `ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(60) NOT NULL DEFAULT 'reporting_reconciliation'`
   );
@@ -916,15 +909,15 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS correction_notes TEXT NULL`);
   await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS previous_workflow_stage VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS action_by INT NULL`);
-  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS action_at DATETIME NULL`);
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS action_at TIMESTAMP NULL`);
   await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS audit_reference VARCHAR(120) NULL`);
   await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS returned_from VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS returned_to VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS returned_by INT NULL`);
-  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS returned_at DATETIME NULL`);
-  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS is_returned TINYINT(1) NOT NULL DEFAULT 0`);
-  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS needs_correction TINYINT(1) NOT NULL DEFAULT 0`);
-  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS is_completed TINYINT(1) NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS returned_at TIMESTAMP NULL`);
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS is_returned SMALLINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS needs_correction SMALLINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS is_completed SMALLINT NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS before_stage VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS after_stage VARCHAR(60) NULL`);
   await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS remarks VARCHAR(255) NULL`);
@@ -939,7 +932,7 @@ async function ensureSchema() {
       username, email, full_name, role, department, access_exemptions_json, is_super_admin, password_hash, status, phone
     )
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE username = username`,
+    ON CONFLICT (username) DO NOTHING`,
     [
       defaultUsername,
       defaultUsername,
@@ -967,7 +960,7 @@ async function ensureSchema() {
   await pool.query(
     `INSERT INTO admin_profile_preferences (user_id, email_notifications, in_app_notifications, dark_mode)
      VALUES (?, 1, 1, 0)
-     ON DUPLICATE KEY UPDATE user_id = user_id`,
+     ON CONFLICT (user_id) DO NOTHING`,
     [seededAdmin.id]
   );
 
@@ -975,12 +968,12 @@ async function ensureSchema() {
     `INSERT INTO admin_users (
       username, email, full_name, role, department, access_exemptions_json, is_super_admin, password_hash, status, phone
     ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'active', ?)
-    ON DUPLICATE KEY UPDATE
-      full_name = VALUES(full_name),
-      role = VALUES(role),
-      department = VALUES(department),
-      access_exemptions_json = VALUES(access_exemptions_json),
-      phone = VALUES(phone)`,
+    ON CONFLICT (username) DO UPDATE SET
+      full_name = EXCLUDED.full_name,
+      role = EXCLUDED.role,
+      department = EXCLUDED.department,
+      access_exemptions_json = EXCLUDED.access_exemptions_json,
+      phone = EXCLUDED.phone`,
     [
       'staff@cashier.local',
       'staff@cashier.local',
@@ -997,12 +990,12 @@ async function ensureSchema() {
     `INSERT INTO admin_users (
       username, email, full_name, role, department, access_exemptions_json, is_super_admin, password_hash, status, phone
     ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'active', ?)
-    ON DUPLICATE KEY UPDATE
-      full_name = VALUES(full_name),
-      role = VALUES(role),
-      department = VALUES(department),
-      access_exemptions_json = VALUES(access_exemptions_json),
-      phone = VALUES(phone)`,
+    ON CONFLICT (username) DO UPDATE SET
+      full_name = EXCLUDED.full_name,
+      role = EXCLUDED.role,
+      department = EXCLUDED.department,
+      access_exemptions_json = EXCLUDED.access_exemptions_json,
+      phone = EXCLUDED.phone`,
     [
       'compliance@cashier.local',
       'compliance@cashier.local',
@@ -1062,8 +1055,10 @@ async function ensureSchema() {
        ('2024-0005', 'Trisha Mendoza', 'BS Accountancy', '4th Year', 'trisha@gmail.com', '09170000003', 'active'),
        ('2024-0006', 'Carlo Reyes', 'BS Computer Science', '1st Year', 'carlo@gmail.com', '09170000004', 'active'),
        ('2024-0007', 'Liza Garcia', 'BS Hospitality Management', '2nd Year', 'liza@gmail.com', '09170000005', 'active'),
-       ('2024-0008', 'Ethan Flores', 'BS Office Administration', '3rd Year', 'ethan@gmail.com', '09170000006', 'active')
-     ON DUPLICATE KEY UPDATE student_no = student_no`
+       ('2024-0008', 'Ethan Flores', 'BS Office Administration', '3rd Year', 'ethan@gmail.com', '09170000006', 'active'),
+       ('2024-0091', 'Clara Verify Search', 'BS Information Systems', '2nd Year', 'clara.verify@example.com', '09170000091', 'active'),
+       ('2024-0092', 'Noah Billing Finder', 'BS Accountancy', '1st Year', 'noah.finder@example.com', '09170000092', 'active')
+     ON CONFLICT (student_no) DO NOTHING`
   );
 
   const defaultStudentPassword = process.env.SEED_STUDENT_PASSWORD || 'student123';
@@ -1114,6 +1109,26 @@ async function ensureSchema() {
     WHERE student_no = '2024-0008'
       AND NOT EXISTS (SELECT 1 FROM billing_records WHERE billing_code = 'BILL-1008')`
   );
+  await pool.query(
+    `INSERT INTO billing_records (
+      student_id, billing_code, semester, school_year, total_amount, paid_amount, balance_amount, billing_status, workflow_stage, created_at, updated_at
+    )
+    SELECT id, 'BILL-VERIFY-2001', '2nd Semester', '2025-2026', 13250.00, 0.00, 13250.00, 'pending_payment', ?, NOW(), NOW()
+    FROM students
+    WHERE student_no = '2024-0091'
+      AND NOT EXISTS (SELECT 1 FROM billing_records WHERE billing_code = 'BILL-VERIFY-2001')`,
+    [WORKFLOW_STAGES.STUDENT_PORTAL_BILLING]
+  );
+  await pool.query(
+    `INSERT INTO billing_records (
+      student_id, billing_code, semester, school_year, total_amount, paid_amount, balance_amount, billing_status, workflow_stage, created_at, updated_at
+    )
+    SELECT id, 'BILL-VERIFY-2002', '2nd Semester', '2025-2026', 9875.00, 0.00, 9875.00, 'pending_payment', ?, NOW(), NOW()
+    FROM students
+    WHERE student_no = '2024-0092'
+      AND NOT EXISTS (SELECT 1 FROM billing_records WHERE billing_code = 'BILL-VERIFY-2002')`,
+    [WORKFLOW_STAGES.STUDENT_PORTAL_BILLING]
+  );
 
   const [[billingItemCountRow]] = await pool.query('SELECT COUNT(*) AS total FROM billing_items');
   if (Number(billingItemCountRow?.total || 0) === 0) {
@@ -1148,10 +1163,10 @@ async function ensureSchema() {
        ('REGISTRATION', 'Registration Fee', 'Services', 8, ?),
        ('ID', 'ID Fee', 'Services', 9, ?),
        ('OTHER', 'Other School Fee', 'Others', 10, ?)
-     ON DUPLICATE KEY UPDATE
-       fee_name = VALUES(fee_name),
-       category = VALUES(category),
-       priority_order = VALUES(priority_order)`,
+     ON CONFLICT (fee_code) DO UPDATE SET
+       fee_name = EXCLUDED.fee_name,
+       category = EXCLUDED.category,
+       priority_order = EXCLUDED.priority_order`,
     [nowSql(), nowSql(), nowSql(), nowSql(), nowSql(), nowSql(), nowSql(), nowSql(), nowSql(), nowSql()]
   );
 
@@ -1921,7 +1936,7 @@ async function fetchReceiptRows() {
         b.billing_code,
         s.full_name,
         COALESCE(r.id, 0) AS receipt_id,
-        COALESCE(r.receipt_number, CONCAT('OR-', DATE_FORMAT(CURRENT_DATE(), '%Y'), '-', LPAD(p.id, 4, '0'))) AS receipt_number,
+        COALESCE(r.receipt_number, CONCAT('OR-', to_char(CURRENT_DATE, 'YYYY'), '-', LPAD(p.id::text, 4, '0'))) AS receipt_number,
         COALESCE(r.receipt_status, CASE WHEN p.payment_status IN ('posted', 'paid') THEN 'ready' ELSE 'queued' END) AS receipt_status,
         COALESCE(r.workflow_stage, 'compliance_documentation') AS workflow_stage,
         COALESCE(r.issued_date, p.payment_date) AS issued_date,
@@ -2794,21 +2809,21 @@ async function upsertReconciliationRecord(paymentId, receiptId = null, status = 
     `INSERT INTO reconciliations (
       payment_id, receipt_id, status, workflow_stage, discrepancy_note, previous_workflow_stage, action_by, action_at, audit_reference, is_completed, reconciled_by, reconciled_at, reported_at, archived_at, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      receipt_id = VALUES(receipt_id),
-      status = VALUES(status),
-      workflow_stage = VALUES(workflow_stage),
-      discrepancy_note = VALUES(discrepancy_note),
-      previous_workflow_stage = VALUES(previous_workflow_stage),
-      action_by = VALUES(action_by),
-      action_at = VALUES(action_at),
-      audit_reference = VALUES(audit_reference),
-      is_completed = VALUES(is_completed),
-      reconciled_by = VALUES(reconciled_by),
-      reconciled_at = VALUES(reconciled_at),
-      reported_at = VALUES(reported_at),
-      archived_at = VALUES(archived_at),
-      updated_at = VALUES(updated_at)`,
+    ON CONFLICT (payment_id) DO UPDATE SET
+      receipt_id = EXCLUDED.receipt_id,
+      status = EXCLUDED.status,
+      workflow_stage = EXCLUDED.workflow_stage,
+      discrepancy_note = EXCLUDED.discrepancy_note,
+      previous_workflow_stage = EXCLUDED.previous_workflow_stage,
+      action_by = EXCLUDED.action_by,
+      action_at = EXCLUDED.action_at,
+      audit_reference = EXCLUDED.audit_reference,
+      is_completed = EXCLUDED.is_completed,
+      reconciled_by = EXCLUDED.reconciled_by,
+      reconciled_at = EXCLUDED.reconciled_at,
+      reported_at = EXCLUDED.reported_at,
+      archived_at = EXCLUDED.archived_at,
+      updated_at = EXCLUDED.updated_at`,
     [
       paymentId,
       receiptId,
@@ -3113,13 +3128,78 @@ async function createPaymentRequest({
 
   const referenceNumber = nextPaymentReference(billingId);
 
-  const [result] = await pool.query(
+  const [insertedRows] = await pool.query(
     `INSERT INTO payment_transactions (
       billing_id, reference_number, amount_paid, payment_method, payment_status, reporting_status, workflow_stage, payment_date, processed_by, remarks, created_at
-    ) VALUES (?, ?, ?, ?, 'processing', 'logged', ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, 'processing', 'logged', ?, ?, ?, ?, ?)
+     RETURNING id`,
     [billingId, referenceNumber, requestedAmount, paymentMethod, WORKFLOW_STAGES.PAYMENT_PROCESSING_GATEWAY, nowSql(), actorUser?.id || null, remarks || null, nowSql()]
   );
-  const paymentId = Number(result.insertId);
+  const paymentId = Number(insertedRows[0]?.id);
+  if (!paymentId) {
+    throw new Error('Unable to create payment transaction.');
+  }
+
+  await pool.query(
+    `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+     SELECT b.id, 'TUITION', 'Tuition Fee', 'Tuition', 8900.00, 1, ?
+     FROM billing_records b
+     WHERE b.billing_code = 'BILL-VERIFY-2001'
+       AND NOT EXISTS (
+         SELECT 1 FROM billing_items bi WHERE bi.billing_id = b.id AND bi.item_code = 'TUITION'
+       )`,
+    [nowSql()]
+  );
+  await pool.query(
+    `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+     SELECT b.id, 'LAB', 'Laboratory Fee', 'Laboratory', 2450.00, 2, ?
+     FROM billing_records b
+     WHERE b.billing_code = 'BILL-VERIFY-2001'
+       AND NOT EXISTS (
+         SELECT 1 FROM billing_items bi WHERE bi.billing_id = b.id AND bi.item_code = 'LAB'
+       )`,
+    [nowSql()]
+  );
+  await pool.query(
+    `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+     SELECT b.id, 'MISC', 'Miscellaneous Fee', 'Assessment', 1900.00, 3, ?
+     FROM billing_records b
+     WHERE b.billing_code = 'BILL-VERIFY-2001'
+       AND NOT EXISTS (
+         SELECT 1 FROM billing_items bi WHERE bi.billing_id = b.id AND bi.item_code = 'MISC'
+       )`,
+    [nowSql()]
+  );
+  await pool.query(
+    `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+     SELECT b.id, 'TUITION', 'Tuition Fee', 'Tuition', 6400.00, 1, ?
+     FROM billing_records b
+     WHERE b.billing_code = 'BILL-VERIFY-2002'
+       AND NOT EXISTS (
+         SELECT 1 FROM billing_items bi WHERE bi.billing_id = b.id AND bi.item_code = 'TUITION'
+       )`,
+    [nowSql()]
+  );
+  await pool.query(
+    `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+     SELECT b.id, 'REGISTRATION', 'Registration Fee', 'Services', 1475.00, 2, ?
+     FROM billing_records b
+     WHERE b.billing_code = 'BILL-VERIFY-2002'
+       AND NOT EXISTS (
+         SELECT 1 FROM billing_items bi WHERE bi.billing_id = b.id AND bi.item_code = 'REGISTRATION'
+       )`,
+    [nowSql()]
+  );
+  await pool.query(
+    `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+     SELECT b.id, 'FOUNDATION', 'Foundation Fee', 'Institutional', 2000.00, 3, ?
+     FROM billing_records b
+     WHERE b.billing_code = 'BILL-VERIFY-2002'
+       AND NOT EXISTS (
+         SELECT 1 FROM billing_items bi WHERE bi.billing_id = b.id AND bi.item_code = 'FOUNDATION'
+       )`,
+    [nowSql()]
+  );
 
   await createPaymentAllocations({
     paymentId,
@@ -3305,11 +3385,11 @@ async function executeGatewayAction({ paymentId, action, actorUser, ipAddress = 
     await pool.query(
       `INSERT INTO receipt_records (payment_id, receipt_number, issued_date, receipt_status, workflow_stage, remarks, created_at)
        VALUES (?, ?, ?, 'queued', ?, 'Receipt is pending generation after successful payment.', ?)
-       ON DUPLICATE KEY UPDATE
-         issued_date = VALUES(issued_date),
-         workflow_stage = VALUES(workflow_stage),
+       ON CONFLICT (receipt_number) DO UPDATE SET
+         issued_date = EXCLUDED.issued_date,
+         workflow_stage = EXCLUDED.workflow_stage,
          receipt_status = 'queued',
-         remarks = VALUES(remarks)`,
+         remarks = EXCLUDED.remarks`,
       [paymentId, nextReceiptNumber(paymentId), nowSql(), WORKFLOW_STAGES.COMPLIANCE_DOCUMENTATION, nowSql()]
     );
 
@@ -3476,7 +3556,7 @@ async function executeGatewayAction({ paymentId, action, actorUser, ipAddress = 
 app.get('/api/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1 AS ok');
-    sendOk(res, { status: 'ok', database: 'mysql', serverTime: new Date().toISOString() });
+    sendOk(res, { status: 'ok', database: 'supabase', serverTime: new Date().toISOString() });
   } catch (error) {
     sendError(res, 500, error instanceof Error ? error.message : 'Database connection failed.');
   }
@@ -3590,7 +3670,7 @@ app.post('/api/admin-auth', async (req, res) => {
         await pool.query(
           `INSERT INTO admin_profile_preferences (user_id, email_notifications, in_app_notifications, dark_mode)
            VALUES (?, 1, 1, 0)
-           ON DUPLICATE KEY UPDATE user_id = user_id`,
+           ON CONFLICT (user_id) DO NOTHING`,
           [created.id]
         );
       }
@@ -3750,11 +3830,11 @@ app.post('/api/admin-profile', requireAuth, async (req, res) => {
     await pool.query(
       `INSERT INTO admin_profile_preferences (user_id, email_notifications, in_app_notifications, dark_mode, updated_at)
        VALUES (?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE
-         email_notifications = VALUES(email_notifications),
-         in_app_notifications = VALUES(in_app_notifications),
-         dark_mode = VALUES(dark_mode),
-         updated_at = VALUES(updated_at)`,
+       ON CONFLICT (user_id) DO UPDATE SET
+         email_notifications = EXCLUDED.email_notifications,
+         in_app_notifications = EXCLUDED.in_app_notifications,
+         dark_mode = EXCLUDED.dark_mode,
+         updated_at = EXCLUDED.updated_at`,
       [
         user.id,
         preferences.emailNotifications ? 1 : 0,
@@ -3935,7 +4015,7 @@ app.get('/api/dashboard/charts', requireAuth, async (_req, res) => {
           COUNT(*) AS transaction_count,
           COALESCE(SUM(CASE WHEN payment_status IN ('paid', 'posted') THEN amount_paid ELSE 0 END), 0) AS paid_total
        FROM payment_transactions
-       WHERE payment_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 6 DAY)
+       WHERE payment_date >= CURRENT_DATE - INTERVAL '6 days'
        GROUP BY DATE(payment_date)
        ORDER BY payment_day ASC`
     );
@@ -4303,14 +4383,15 @@ app.post('/api/billings/:id/fee-items', requireAuth, requireRole('admin', 'cashi
       return;
     }
 
-    const [result] = await pool.query(
+    const [rows] = await pool.query(
       `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       RETURNING id`,
       [billingId, feeCode, feeName, category, amount, sortOrder, nowSql()]
     );
 
     await recalculateBillingFinancials(billingId);
-    sendOk(res, { id: Number(result.insertId) }, 'Billing fee item added successfully.');
+    sendOk(res, { id: Number(rows[0]?.id) }, 'Billing fee item added successfully.');
   } catch (error) {
     sendError(res, 500, error instanceof Error ? error.message : 'Unable to add billing fee item.');
   }
@@ -4390,14 +4471,19 @@ app.post('/api/billings', requireAuth, requireRole('admin', 'cashier'), async (r
     const initialStatus = ['draft', 'unpaid', 'correction'].includes(requestedStatus) ? requestedStatus : 'draft';
     const initialStage = resolveBillingWorkflowStage(initialStatus, billingTotal);
 
-    const [result] = await pool.query(
+    const [rows] = await pool.query(
       `INSERT INTO billing_records (
         student_id, billing_code, semester, school_year, total_amount, paid_amount, balance_amount, billing_status, workflow_stage, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+      RETURNING id`,
       [studentId, billingCode, semester, schoolYear, billingTotal, billingTotal, initialStatus, initialStage, nowSql(), nowSql()]
     );
 
-    const billingId = Number(result.insertId);
+    const billingId = Number(rows[0]?.id);
+    if (!billingId) {
+      sendError(res, 500, 'Unable to create billing record.');
+      return;
+    }
 
     const normalizedItems =
       items.length > 0
@@ -5343,17 +5429,18 @@ app.post('/api/installments', requireAuth, requireRole('admin', 'cashier'), asyn
       billingStageAfterCreate: WORKFLOW_STAGES.PAY_BILLS
     });
 
-    const [result] = await pool.query(
+    const [rows] = await pool.query(
       `INSERT INTO installments (
         billing_id, payment_id, installment_amount, installment_count, due_schedule, remarks, status, created_by, updated_by, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+      RETURNING id`,
       [billingId, payment.id || null, installmentAmount, installmentCount, dueSchedule || null, remarks || null, req.currentUser.id, req.currentUser.id, nowSql(), nowSql()]
     );
 
     sendOk(
       res,
       {
-        id: Number(result.insertId),
+        id: Number(rows[0]?.id),
         paymentId: payment.id || null,
         billingId,
         installmentAmount,
@@ -6063,11 +6150,11 @@ app.post('/api/receipts/generate', requireAuth, requireRole('admin', 'cashier', 
     await pool.query(
       `INSERT INTO receipt_records (payment_id, receipt_number, issued_date, receipt_status, workflow_stage, remarks, created_at)
        VALUES (?, ?, ?, 'generated', ?, 'Receipt document was generated from the successful payment.', ?)
-       ON DUPLICATE KEY UPDATE
-         issued_date = VALUES(issued_date),
-         workflow_stage = VALUES(workflow_stage),
+       ON CONFLICT (receipt_number) DO UPDATE SET
+         issued_date = EXCLUDED.issued_date,
+         workflow_stage = EXCLUDED.workflow_stage,
          receipt_status = 'generated',
-         remarks = VALUES(remarks)`,
+         remarks = EXCLUDED.remarks`,
       [paymentId, receiptNumber, nowSql(), WORKFLOW_STAGES.COMPLIANCE_DOCUMENTATION, nowSql()]
     );
 
@@ -7340,10 +7427,10 @@ app.post('/api/generate-receipt', requireAuth, async (req, res) => {
       await pool.query(
         `INSERT INTO receipt_records (payment_id, receipt_number, issued_date, receipt_status, remarks, created_at)
          VALUES (?, ?, ?, 'generated', 'Receipt document was generated from the successful payment.', ?)
-         ON DUPLICATE KEY UPDATE
-           issued_date = VALUES(issued_date),
+         ON CONFLICT (receipt_number) DO UPDATE SET
+           issued_date = EXCLUDED.issued_date,
            receipt_status = 'generated',
-           remarks = VALUES(remarks)`,
+           remarks = EXCLUDED.remarks`,
         [paymentId, receiptNumber, nowSql(), nowSql()]
       );
       const [receiptRows] = await pool.query(`SELECT id FROM receipt_records WHERE payment_id = ? ORDER BY id DESC LIMIT 1`, [paymentId]);
@@ -7924,16 +8011,16 @@ app.post('/api/workflow/:id/generate-receipt', requireAuth, requireRole('admin',
          payment_id, receipt_number, issued_date, receipt_status, workflow_stage, remarks, previous_workflow_stage, action_by, action_at, audit_reference, is_completed, is_returned, needs_correction, created_at
        )
        VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, 1, 0, 0, ?)
-       ON DUPLICATE KEY UPDATE
-         receipt_number = VALUES(receipt_number),
-         issued_date = VALUES(issued_date),
+       ON CONFLICT (receipt_number) DO UPDATE SET
+         receipt_number = EXCLUDED.receipt_number,
+         issued_date = EXCLUDED.issued_date,
          receipt_status = 'completed',
-         workflow_stage = VALUES(workflow_stage),
-         remarks = VALUES(remarks),
-         previous_workflow_stage = VALUES(previous_workflow_stage),
-         action_by = VALUES(action_by),
-         action_at = VALUES(action_at),
-         audit_reference = VALUES(audit_reference),
+         workflow_stage = EXCLUDED.workflow_stage,
+         remarks = EXCLUDED.remarks,
+         previous_workflow_stage = EXCLUDED.previous_workflow_stage,
+         action_by = EXCLUDED.action_by,
+         action_at = EXCLUDED.action_at,
+         audit_reference = EXCLUDED.audit_reference,
          is_completed = 1,
          is_returned = 0,
          needs_correction = 0,
@@ -8808,6 +8895,14 @@ app.use((_req, res) => {
 async function start() {
   try {
     await ensureSchema();
+    if (process.argv.includes('--seed')) {
+      if (pool?.end) {
+        await pool.end();
+      }
+      console.log('Cashier database schema verified and seeded.');
+      return;
+    }
+
     app.listen(port, () => {
       console.log(`Cashier API running at http://localhost:${port}`);
       console.log(`Frontend origins allowed: ${frontendOrigins.join(', ')}`);

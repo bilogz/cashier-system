@@ -1,4 +1,4 @@
-import { onUnmounted } from 'vue';
+import { onUnmounted, ref } from 'vue';
 
 type RunOptions = {
   silent?: boolean;
@@ -34,6 +34,7 @@ export function emitRealtimeRefresh(reason = 'data_changed'): void {
 export function useRealtimeListSync() {
   let requestToken = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let eventSource: EventSource | null = null;
   let inFlight = false;
   let pollTask: (() => void | Promise<void>) | null = null;
   let pollIntervalMs = 0;
@@ -45,6 +46,13 @@ export function useRealtimeListSync() {
   };
   let visibilityBound = false;
   let refreshEventBound = false;
+  const connectionState = ref<'idle' | 'connecting' | 'live' | 'fallback'>('idle');
+
+  function resolveRealtimeUrl(): string {
+    const apiBaseUrl = String(import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+    if (!apiBaseUrl) return '/api/realtime-stream';
+    return `${apiBaseUrl}/realtime-stream`;
+  }
 
   async function runLatest<T>(task: () => Promise<T>, options: RunOptions = {}): Promise<T | undefined> {
     const token = ++requestToken;
@@ -151,6 +159,36 @@ export function useRealtimeListSync() {
     refreshEventBound = false;
   }
 
+  function bindServerRealtime(): void {
+    if (eventSource || typeof window === 'undefined' || typeof EventSource === 'undefined') return;
+
+    connectionState.value = 'connecting';
+    eventSource = new EventSource(resolveRealtimeUrl(), { withCredentials: true });
+
+    eventSource.onopen = () => {
+      connectionState.value = 'live';
+    };
+
+    eventSource.onmessage = () => {
+      if (!pollTask) return;
+      void runPollTick();
+    };
+
+    eventSource.onerror = () => {
+      connectionState.value = 'fallback';
+    };
+  }
+
+  function unbindServerRealtime(): void {
+    if (!eventSource) {
+      connectionState.value = 'idle';
+      return;
+    }
+    eventSource.close();
+    eventSource = null;
+    connectionState.value = 'idle';
+  }
+
   function startPolling(task: () => void | Promise<void>, intervalMs: number, options: PollOptions = {}): void {
     stopPolling();
     pollTask = task;
@@ -163,6 +201,7 @@ export function useRealtimeListSync() {
     };
     bindVisibilityListener();
     bindRefreshListeners();
+    bindServerRealtime();
     if (pollOptions.immediate) {
       void runPollTick();
       return;
@@ -177,6 +216,7 @@ export function useRealtimeListSync() {
     inFlight = false;
     unbindVisibilityListener();
     unbindRefreshListeners();
+    unbindServerRealtime();
   }
 
   function invalidatePending(): void {
@@ -188,6 +228,7 @@ export function useRealtimeListSync() {
   });
 
   return {
+    connectionState,
     runLatest,
     startPolling,
     stopPolling,

@@ -1,4 +1,5 @@
 import { fetchApiData, invalidateApiCache } from '@/services/apiClient';
+import { emitRealtimeRefresh } from '@/composables/useRealtimeListSync';
 
 export type SystemNotification = {
   id: number;
@@ -28,10 +29,10 @@ export type NotificationPayload = {
   };
 };
 
-export async function fetchNotifications(filter = 'all'): Promise<NotificationPayload> {
+export async function fetchNotifications(filter = 'all', forceRefresh = false): Promise<NotificationPayload> {
   const params = new URLSearchParams();
   if (filter.trim()) params.set('filter', filter.trim().toLowerCase());
-  return await fetchApiData<NotificationPayload>(`/api/notifications?${params.toString()}`, { ttlMs: 8_000 });
+  return await fetchApiData<NotificationPayload>(`/api/notifications?${params.toString()}`, { ttlMs: 8_000, forceRefresh });
 }
 
 export async function markNotificationRead(notificationId: number): Promise<{ unreadCount: number }> {
@@ -40,6 +41,7 @@ export async function markNotificationRead(notificationId: number): Promise<{ un
   });
   invalidateApiCache('/api/notifications');
   invalidateApiCache('/api/dashboard/alerts');
+  emitRealtimeRefresh('notification_read');
   return data;
 }
 
@@ -49,5 +51,6 @@ export async function markAllNotificationsRead(): Promise<{ unreadCount: number 
   });
   invalidateApiCache('/api/notifications');
   invalidateApiCache('/api/dashboard/alerts');
+  emitRealtimeRefresh('notifications_read_all');
   return data;
 }

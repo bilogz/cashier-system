@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { mdiArchiveOutline, mdiCheckDecagramOutline, mdiFileChartOutline, mdiDownloadOutline, mdiMagnify } from '@mdi/js';
 import CashierAnalyticsCard from '@/components/shared/CashierAnalyticsCard.vue';
 import CashierActionButton from '@/components/shared/CashierActionButton.vue';
@@ -23,6 +23,7 @@ import {
   flagReconciliationDiscrepancy,
   reportReconciliationRecord
 } from '@/services/workflowCrudActions';
+import { useRealtimeListSync } from '@/composables/useRealtimeListSync';
 
 const auth = useAuthStore();
 const stats = ref<ReportingSnapshot['stats']>([]);
@@ -36,6 +37,9 @@ const completedMeta = ref<ReportingPaginationMeta>({
 });
 const alerts = ref<ReportingSnapshot['activityFeed']>([]);
 const selectedReport = ref<ReportingItem | null>(null);
+const activeSearch = ref('');
+const departmentFilter = ref('All Departments');
+const categoryFilter = ref('All Categories');
 const itemsPerPage = ref(6);
 const currentPage = ref(1);
 const historyItemsPerPage = ref(6);
@@ -52,6 +56,15 @@ const snackbarMessage = ref('');
 const loading = ref(false);
 const actionLoading = ref(false);
 const errorMessage = ref('');
+const realtime = useRealtimeListSync();
+const departmentFilterOptions = computed(() => [
+  'All Departments',
+  ...new Set([...reportRows.value, ...completedRows.value].map((item) => item.sourceDepartment).filter(Boolean))
+]);
+const categoryFilterOptions = computed(() => [
+  'All Categories',
+  ...new Set([...reportRows.value, ...completedRows.value].map((item) => item.sourceCategory).filter(Boolean))
+]);
 
 function statusColor(status: ReportingStatus) {
   if (status === 'Archived') return 'secondary';
@@ -59,6 +72,18 @@ function statusColor(status: ReportingStatus) {
   if (status === 'Reconciled') return 'info';
   if (status === 'With Discrepancy') return 'error';
   return 'warning';
+}
+
+function canReconcile(row: ReportingItem) {
+  return row.status === 'Logged' || row.status === 'With Discrepancy';
+}
+
+function canSendToPmed(row: ReportingItem) {
+  return row.status === 'Reconciled';
+}
+
+function canArchive(row: ReportingItem) {
+  return row.status === 'Reported' || row.status === 'Archived';
 }
 
 function openDialog(mode: 'reconcile' | 'report' | 'archive' | 'discrepancy', row: ReportingItem) {
@@ -74,7 +99,7 @@ function openCorrectionDialog(row: ReportingItem) {
 
 function dialogTitle() {
   if (dialogMode.value === 'reconcile') return 'Reconcile and Archive';
-  if (dialogMode.value === 'report') return 'Mark as Reported';
+  if (dialogMode.value === 'report') return 'Send Financial Report to PMED';
   if (dialogMode.value === 'archive') return 'Archive Record';
   return '';
 }
@@ -82,7 +107,7 @@ function dialogTitle() {
 function dialogMessage() {
   if (!selectedReport.value) return '';
   if (dialogMode.value === 'reconcile') return `Match ${selectedReport.value.reference} with its payment and documentation records, then move it to archive?`;
-  if (dialogMode.value === 'report') return `Include ${selectedReport.value.reference} in the finalized financial report?`;
+  if (dialogMode.value === 'report') return `Send ${selectedReport.value.reference} to PMED as a cashier financial report package?`;
   if (dialogMode.value === 'archive') return `Archive ${selectedReport.value.reference} from the active reconciliation board?`;
   return '';
 }
@@ -92,8 +117,8 @@ function formatActionMessage(response: { message?: string; next_module?: string 
   return response.message || 'Reporting queue updated successfully.';
 }
 
-async function loadSnapshot() {
-  loading.value = true;
+async function loadSnapshot(options: { silent?: boolean } = {}) {
+  if (!options.silent) loading.value = true;
   errorMessage.value = '';
   try {
     const [snapshot, completed] = await Promise.all([
@@ -103,6 +128,8 @@ async function loadSnapshot() {
         perPage: historyItemsPerPage.value,
         search: completedSearch.value,
         status: completedStatus.value,
+        department: departmentFilter.value !== 'All Departments' ? departmentFilter.value : '',
+        category: categoryFilter.value !== 'All Categories' ? categoryFilter.value : '',
         dateFrom: completedDateFrom.value,
         dateTo: completedDateTo.value
       })
@@ -126,7 +153,7 @@ async function loadSnapshot() {
     }
     errorMessage.value = message;
   } finally {
-    loading.value = false;
+    if (!options.silent) loading.value = false;
   }
 }
 
@@ -136,6 +163,8 @@ async function exportCompletedTable() {
     const file = await exportCompletedTransactions({
       search: completedSearch.value,
       status: completedStatus.value,
+      department: departmentFilter.value !== 'All Departments' ? departmentFilter.value : '',
+      category: categoryFilter.value !== 'All Categories' ? categoryFilter.value : '',
       dateFrom: completedDateFrom.value,
       dateTo: completedDateTo.value
     });
@@ -205,6 +234,8 @@ const reportContextFields = computed(() => {
     { label: 'Student Name', value: selectedReport.value.studentName },
     { label: 'Billing Code', value: selectedReport.value.billingCode },
     { label: 'Receipt Number', value: selectedReport.value.receiptNumber },
+    { label: 'Connected Department', value: selectedReport.value.sourceDepartment },
+    { label: 'Category Type', value: selectedReport.value.sourceCategory },
     { label: 'Amount', value: selectedReport.value.amount },
     { label: 'Workflow Stage', value: selectedReport.value.workflowStageLabel }
   ];
@@ -215,7 +246,7 @@ const reconcileInitialValues = computed(() => ({
 }));
 
 const reportInitialValues = computed(() => ({
-  remarks: 'Included in finalized financial reporting.'
+  remarks: 'Cashier financial report package sent to PMED.'
 }));
 
 const archiveInitialValues = computed(() => ({
@@ -230,22 +261,35 @@ const discrepancyInitialValues = computed(() => ({
 const nextStepLabel = computed(() => {
   if (!selectedReport.value) return 'Select a reporting record to review its final cashier outcome.';
   if (selectedReport.value.status === 'Logged') return 'Reconcile the billing, payment, and receipt records before final reporting.';
-  if (selectedReport.value.status === 'Reconciled') return 'Mark this record as Reported or Archive it after reporting is complete.';
-  if (selectedReport.value.status === 'Reported') return 'Archive this record to move it into completed history.';
+  if (selectedReport.value.status === 'Reconciled') return 'Send this reconciled cashier financial report package to PMED Department.';
+  if (selectedReport.value.status === 'Reported') return 'PMED already received this cashier report package. Archive it to move the record into completed history.';
   if (selectedReport.value.status === 'With Discrepancy') return 'Resolve the discrepancy or return the record to Compliance & Documentation.';
   return 'This record already completed the reporting workflow.';
 });
-const totalPages = computed(() => Math.max(1, Math.ceil(reportRows.value.length / itemsPerPage.value)));
+const filteredReportRows = computed(() =>
+  reportRows.value.filter((item) => {
+    if (departmentFilter.value !== 'All Departments' && item.sourceDepartment !== departmentFilter.value) return false;
+    if (categoryFilter.value !== 'All Categories' && item.sourceCategory !== categoryFilter.value) return false;
+    if (activeSearch.value.trim()) {
+      const needle = activeSearch.value.trim().toLowerCase();
+      const haystack =
+        `${item.reference} ${item.studentName} ${item.billingCode} ${item.receiptNumber} ${item.sourceDepartment} ${item.sourceCategory} ${item.paymentStatus} ${item.documentStatus} ${item.status} ${item.workflowStageLabel}`.toLowerCase();
+      if (!haystack.includes(needle)) return false;
+    }
+    return true;
+  })
+);
+const totalPages = computed(() => Math.max(1, Math.ceil(filteredReportRows.value.length / itemsPerPage.value)));
 const historyTotalPages = computed(() => Math.max(1, Number(completedMeta.value.totalPages || 1)));
 const paginatedReportRows = computed(() => {
   const start = (currentPage.value - 1) * itemsPerPage.value;
-  return reportRows.value.slice(start, start + itemsPerPage.value);
+  return filteredReportRows.value.slice(start, start + itemsPerPage.value);
 });
 const activePageSummary = computed(() => {
-  if (!reportRows.value.length) return 'No active reconciliation records.';
+  if (!filteredReportRows.value.length) return 'No active reconciliation records.';
   const first = (currentPage.value - 1) * itemsPerPage.value + 1;
-  const last = Math.min(currentPage.value * itemsPerPage.value, reportRows.value.length);
-  return `Showing ${first}-${last} of ${reportRows.value.length} active reconciliation record${reportRows.value.length === 1 ? '' : 's'}`;
+  const last = Math.min(currentPage.value * itemsPerPage.value, filteredReportRows.value.length);
+  return `Showing ${first}-${last} of ${filteredReportRows.value.length} active reconciliation record${filteredReportRows.value.length === 1 ? '' : 's'}`;
 });
 const historyPageSummary = computed(() => {
   if (!completedRows.value.length) return 'No completed transaction records.';
@@ -257,6 +301,16 @@ const historyPageSummary = computed(() => {
 
 watch(itemsPerPage, () => {
   currentPage.value = 1;
+});
+
+watch(activeSearch, () => {
+  currentPage.value = 1;
+});
+
+watch([departmentFilter, categoryFilter], () => {
+  currentPage.value = 1;
+  historyCurrentPage.value = 1;
+  void loadSnapshot();
 });
 
 watch(historyItemsPerPage, () => {
@@ -286,7 +340,7 @@ watch(completedSearch, () => {
   historyCurrentPage.value = 1;
   if (completedSearchTimer) clearTimeout(completedSearchTimer);
   completedSearchTimer = setTimeout(() => {
-    void loadSnapshot();
+    void loadSnapshot({ silent: true });
   }, 250);
 });
 
@@ -399,6 +453,14 @@ async function submitDiscrepancyAction(formValues: Record<string, string | numbe
 
 onMounted(() => {
   void loadSnapshot();
+  realtime.startPolling(() => {
+    void loadSnapshot({ silent: true });
+  }, 0, { pauseWhenDialogOpen: false });
+});
+
+onUnmounted(() => {
+  realtime.stopPolling();
+  realtime.invalidatePending();
 });
 </script>
 
@@ -444,6 +506,43 @@ onMounted(() => {
             <div class="toolbar-row mb-4">
               <div class="text-body-2 text-medium-emphasis">{{ activePageSummary }}</div>
               <div class="toolbar-controls">
+                <v-text-field
+                  v-model="activeSearch"
+                  :prepend-inner-icon="mdiMagnify"
+                  label="Search reporting records"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  class="completed-search"
+                />
+                <v-btn
+                  v-if="activeSearch || departmentFilter !== 'All Departments' || categoryFilter !== 'All Categories'"
+                  size="small"
+                  variant="text"
+                  color="primary"
+                  prepend-icon="mdi-filter-remove-outline"
+                  @click="activeSearch = ''; departmentFilter = 'All Departments'; categoryFilter = 'All Categories'"
+                >
+                  Clear Filters
+                </v-btn>
+                <v-select
+                  v-model="departmentFilter"
+                  :items="departmentFilterOptions"
+                  label="Connected department"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  class="toolbar-select"
+                />
+                <v-select
+                  v-model="categoryFilter"
+                  :items="categoryFilterOptions"
+                  label="Category type"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  class="toolbar-select"
+                />
                 <v-select
                   v-model="itemsPerPage"
                   :items="[6, 10]"
@@ -460,23 +559,24 @@ onMounted(() => {
               <div>
                 <div class="font-weight-bold">{{ row.reference }}</div>
                 <div class="text-body-2 text-medium-emphasis">{{ row.studentName }} | {{ row.billingCode }} | {{ row.amount }}</div>
+                <div class="text-body-2 text-medium-emphasis">{{ row.sourceDepartment }} | {{ row.sourceCategory }}</div>
                 <div class="text-body-2 text-medium-emphasis">{{ row.paymentStatus }} | {{ row.documentStatus }} | {{ row.postedAt }}</div>
                 <div v-if="row.allocationSummary" class="text-body-2 text-medium-emphasis mt-1">{{ row.allocationSummary }}</div>
               </div>
               <div class="report-side">
                 <v-chip size="small" :color="statusColor(row.status)" variant="tonal">{{ row.status }}</v-chip>
                 <div class="report-actions">
-                  <CashierActionButton :icon="mdiCheckDecagramOutline" label="Reconcile" color="primary" variant="text" compact @click.stop="openDialog('reconcile', row)" />
-                  <CashierActionButton :icon="mdiFileChartOutline" label="Report" color="secondary" variant="text" compact @click.stop="openDialog('report', row)" />
+                  <CashierActionButton :icon="mdiCheckDecagramOutline" label="Reconcile" color="primary" variant="text" compact :disabled="!canReconcile(row)" @click.stop="openDialog('reconcile', row)" />
+                  <CashierActionButton :icon="mdiFileChartOutline" label="Send to PMED" color="secondary" variant="text" compact :disabled="!canSendToPmed(row)" @click.stop="openDialog('report', row)" />
                   <CashierActionButton :icon="mdiFileChartOutline" label="Discrepancy" color="warning" variant="text" compact @click.stop="openDialog('discrepancy', row)" />
                   <CashierActionButton :icon="mdiArchiveOutline" label="Correction" color="error" variant="text" compact @click.stop="openCorrectionDialog(row)" />
-                  <CashierActionButton :icon="mdiArchiveOutline" label="Archive" color="warning" variant="text" compact @click.stop="openDialog('archive', row)" />
+                  <CashierActionButton :icon="mdiArchiveOutline" label="Archive" color="warning" variant="text" compact :disabled="!canArchive(row)" @click.stop="openDialog('archive', row)" />
                 </div>
               </div>
             </div>
             </div>
-            <div v-if="!reportRows.length" class="text-body-2 text-medium-emphasis py-8 text-center">No reporting records are available yet.</div>
-            <div v-if="reportRows.length" class="d-flex flex-column flex-sm-row justify-space-between align-start align-sm-center ga-3 mt-4">
+            <div v-if="!filteredReportRows.length" class="text-body-2 text-medium-emphasis py-8 text-center">No reporting records are available yet.</div>
+            <div v-if="filteredReportRows.length" class="d-flex flex-column flex-sm-row justify-space-between align-start align-sm-center ga-3 mt-4">
               <div class="text-body-2 text-medium-emphasis">{{ activePageSummary }}</div>
               <v-pagination v-model="currentPage" :length="totalPages" density="comfortable" total-visible="5" />
             </div>
@@ -508,6 +608,24 @@ onMounted(() => {
                     v-model="completedStatus"
                     :items="['', 'Archived', 'Reported', 'Reconciled', 'With Discrepancy']"
                     label="Final status"
+                    density="compact"
+                    variant="outlined"
+                    hide-details
+                    class="completed-filter"
+                  />
+                  <v-select
+                    v-model="departmentFilter"
+                    :items="departmentFilterOptions"
+                    label="Connected department"
+                    density="compact"
+                    variant="outlined"
+                    hide-details
+                    class="completed-filter"
+                  />
+                  <v-select
+                    v-model="categoryFilter"
+                    :items="categoryFilterOptions"
+                    label="Category type"
                     density="compact"
                     variant="outlined"
                     hide-details
@@ -560,6 +678,8 @@ onMounted(() => {
                     <th>Reference</th>
                     <th>Student</th>
                     <th>Billing Code</th>
+                    <th>Department</th>
+                    <th>Category</th>
                     <th>Receipt No.</th>
                     <th>Amount</th>
                     <th>Payment</th>
@@ -574,6 +694,8 @@ onMounted(() => {
                     <td class="font-weight-bold">{{ row.reference }}</td>
                     <td>{{ row.studentName }}</td>
                     <td>{{ row.billingCode }}</td>
+                    <td>{{ row.sourceDepartment }}</td>
+                    <td>{{ row.sourceCategory }}</td>
                     <td>{{ row.receiptNumber || 'Pending Receipt' }}</td>
                     <td>{{ row.amount }}</td>
                     <td>{{ row.paymentStatus }}</td>
@@ -616,6 +738,8 @@ onMounted(() => {
             <div class="text-body-2">{{ nextStepLabel }}</div>
           </div>
           <v-list density="comfortable" class="py-0">
+            <v-list-item title="Connected department" :subtitle="selectedReport.sourceDepartment" />
+            <v-list-item title="Category type" :subtitle="selectedReport.sourceCategory" />
             <v-list-item title="Billing code" :subtitle="selectedReport.billingCode" />
             <v-list-item title="Receipt number" :subtitle="selectedReport.receiptNumber" />
             <v-list-item title="Payment status" :subtitle="selectedReport.paymentStatus" />
@@ -633,7 +757,7 @@ onMounted(() => {
       <v-card class="panel-card" variant="outlined">
         <v-card-item>
           <v-card-title>Completion Alerts</v-card-title>
-          <v-card-subtitle>Live archive, discrepancy, and send-back notifications</v-card-subtitle>
+          <v-card-subtitle>PMED report requests, archive updates, discrepancy flags, and send-back notifications</v-card-subtitle>
         </v-card-item>
         <v-card-text>
           <div v-for="item in alerts" :key="item.title + item.time" class="alert-card">
@@ -643,6 +767,7 @@ onMounted(() => {
             </div>
             <div class="text-body-2 text-medium-emphasis">{{ item.detail }}</div>
           </div>
+          <div v-if="!alerts.length" class="text-body-2 text-medium-emphasis">No PMED report requests or reporting alerts yet.</div>
         </v-card-text>
       </v-card>
     </v-col>
@@ -681,21 +806,21 @@ onMounted(() => {
       v-else-if="dialogMode === 'report'"
       :model-value="true"
       :loading="actionLoading"
-      title="Publish Financial Report Entry"
-      subtitle="Confirm that this reconciled record is ready to be included in the finalized financial reporting output."
-      chip-label="Report"
+      title="Send Cashier Financial Report to PMED"
+      subtitle="Create a structured cashier financial report package and deliver it to PMED as an inbound department report."
+      chip-label="Send to PMED"
       chip-color="secondary"
-      confirm-label="Mark as Reported"
+      confirm-label="Send to PMED"
       confirm-color="secondary"
       :context-fields="reportContextFields"
       :fields="[
         {
           key: 'remarks',
-          label: 'Reporting Remarks',
+          label: 'PMED Handoff Remarks',
           type: 'textarea',
           required: true,
           rows: 3,
-          placeholder: 'Add reporting notes for this transaction.'
+          placeholder: 'Add PMED-facing notes for this financial report package.'
         }
       ]"
       :initial-values="reportInitialValues"
@@ -1047,3 +1172,7 @@ onMounted(() => {
   }
 }
 </style>
+
+
+
+

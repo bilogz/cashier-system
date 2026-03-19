@@ -24,6 +24,7 @@ type ActionDialogContextField = {
 const props = defineProps<{
   modelValue: boolean;
   loading?: boolean;
+  confirmDisabled?: boolean;
   title: string;
   subtitle?: string;
   chipLabel?: string;
@@ -197,7 +198,13 @@ function submitDialog() {
       <v-card-actions class="px-6 pb-6 pt-0">
         <v-spacer />
         <v-btn variant="text" :prepend-icon="mdiCloseCircleOutline" @click="closeDialog">Cancel</v-btn>
-        <v-btn :color="resolvedConfirmColor" class="dialog-confirm-btn" :loading="loading" @click="submitDialog">
+        <v-btn
+          :color="resolvedConfirmColor"
+          class="dialog-confirm-btn"
+          :loading="loading"
+          :disabled="confirmDisabled"
+          @click="submitDialog"
+        >
           {{ resolvedConfirmLabel }}
         </v-btn>
       </v-card-actions>

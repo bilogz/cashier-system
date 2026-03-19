@@ -1,15 +1,21 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { fetchNotifications, markAllNotificationsRead, markNotificationRead, type SystemNotification } from '@/services/notifications';
+import { useRealtimeListSync } from '@/composables/useRealtimeListSync';
+import { formatDateTimeWithTimezone, formatRelativeDateTime } from '@/utils/dateTime';
 
-const notificationFilters = ['All Notifications', 'New', 'Unread', 'Other'];
+const notificationFilters = ['All Notifications', 'PMED Requests', 'Unread', 'New', 'Other'];
 const selectedFilter = ref<string>('All Notifications');
 const loading = ref(false);
 const errorMessage = ref('');
 const items = ref<SystemNotification[]>([]);
 const totalUnread = ref(0);
+const realtime = useRealtimeListSync();
+const timeTick = ref(Date.now());
+let timeTimer: ReturnType<typeof setInterval> | null = null;
 
 const filterValue = computed(() => {
+  if (selectedFilter.value === 'PMED Requests') return 'pmed_requests';
   if (selectedFilter.value === 'Unread') return 'unread';
   if (selectedFilter.value === 'New') return 'new';
   if (selectedFilter.value === 'Other') return 'other';
@@ -17,6 +23,7 @@ const filterValue = computed(() => {
 });
 
 function typeColor(item: SystemNotification): string {
+  if (item.type.includes('pmed')) return 'secondary';
   if (item.type.includes('failed') || item.type.includes('discrepancy')) return 'error';
   if (item.type.includes('receipt') || item.type.includes('billing')) return 'primary';
   if (item.type.includes('payment')) return 'success';
@@ -24,6 +31,7 @@ function typeColor(item: SystemNotification): string {
 }
 
 function typeIcon(item: SystemNotification): string {
+  if (item.type.includes('pmed')) return 'mdi-file-chart-outline';
   if (item.type.includes('failed') || item.type.includes('discrepancy')) return 'mdi-alert-circle-outline';
   if (item.type.includes('receipt')) return 'mdi-receipt-text-check-outline';
   if (item.type.includes('billing')) return 'mdi-file-document-outline';
@@ -31,11 +39,26 @@ function typeIcon(item: SystemNotification): string {
   return 'mdi-bell-outline';
 }
 
-async function loadNotifications(): Promise<void> {
+function formatAbsoluteTime(value: string | null): string {
+  void timeTick.value;
+  return formatDateTimeWithTimezone(value, { fallback: '--' });
+}
+
+function formatLiveRelativeTime(value: string | null): string {
+  void timeTick.value;
+  return formatRelativeDateTime(value, '--');
+}
+
+function formatTypeLabel(item: SystemNotification): string {
+  if (item.type === 'pmed_report_request') return 'PMED request';
+  return item.type.replace(/_/g, ' ');
+}
+
+async function loadNotifications(forceRefresh = false): Promise<void> {
   loading.value = true;
   errorMessage.value = '';
   try {
-    const payload = await fetchNotifications(filterValue.value);
+    const payload = await fetchNotifications(filterValue.value, forceRefresh);
     items.value = payload.items || [];
     totalUnread.value = payload.meta.totalUnread || 0;
   } catch (error) {
@@ -52,7 +75,7 @@ async function handleRead(item: SystemNotification): Promise<void> {
   try {
     const payload = await markNotificationRead(item.id);
     totalUnread.value = payload.unreadCount || 0;
-    await loadNotifications();
+    await loadNotifications(true);
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : 'Unable to mark notification as read.';
   }
@@ -62,18 +85,30 @@ async function handleReadAll(): Promise<void> {
   try {
     const payload = await markAllNotificationsRead();
     totalUnread.value = payload.unreadCount || 0;
-    await loadNotifications();
+    await loadNotifications(true);
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : 'Unable to mark all notifications as read.';
   }
 }
 
 watch(filterValue, () => {
-  void loadNotifications();
+  void loadNotifications(true);
 });
 
 onMounted(() => {
-  void loadNotifications();
+  void loadNotifications(true);
+  timeTimer = setInterval(() => {
+    timeTick.value = Date.now();
+  }, 60 * 1000);
+  realtime.startPolling(() => {
+    void loadNotifications(true);
+  }, 0, { pauseWhenDialogOpen: false });
+});
+
+onUnmounted(() => {
+  if (timeTimer) clearInterval(timeTimer);
+  realtime.stopPolling();
+  realtime.invalidatePending();
 });
 </script>
 
@@ -111,12 +146,13 @@ onMounted(() => {
 
           <div class="d-inline-flex align-center justify-space-between w-100 ga-3">
             <h6 class="text-subtitle-2 font-weight-bold">{{ item.title }}</h6>
-            <span class="text-caption text-medium-emphasis">{{ item.relativeTime }}</span>
+            <span class="text-caption text-medium-emphasis">{{ formatLiveRelativeTime(item.createdAt) }}</span>
           </div>
 
           <p class="text-body-2 text-medium-emphasis mt-1 mb-2">{{ item.message }}</p>
+          <div class="text-caption text-medium-emphasis mb-2">{{ formatAbsoluteTime(item.createdAt) }}</div>
           <div class="d-flex align-center flex-wrap ga-2">
-            <v-chip size="small" :color="typeColor(item)" variant="tonal">{{ item.type.replace(/_/g, ' ') }}</v-chip>
+            <v-chip size="small" :color="typeColor(item)" variant="tonal">{{ formatTypeLabel(item) }}</v-chip>
             <v-chip v-if="!item.isRead" size="small" color="error" variant="tonal">Unread</v-chip>
             <v-chip v-else size="small" color="success" variant="tonal">Read</v-chip>
           </div>
@@ -129,7 +165,7 @@ onMounted(() => {
   </perfect-scrollbar>
   <v-divider />
   <div class="pa-2 text-center">
-    <v-btn color="primary" variant="text" @click="loadNotifications">Refresh</v-btn>
+    <v-btn color="primary" variant="text" @click="loadNotifications(true)">Refresh</v-btn>
   </div>
 </template>
 

@@ -44,6 +44,11 @@ const sidebarItem: menu[] = [
     to: '/modules/generate-receipt'
   },
   {
+    title: 'Report Center',
+    icon: 'mdi-file-chart-outline',
+    to: '/modules/report-center'
+  },
+  {
     title: 'Completed Transactions',
     icon: 'mdi-chart-line',
     to: '/modules/reports'

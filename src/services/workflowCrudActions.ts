@@ -19,6 +19,8 @@ function resolveApiUrl(segment: string): string {
 }
 
 function invalidateWorkflowCaches() {
+  invalidateApiCache('/api/report-center');
+  invalidateApiCache('/report-center');
   invalidateApiCache('/api/student-billing');
   invalidateApiCache('/student-billing');
   invalidateApiCache('/api/process-payment');
@@ -201,11 +203,13 @@ export async function completeComplianceDocumentation(payload: {
 export async function reportReconciliationRecord(payload: {
   paymentId: number;
   remarks: string;
+  requestReference?: string;
 }): Promise<CrudWorkflowResponse> {
   return await postAction<CrudWorkflowResponse>('reporting-reconciliation', {
     paymentId: payload.paymentId,
     action: 'report',
-    remarks: payload.remarks
+    remarks: payload.remarks,
+    requestReference: payload.requestReference
   });
 }
 

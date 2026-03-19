@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 import {
   mdiArchiveOutline,
   mdiContentSaveOutline,
+  mdiMagnify,
   mdiPauseCircleOutline
 } from '@mdi/js';
 import { useAuthStore } from '@/stores/auth';
@@ -28,6 +29,8 @@ const ledgerItems = ref<ManagementLedgerItem[]>([]);
 const selectedLedger = ref<ManagementLedgerItem | null>(null);
 const recentUpdates = ref<BillingAlert[]>([]);
 const search = ref('');
+const departmentFilter = ref('All Departments');
+const categoryFilter = ref('All Categories');
 const itemsPerPage = ref(6);
 const currentPage = ref(1);
 const loading = ref(false);
@@ -39,13 +42,31 @@ const correctionDialog = ref(false);
 const correctionLedger = ref<ManagementLedgerItem | null>(null);
 const snackbar = ref(false);
 const snackbarMessage = ref('');
+const departmentFilterOptions = computed(() => [
+  'All Departments',
+  ...new Set(ledgerItems.value.map((item) => item.sourceDepartment).filter(Boolean))
+]);
+const categoryFilterOptions = computed(() => [
+  'All Categories',
+  ...new Set(ledgerItems.value.map((item) => item.sourceCategory).filter(Boolean))
+]);
 
 const filteredLedgerItems = computed(() => {
   const keyword = search.value.trim().toLowerCase();
-  if (!keyword) return ledgerItems.value;
+  const departmentValue = departmentFilter.value;
+  const sourceFiltered =
+    departmentValue === 'All Departments'
+      ? ledgerItems.value
+      : ledgerItems.value.filter((item) => item.sourceDepartment === departmentValue);
+  const categoryFiltered =
+    categoryFilter.value === 'All Categories'
+      ? sourceFiltered
+      : sourceFiltered.filter((item) => item.sourceCategory === categoryFilter.value);
 
-  return ledgerItems.value.filter((item) =>
-    [item.billingCode, item.studentName, item.semester, item.category, item.status, item.balance, item.remarks]
+  if (!keyword) return categoryFiltered;
+
+  return categoryFiltered.filter((item) =>
+    [item.billingCode, item.studentName, item.semester, item.category, item.sourceModule, item.sourceDepartment, item.sourceCategory, item.status, item.balance, item.remarks]
       .join(' ')
       .toLowerCase()
       .includes(keyword)
@@ -56,10 +77,13 @@ const totalPages = computed(() => Math.max(1, Math.ceil(filteredLedgerItems.valu
 const resultSummary = computed(() =>
   search.value.trim()
     ? `${filteredLedgerItems.value.length} ledger match${filteredLedgerItems.value.length === 1 ? '' : 'es'} for "${search.value.trim()}"`
-    : `${ledgerItems.value.length} billing ledger record${ledgerItems.value.length === 1 ? '' : 's'} available`
+    : `${filteredLedgerItems.value.length} billing ledger record${filteredLedgerItems.value.length === 1 ? '' : 's'} available`
 );
 const nextStepLabel = computed(() => {
   if (!selectedLedger.value) return 'Select a billing ledger to review its maintenance path.';
+  if (selectedLedger.value.sourceModule === 'Clinic' && selectedLedger.value.workflowStage === 'student_portal_billing') {
+    return 'Clinic booking is synced and ready for cashier verification here before gateway handoff.';
+  }
   if (selectedLedger.value.status === 'Fully Paid') return 'Forwarded to Payment Processing & Gateway for transaction validation.';
   if (selectedLedger.value.status === 'Partially Paid') return 'Remain visible here until the balance is fully settled.';
   if (selectedLedger.value.status === 'Payment Failed') return 'Retry payment or return the student billing to review.';
@@ -210,6 +234,10 @@ watch([search, itemsPerPage], () => {
   currentPage.value = 1;
 });
 
+watch([departmentFilter, categoryFilter], () => {
+  currentPage.value = 1;
+});
+
 watch(totalPages, (value) => {
   if (currentPage.value > value) currentPage.value = value;
 });
@@ -238,6 +266,10 @@ async function submitApproveAction(formValues: Record<string, string | number>) 
     if (message.toLowerCase().includes('authentication required')) {
       await auth.logout();
       return;
+    }
+    if (message.toLowerCase().includes('active in payment processing')) {
+      await loadSnapshot();
+      dialogMode.value = null;
     }
     snackbarMessage.value = message;
     snackbar.value = true;
@@ -272,6 +304,10 @@ async function submitInstallmentAction(formValues: Record<string, string | numbe
     if (message.toLowerCase().includes('authentication required')) {
       await auth.logout();
       return;
+    }
+    if (message.toLowerCase().includes('active in payment processing')) {
+      await loadSnapshot();
+      dialogMode.value = null;
     }
     snackbarMessage.value = message;
     snackbar.value = true;
@@ -313,6 +349,9 @@ const ledgerContextFields = computed(() => {
   return [
     { label: 'Student', value: selectedLedger.value.studentName },
     { label: 'Billing Code', value: selectedLedger.value.billingCode },
+    { label: 'Source Module', value: selectedLedger.value.sourceModule },
+    { label: 'Connected Department', value: selectedLedger.value.sourceDepartment },
+    { label: 'Booking Category', value: selectedLedger.value.sourceCategory },
     { label: 'Status', value: selectedLedger.value.status },
     { label: 'Remaining Balance', value: selectedLedger.value.balance },
     { label: 'Semester', value: selectedLedger.value.semester },
@@ -322,7 +361,7 @@ const ledgerContextFields = computed(() => {
 
 const approveInitialValues = computed(() => ({
   amount: parseCurrencyValue(selectedLedger.value?.balance || '0'),
-  paymentMethod: 'Online',
+  paymentMethod: 'Cash',
   allocationMode: 'auto',
   remarks: 'Payment request approved for processing.'
 }));
@@ -335,7 +374,7 @@ const installmentInitialValues = computed(() => {
     installmentAmount: suggestedInstallment,
     installmentCount: 2,
     dueSchedule: 'Every 15th of the month',
-    paymentMethod: 'Online',
+    paymentMethod: 'Cash',
     allocationMode: 'manual',
     remarks: 'Installment payment request created from Pay Bills.'
   };
@@ -361,13 +400,13 @@ onMounted(() => {
               <div class="hero-kicker">Pay Bills</div>
               <h1 class="text-h4 font-weight-black mb-2">Pay Bills</h1>
               <p class="hero-subtitle mb-0">
-                Accept full or installment bill settlements and prepare approved payments for gateway processing.
+                Accept full or installment bill settlements, identify the connected department for each record, and prepare clinic-synced payments for gateway processing.
               </p>
             </div>
             <div class="hero-side-panel">
               <div class="hero-side-label">Payment Flow</div>
-              <div class="text-h6 font-weight-bold">Pending Payment -> Settlement -> Gateway</div>
-              <div class="text-body-2">Only active billings from Student Portal & Billing should move through this queue.</div>
+              <div class="text-h6 font-weight-bold">Clinic Sync -> Pay Bills -> Gateway</div>
+              <div class="text-body-2">Clinic bookings now stay visible here with their connected department before payment update and gateway handoff.</div>
             </div>
           </div>
         </v-card-text>
@@ -390,8 +429,7 @@ onMounted(() => {
               <div class="billing-search-stack">
                 <v-text-field
                   v-model="search"
-                  prepend-inner-icon="mdi-magnify"
-                  append-inner-icon="mdi-book-search-outline"
+                  :prepend-inner-icon="mdiMagnify"
                   label="Search by billing code, student, payment status, or program"
                   placeholder="Try BILL-1007 or Partially Paid"
                   variant="outlined"
@@ -403,17 +441,35 @@ onMounted(() => {
                 <div class="d-flex align-center justify-space-between flex-wrap ga-2">
                   <div class="text-body-2 text-medium-emphasis">{{ resultSummary }}</div>
                   <v-btn
-                    v-if="search"
+                    v-if="search || departmentFilter !== 'All Departments' || categoryFilter !== 'All Categories'"
                     size="small"
                     variant="text"
                     color="primary"
                     prepend-icon="mdi-filter-remove-outline"
-                    @click="search = ''"
+                    @click="search = ''; departmentFilter = 'All Departments'; categoryFilter = 'All Categories'"
                   >
-                    Clear Search
+                    Clear Filters
                   </v-btn>
                 </div>
               </div>
+              <v-select
+                v-model="departmentFilter"
+                :items="departmentFilterOptions"
+                label="Connected department"
+                variant="outlined"
+                density="comfortable"
+                hide-details
+                class="page-size-select"
+              />
+              <v-select
+                v-model="categoryFilter"
+                :items="categoryFilterOptions"
+                label="Category type"
+                variant="outlined"
+                density="comfortable"
+                hide-details
+                class="page-size-select"
+              />
               <v-select
                 v-model="itemsPerPage"
                 :items="[6, 10]"
@@ -441,6 +497,7 @@ onMounted(() => {
                         <div class="text-subtitle-1 font-weight-bold">{{ item.studentName }}</div>
                         <v-chip size="small" :color="statusColor(item.status)" variant="tonal">{{ item.status }}</v-chip>
                         <v-chip size="small" color="primary" variant="outlined">{{ item.billingCode }}</v-chip>
+                        <v-chip size="small" :color="item.sourceModule === 'Clinic' ? 'warning' : 'secondary'" variant="tonal">{{ item.sourceModule }}</v-chip>
                       </div>
                       <div class="billing-grid">
                         <div>
@@ -450,6 +507,14 @@ onMounted(() => {
                         <div>
                           <div class="metric-label">Category</div>
                           <div class="meta-value">{{ item.category }}</div>
+                        </div>
+                        <div>
+                          <div class="metric-label">Connected Dept</div>
+                          <div class="meta-value">{{ item.sourceDepartment }}</div>
+                        </div>
+                        <div>
+                          <div class="metric-label">Booking Category</div>
+                          <div class="meta-value">{{ item.sourceCategory }}</div>
                         </div>
                         <div>
                           <div class="metric-label">Total Assessment</div>
@@ -522,6 +587,9 @@ onMounted(() => {
             <div class="text-body-2">{{ nextStepLabel }}</div>
           </div>
           <v-list density="comfortable" class="py-0">
+            <v-list-item title="Source module" :subtitle="selectedLedger.sourceModule" />
+            <v-list-item title="Connected department" :subtitle="selectedLedger.sourceDepartment" />
+            <v-list-item title="Booking category" :subtitle="selectedLedger.sourceCategory" />
             <v-list-item title="Status" :subtitle="selectedLedger.status" />
             <v-list-item title="Category" :subtitle="selectedLedger.category" />
             <v-list-item title="Semester" :subtitle="selectedLedger.semester" />
@@ -580,15 +648,15 @@ onMounted(() => {
           label: 'Approved Amount',
           type: 'number',
           required: true,
-          readonly: true,
-          hint: 'Full approval uses the current remaining balance.'
+          step: '0.01',
+          hint: 'Cashier can edit this amount for cash payments before forwarding it.'
         },
         {
           key: 'paymentMethod',
           label: 'Payment Method',
           type: 'select',
           required: true,
-          items: ['Online', 'GCash', 'Maya', 'Bank Transfer']
+          items: ['Cash', 'Online', 'GCash', 'Maya', 'Bank Transfer']
         },
         {
           key: 'allocationMode',
@@ -686,7 +754,7 @@ onMounted(() => {
           label: 'Payment Method',
           type: 'select',
           required: true,
-          items: ['Online', 'GCash', 'Maya', 'Bank Transfer']
+          items: ['Cash', 'Online', 'GCash', 'Maya', 'Bank Transfer']
         },
         {
           key: 'allocationMode',
@@ -914,10 +982,10 @@ onMounted(() => {
 
 .billing-toolbar {
   display: grid;
-  grid-template-columns: minmax(280px, 1fr) 170px;
+  grid-template-columns: minmax(260px, 1fr) 180px 180px 150px;
   gap: 12px;
   align-items: start;
-  width: min(100%, 560px);
+  width: min(100%, 940px);
 }
 
 .billing-search-stack {

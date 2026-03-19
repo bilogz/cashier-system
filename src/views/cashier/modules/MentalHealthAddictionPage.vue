@@ -1,4 +1,4 @@
-ï»¿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import SaasDateTimePickerField from '@/components/shared/SaasDateTimePickerField.vue';
 import ModuleActivityLogs from '@/components/shared/ModuleActivityLogs.vue';
@@ -356,7 +356,6 @@ onUnmounted(() => {
             <v-card-title>Sessions</v-card-title>
             <template #append>
               <div class="d-flex ga-2 align-center flex-wrap">
-                <v-btn class="saas-btn saas-btn-ghost" prepend-icon="mdi-refresh" :loading="pageLoading" @click="reloadDashboard">Refresh</v-btn>
                 <v-btn class="saas-btn saas-btn-primary" prepend-icon="mdi-plus" :disabled="!can('create')" @click="openCreate">New Session</v-btn>
               </div>
             </template>
@@ -421,7 +420,7 @@ onUnmounted(() => {
           <v-card-item><v-card-title>Upcoming Follow-Ups</v-card-title></v-card-item>
           <v-divider />
           <v-list density="compact">
-            <v-list-item v-for="item in upcomingFollowups" :key="`f-${item.id}`" :title="item.patient_name" :subtitle="`${item.case_reference} â€¢ ${formatDateTime(item.next_follow_up_at)}`" />
+            <v-list-item v-for="item in upcomingFollowups" :key="`f-${item.id}`" :title="item.patient_name" :subtitle="`${item.case_reference} • ${formatDateTime(item.next_follow_up_at)}`" />
             <v-list-item v-if="!upcomingFollowups.length" title="No follow-ups scheduled." />
           </v-list>
         </v-card>
@@ -439,7 +438,7 @@ onUnmounted(() => {
           <v-card-item><v-card-title>Activity Log</v-card-title></v-card-item>
           <v-divider />
           <v-list density="compact">
-            <v-list-item v-for="item in recentActivity" :key="`a-${item.id}`" :title="item.action" :subtitle="`${item.detail} â€¢ ${formatDateTime(item.created_at)}`" />
+            <v-list-item v-for="item in recentActivity" :key="`a-${item.id}`" :title="item.action" :subtitle="`${item.detail} • ${formatDateTime(item.created_at)}`" />
             <v-list-item v-if="!recentActivity.length" title="No activity yet." />
           </v-list>
         </v-card>
@@ -503,8 +502,8 @@ onUnmounted(() => {
             <v-col cols="12" md="8">
               <div class="flow-steps mb-3"><span class="step active">Create Session</span><span class="step active">Record Notes</span><span class="step">Plan Follow-Up</span><span class="step">Complete / Escalate</span></div>
               <v-alert variant="tonal" color="info" class="mb-3">{{ selectedSession.treatment_plan || 'No treatment plan documented.' }}</v-alert>
-              <v-card variant="outlined" class="mb-3"><v-card-item><v-card-title class="text-subtitle-1">Structured Notes</v-card-title></v-card-item><v-divider /><v-list density="compact"><v-list-item v-for="item in sessionNotes.slice(0, 6)" :key="`n-${item.id}`" :title="`${item.note_type} â€¢ ${item.created_by_role}`" :subtitle="`${item.note_content}${item.attachment_name ? ` â€¢ Attachment: ${item.attachment_name}` : ''}`" /><v-list-item v-if="!sessionNotes.length" title="No notes for this session." /></v-list></v-card>
-              <v-card variant="outlined"><v-card-item><v-card-title class="text-subtitle-1">Timeline / Audit</v-card-title></v-card-item><v-divider /><v-list density="compact"><v-list-item v-for="item in sessionActivity" :key="`ac-${item.id}`" :title="item.action" :subtitle="`${item.detail} â€¢ ${item.actor_role} â€¢ ${formatDateTime(item.created_at)}`" /><v-list-item v-if="!sessionActivity.length" title="No activity yet." /></v-list></v-card>
+              <v-card variant="outlined" class="mb-3"><v-card-item><v-card-title class="text-subtitle-1">Structured Notes</v-card-title></v-card-item><v-divider /><v-list density="compact"><v-list-item v-for="item in sessionNotes.slice(0, 6)" :key="`n-${item.id}`" :title="`${item.note_type} • ${item.created_by_role}`" :subtitle="`${item.note_content}${item.attachment_name ? ` • Attachment: ${item.attachment_name}` : ''}`" /><v-list-item v-if="!sessionNotes.length" title="No notes for this session." /></v-list></v-card>
+              <v-card variant="outlined"><v-card-item><v-card-title class="text-subtitle-1">Timeline / Audit</v-card-title></v-card-item><v-divider /><v-list density="compact"><v-list-item v-for="item in sessionActivity" :key="`ac-${item.id}`" :title="item.action" :subtitle="`${item.detail} • ${item.actor_role} • ${formatDateTime(item.created_at)}`" /><v-list-item v-if="!sessionActivity.length" title="No activity yet." /></v-list></v-card>
             </v-col>
           </v-row>
         </v-card-text>

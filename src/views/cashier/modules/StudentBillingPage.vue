@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
   mdiBellOutline,
   mdiCheckDecagramOutline,
-  mdiCloseThick
+  mdiCloseThick,
+  mdiMagnify
 } from '@mdi/js';
 import { useRoute } from 'vue-router';
 import CashierAnalyticsCard from '@/components/shared/CashierAnalyticsCard.vue';
@@ -23,6 +24,8 @@ import {
 import { returnWorkflowRecordForCorrection } from '@/services/workflowCorrections';
 import { verifyWorkflowRecord } from '@/services/workflowActions';
 import { sendWorkflowNotification } from '@/services/workflowCrudActions';
+import { fetchIntegratedFlow, type IntegratedFlowEdge } from '@/services/integratedFlow';
+import { useRealtimeListSync } from '@/composables/useRealtimeListSync';
 
 const route = useRoute();
 const auth = useAuthStore();
@@ -51,13 +54,54 @@ const currentPage = ref(1);
 const loading = ref(false);
 const actionLoading = ref(false);
 const errorMessage = ref('');
+const integrationLoading = ref(false);
+const integrationError = ref('');
+const incomingDependencies = ref<IntegratedFlowEdge[]>([]);
+const outgoingDependencies = ref<IntegratedFlowEdge[]>([]);
+const realtime = useRealtimeListSync();
+const departmentFilter = ref('All Departments');
+const categoryFilter = ref('All Categories');
+const departmentFilterOptions = computed(() => [
+  'All Departments',
+  ...new Set(billingItems.value.map((item) => item.sourceDepartment).filter(Boolean))
+]);
+const categoryFilterOptions = computed(() => [
+  'All Categories',
+  ...new Set(billingItems.value.map((item) => item.sourceCategory).filter(Boolean))
+]);
 
 const filteredBillings = computed(() => {
   const keyword = search.value.trim().toLowerCase();
-  if (!keyword) return billingItems.value;
+  const departmentValue = departmentFilter.value;
+  const sourceFiltered =
+    departmentValue === 'All Departments'
+      ? billingItems.value
+      : billingItems.value.filter((item) => item.sourceDepartment === departmentValue);
+  const categoryFiltered =
+    categoryFilter.value === 'All Categories'
+      ? sourceFiltered
+      : sourceFiltered.filter((item) => item.sourceCategory === categoryFilter.value);
 
-  return billingItems.value.filter((item) =>
-    [item.reference, item.studentName, item.studentNumber, item.program, item.status].join(' ').toLowerCase().includes(keyword)
+  if (!keyword) return categoryFiltered;
+
+  return categoryFiltered.filter((item) =>
+    [
+      item.reference,
+      item.studentName,
+      item.studentNumber,
+      item.program,
+      item.sourceModule,
+      item.sourceDepartment,
+      item.sourceCategory,
+      item.status,
+      item.workflowStageLabel,
+      item.note,
+      item.feeSummary?.label ?? '',
+      ...(item.feeItems?.map((fee) => `${fee.feeType} ${fee.feeName} ${fee.category}`) ?? [])
+    ]
+      .join(' ')
+      .toLowerCase()
+      .includes(keyword)
   );
 });
 
@@ -65,7 +109,7 @@ const totalPages = computed(() => Math.max(1, Math.ceil(filteredBillings.value.l
 const resultSummary = computed(() =>
   search.value.trim()
     ? `${filteredBillings.value.length} match${filteredBillings.value.length === 1 ? '' : 'es'} for "${search.value.trim()}"`
-    : `${billingItems.value.length} billing record${billingItems.value.length === 1 ? '' : 's'} available`
+    : `${filteredBillings.value.length} billing record${filteredBillings.value.length === 1 ? '' : 's'} available`
 );
 const nextStepLabel = computed(() => {
   if (!selectedBilling.value) return 'Select a billing record to review the next action.';
@@ -78,9 +122,24 @@ const nextStepLabel = computed(() => {
   return 'Review the billing details and activate the billing once it is valid for payment.';
 });
 
-function canVerifyBilling(item: VerificationBillingItem) {
+function getVerifyBlockReason(item: VerificationBillingItem) {
   const remainingAmount = Number(item.feeSummary?.remainingAmount ?? 0);
-  return item.workflowStage === 'student_portal_billing' && remainingAmount > 0;
+
+  if (item.workflowStage !== 'student_portal_billing') {
+    return 'Only billings still in Student Portal & Billing can be verified.';
+  }
+  if (remainingAmount <= 0) {
+    return 'Only billings with an active outstanding balance can be forwarded to Pay Bills.';
+  }
+  if (item.status !== 'Pending Payment') {
+    return 'Only billings marked Pending Payment can be verified for cashier processing.';
+  }
+
+  return '';
+}
+
+function canVerifyBilling(item: VerificationBillingItem) {
+  return getVerifyBlockReason(item) === '';
 }
 
 const paginatedBillings = computed(() => {
@@ -96,6 +155,9 @@ const billingContextFields = computed(() => {
     { label: 'Student Number', value: selectedBilling.value.studentNumber },
     { label: 'Billing Code', value: selectedBilling.value.reference },
     { label: 'Program', value: selectedBilling.value.program },
+    { label: 'Source Module', value: selectedBilling.value.sourceModule },
+    { label: 'Connected Department', value: selectedBilling.value.sourceDepartment },
+    { label: 'Booking Category', value: selectedBilling.value.sourceCategory },
     { label: 'Balance Due', value: selectedBilling.value.amount },
     { label: 'Workflow Stage', value: selectedBilling.value.workflowStageLabel }
   ];
@@ -132,6 +194,16 @@ function feeStatusColor(status: BillingFeeItem['status']) {
 }
 
 function openDialog(mode: 'approve' | 'notify', item: VerificationBillingItem) {
+  if (mode === 'approve') {
+    const blockReason = getVerifyBlockReason(item);
+    if (blockReason) {
+      selectedBilling.value = item;
+      snackbarMessage.value = blockReason;
+      snackbar.value = true;
+      return;
+    }
+  }
+
   selectedBilling.value = item;
   dialogMode.value = mode;
 }
@@ -147,8 +219,8 @@ function formatActionMessage(response: { message?: string; next_module?: string 
   return response.message || 'Billing queue updated successfully.';
 }
 
-async function loadSnapshot(forceRefresh = false) {
-  loading.value = true;
+async function loadSnapshot(forceRefresh = false, options: { silent?: boolean } = {}) {
+  if (!options.silent) loading.value = true;
   errorMessage.value = '';
 
   try {
@@ -171,7 +243,23 @@ async function loadSnapshot(forceRefresh = false) {
     }
     errorMessage.value = message;
   } finally {
-    loading.value = false;
+    if (!options.silent) loading.value = false;
+  }
+}
+
+async function loadIntegrationFlow() {
+  integrationLoading.value = true;
+  integrationError.value = '';
+  try {
+    const payload = await fetchIntegratedFlow('Cashier');
+    incomingDependencies.value = Array.isArray(payload.incoming) ? payload.incoming : [];
+    outgoingDependencies.value = Array.isArray(payload.outgoing) ? payload.outgoing : [];
+  } catch (error) {
+    integrationError.value = error instanceof Error ? error.message : 'Unable to load integration flow.';
+    incomingDependencies.value = [];
+    outgoingDependencies.value = [];
+  } finally {
+    integrationLoading.value = false;
   }
 }
 
@@ -188,14 +276,30 @@ watch([search, itemsPerPage], () => {
   currentPage.value = 1;
 });
 
+watch([departmentFilter, categoryFilter], () => {
+  currentPage.value = 1;
+});
+
 watch(totalPages, (value) => {
   if (currentPage.value > value) currentPage.value = value;
 });
 
+watch([dialogMode, selectedBilling], ([mode, billing]) => {
+  if (mode !== 'approve' || !billing) return;
+
+  const blockReason = getVerifyBlockReason(billing);
+  if (!blockReason) return;
+
+  dialogMode.value = null;
+  snackbarMessage.value = blockReason;
+  snackbar.value = true;
+});
+
 async function submitVerifyAction(formValues: Record<string, string | number>) {
   if (!selectedBilling.value) return;
-  if (!canVerifyBilling(selectedBilling.value)) {
-    snackbarMessage.value = 'Only billings with an active outstanding balance can be forwarded to Pay Bills.';
+  const blockReason = getVerifyBlockReason(selectedBilling.value);
+  if (blockReason) {
+    snackbarMessage.value = blockReason;
     snackbar.value = true;
     return;
   }
@@ -286,7 +390,16 @@ async function submitCorrection(payload: { reason: string; remarks: string }) {
 }
 
 onMounted(() => {
-  loadSnapshot();
+  void loadSnapshot();
+  void loadIntegrationFlow();
+  realtime.startPolling(() => {
+    void loadSnapshot(true, { silent: true });
+  }, 0, { immediate: false, pauseWhenDialogOpen: false });
+});
+
+onUnmounted(() => {
+  realtime.stopPolling();
+  realtime.invalidatePending();
 });
 </script>
 
@@ -327,10 +440,9 @@ onMounted(() => {
               <div class="billing-search-stack">
                 <v-text-field
                   v-model="search"
-                  prepend-inner-icon="mdi-magnify"
-                  append-inner-icon="mdi-card-search-outline"
-                  label="Search by student, billing code, program, or status"
-                  placeholder="Try BILL-1007 or Liza Garcia"
+                  :prepend-inner-icon="mdiMagnify"
+                  label="Search by student, number, billing code, program, stage, or fee"
+                  placeholder="Try BILL-VERIFY-2001, Clara, or Accountancy"
                   variant="outlined"
                   density="comfortable"
                   clearable
@@ -340,17 +452,35 @@ onMounted(() => {
                 <div class="d-flex align-center justify-space-between flex-wrap ga-2">
                   <div class="text-body-2 text-medium-emphasis">{{ resultSummary }}</div>
                   <v-btn
-                    v-if="search"
+                    v-if="search || departmentFilter !== 'All Departments' || categoryFilter !== 'All Categories'"
                     size="small"
                     variant="text"
                     color="primary"
                     prepend-icon="mdi-filter-remove-outline"
-                    @click="search = ''"
+                    @click="search = ''; departmentFilter = 'All Departments'; categoryFilter = 'All Categories'"
                   >
-                    Clear Search
+                    Clear Filters
                   </v-btn>
                 </div>
               </div>
+              <v-select
+                v-model="departmentFilter"
+                :items="departmentFilterOptions"
+                label="Connected department"
+                variant="outlined"
+                density="comfortable"
+                hide-details
+                class="page-size-select"
+              />
+              <v-select
+                v-model="categoryFilter"
+                :items="categoryFilterOptions"
+                label="Category type"
+                variant="outlined"
+                density="comfortable"
+                hide-details
+                class="page-size-select"
+              />
               <v-select
                 v-model="itemsPerPage"
                 :items="[6, 10]"
@@ -378,6 +508,7 @@ onMounted(() => {
                         <div class="text-subtitle-1 font-weight-bold">{{ item.studentName }}</div>
                         <v-chip size="small" :color="statusColor(item.status)" variant="tonal">{{ item.status }}</v-chip>
                         <v-chip size="small" color="primary" variant="outlined">{{ item.reference }}</v-chip>
+                        <v-chip size="small" :color="item.sourceModule === 'Clinic' ? 'warning' : 'secondary'" variant="tonal">{{ item.sourceDepartment }}</v-chip>
                       </div>
                       <div class="billing-meta-grid">
                         <div>
@@ -393,8 +524,16 @@ onMounted(() => {
                           <div class="meta-value">{{ item.amount }}</div>
                         </div>
                         <div>
+                          <div class="meta-label">Connected Dept</div>
+                          <div class="meta-value">{{ item.sourceDepartment }}</div>
+                        </div>
+                        <div>
                           <div class="meta-label">Total Paid</div>
                           <div class="meta-value">{{ item.totalPaid }}</div>
+                        </div>
+                        <div>
+                          <div class="meta-label">Booking Category</div>
+                          <div class="meta-value">{{ item.sourceCategory }}</div>
                         </div>
                         <div>
                           <div class="meta-label">Due Date</div>
@@ -429,9 +568,6 @@ onMounted(() => {
                         :disabled="!canVerifyBilling(item)"
                         @click="openDialog('approve', item)"
                       />
-                      <div v-if="!canVerifyBilling(item)" class="text-caption text-error text-center px-2">
-                        Verification requires an active outstanding balance.
-                      </div>
                       <CashierActionButton :icon="mdiCloseThick" label="Correction" color="error" variant="outlined" @click="openCorrectionDialog(item)" />
                       <CashierActionButton :icon="mdiBellOutline" label="Notify" color="secondary" variant="tonal" @click="openDialog('notify', item)" />
                     </div>
@@ -471,6 +607,9 @@ onMounted(() => {
             <div class="text-body-2">{{ nextStepLabel }}</div>
           </div>
           <v-list density="comfortable" class="py-0">
+            <v-list-item title="Source module" :subtitle="selectedBilling.sourceModule" />
+            <v-list-item title="Connected department" :subtitle="selectedBilling.sourceDepartment" />
+            <v-list-item title="Booking category" :subtitle="selectedBilling.sourceCategory" />
             <v-list-item title="Current status" :subtitle="selectedBilling.status" />
             <v-list-item title="Program" :subtitle="selectedBilling.program" />
             <v-list-item title="Due date" :subtitle="selectedBilling.dueDate" />
@@ -506,6 +645,37 @@ onMounted(() => {
           </div>
         </v-card-text>
       </v-card>
+
+      <v-card class="panel-card mt-6" variant="outlined">
+        <v-card-item>
+          <v-card-title>Inter-Department Integration</v-card-title>
+          <v-card-subtitle>Cashier dependencies for end-to-end institutional workflow</v-card-subtitle>
+        </v-card-item>
+        <v-card-text>
+          <v-alert v-if="integrationError" type="warning" variant="tonal" class="mb-3">{{ integrationError }}</v-alert>
+          <div v-if="integrationLoading" class="py-4 text-center">
+            <v-progress-circular indeterminate color="primary" size="22" />
+          </div>
+          <div v-else class="integration-grid">
+            <div class="integration-column">
+              <div class="meta-label mb-2">Incoming To Cashier</div>
+              <div v-if="incomingDependencies.length === 0" class="text-body-2 text-medium-emphasis">No incoming dependencies configured.</div>
+              <div v-for="(edge, index) in incomingDependencies" :key="`in-${index}-${edge.from}-${edge.artifact}`" class="integration-edge">
+                <div class="font-weight-bold">{{ edge.from }}</div>
+                <div class="text-body-2 text-medium-emphasis">{{ edge.artifact }}</div>
+              </div>
+            </div>
+            <div class="integration-column">
+              <div class="meta-label mb-2">Outgoing From Cashier</div>
+              <div v-if="outgoingDependencies.length === 0" class="text-body-2 text-medium-emphasis">No outgoing dependencies configured.</div>
+              <div v-for="(edge, index) in outgoingDependencies" :key="`out-${index}-${edge.to}-${edge.artifact}`" class="integration-edge">
+                <div class="font-weight-bold">{{ edge.to }}</div>
+                <div class="text-body-2 text-medium-emphasis">{{ edge.artifact }}</div>
+              </div>
+            </div>
+          </div>
+        </v-card-text>
+      </v-card>
     </v-col>
 
     <v-col cols="12">
@@ -516,6 +686,7 @@ onMounted(() => {
       v-if="dialogMode === 'approve'"
       :model-value="true"
       :loading="actionLoading"
+      :confirm-disabled="!selectedBilling || !canVerifyBilling(selectedBilling)"
       title="Verify Billing Record"
       subtitle="Validate the billing details and move the record into Pay Bills once it is ready for cashier settlement."
       chip-label="Verify"
@@ -587,7 +758,11 @@ onMounted(() => {
             </v-chip>
           </div>
           <div class="verify-flow-preview__copy text-body-2 text-medium-emphasis">
-            Verify the student profile, fee breakdown, payment eligibility, and duplicate-billing check before releasing this record to the cashier payment queue.
+            {{
+              canVerifyBilling(selectedBilling)
+                ? 'Verify the student profile, fee breakdown, payment eligibility, and duplicate-billing check before releasing this record to the cashier payment queue.'
+                : getVerifyBlockReason(selectedBilling)
+            }}
           </div>
           <div v-if="selectedBilling.feeSummary" class="verify-flow-preview__summary">
             <div class="verify-flow-preview__metric">
@@ -757,10 +932,10 @@ onMounted(() => {
 
 .billing-toolbar {
   display: grid;
-  grid-template-columns: minmax(280px, 1fr) 170px;
+  grid-template-columns: minmax(260px, 1fr) 180px 180px 150px;
   gap: 12px;
   align-items: start;
-  width: min(100%, 560px);
+  width: min(100%, 940px);
 }
 
 .billing-search-stack {
@@ -878,6 +1053,30 @@ onMounted(() => {
   margin-top: 12px;
 }
 
+.integration-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.integration-column {
+  padding: 12px;
+  border-radius: 14px;
+  background: #f8fbff;
+  border: 1px solid rgba(78, 107, 168, 0.14);
+}
+
+.integration-edge {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #fff;
+  border: 1px solid rgba(120, 145, 190, 0.14);
+}
+
+.integration-edge + .integration-edge {
+  margin-top: 8px;
+}
+
 @media (max-width: 959px) {
   .billing-actions {
     min-width: 100%;
@@ -893,6 +1092,10 @@ onMounted(() => {
     overflow: visible;
     padding-right: 0;
   }
+
+  .integration-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 640px) {
@@ -905,3 +1108,6 @@ onMounted(() => {
   }
 }
 </style>
+
+
+

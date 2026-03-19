@@ -162,7 +162,6 @@ onUnmounted(() => {
         <v-card-title>Patient Registry</v-card-title>
         <template #append>
           <div class="d-flex ga-2 align-center flex-wrap">
-            <v-btn class="saas-btn saas-btn-ghost" prepend-icon="mdi-refresh" :loading="loading" @click="load">Refresh</v-btn>
             <v-btn class="saas-btn saas-btn-primary" prepend-icon="mdi-sync" :loading="syncing" @click="syncNow">Sync Modules</v-btn>
           </div>
         </template>

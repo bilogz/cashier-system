@@ -58,6 +58,9 @@ export type VerificationBillingItem = {
   studentName: string;
   studentNumber: string;
   program: string;
+  sourceModule: string;
+  sourceDepartment: string;
+  sourceCategory: string;
   amount: string;
   totalPaid: string;
   dueDate: string;
@@ -75,6 +78,9 @@ export type ManagementLedgerItem = {
   studentName: string;
   semester: string;
   category: string;
+  sourceModule: string;
+  sourceDepartment: string;
+  sourceCategory: string;
   total: string;
   balance: string;
   status: ManagementLedgerStatus;

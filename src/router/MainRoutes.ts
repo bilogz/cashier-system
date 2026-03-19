@@ -57,6 +57,15 @@ const MainRoutes = {
       }
     },
     {
+      name: 'Report Center',
+      path: '/modules/report-center',
+      component: () => import('@/views/cashier/modules/ReportCenterPage.vue'),
+      meta: {
+        pageTitle: 'Report Center',
+        pageDescription: 'Receive PMED report requests, prepare reconciled cashier report packages, and send financial reports back to PMED.'
+      }
+    },
+    {
       name: 'Completed Transactions',
       path: '/modules/reports',
       component: () => import('@/views/cashier/modules/ReportsDashboardPage.vue'),

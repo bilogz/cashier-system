@@ -2,6 +2,7 @@ import vue from '@vitejs/plugin-vue';
 import { fileURLToPath, URL } from 'url';
 import { defineConfig, loadEnv, type Plugin } from 'vite';
 import { neon } from '@neondatabase/serverless';
+import pg from 'pg';
 import vuetify from 'vite-plugin-vuetify';
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 
@@ -17,11 +18,45 @@ function normalizePathPrefix(value: string): string {
 type JsonRecord = Record<string, unknown>;
 const patientAuthRateLimit = new Map<string, { count: number; resetAt: number }>();
 const adminAuthRateLimit = new Map<string, { count: number; resetAt: number }>();
+const sqlPoolByConnection = new Map<string, pg.Pool>();
 
 function writeJson(res: any, statusCode: number, payload: JsonRecord): void {
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.end(JSON.stringify(payload));
+}
+
+function shouldUseNeonHttpDriver(connectionString: string): boolean {
+  const value = String(connectionString || '').toLowerCase();
+  return value.includes('.neon.tech') || value.includes('.neon.build');
+}
+
+function shouldUseSsl(connectionString: string): boolean {
+  const value = String(connectionString || '').toLowerCase();
+  return value.includes('supabase.co') || value.includes('supabase.net') || value.includes('pooler.supabase.com');
+}
+
+function createSqlClient(connectionString: string): { query: (sql: string, params?: unknown[]) => Promise<any[]> } {
+  if (shouldUseNeonHttpDriver(connectionString)) {
+    return neon(connectionString);
+  }
+
+  let pool = sqlPoolByConnection.get(connectionString);
+  if (!pool) {
+    const { Pool } = pg;
+    pool = new Pool({
+      connectionString,
+      ...(shouldUseSsl(connectionString) ? { ssl: { rejectUnauthorized: false } } : {})
+    });
+    sqlPoolByConnection.set(connectionString, pool);
+  }
+
+  return {
+    async query(sql: string, params: unknown[] = []): Promise<any[]> {
+      const result = await pool.query(sql, params);
+      return result.rows;
+    }
+  };
 }
 
 async function readJsonBody(req: any): Promise<JsonRecord> {
@@ -500,6 +535,27 @@ async function ensureModuleActivityLogsTable(sql: ReturnType<typeof neon>): Prom
   await sql.query(`CREATE INDEX IF NOT EXISTS idx_module_activity_module ON module_activity_logs(module, created_at DESC)`);
 }
 
+async function ensureNotificationsTable(sql: ReturnType<typeof neon>): Promise<void> {
+  await sql.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id BIGSERIAL PRIMARY KEY,
+      recipient_role VARCHAR(60) NOT NULL DEFAULT 'admin',
+      recipient_name VARCHAR(190) NULL,
+      channel VARCHAR(40) NOT NULL DEFAULT 'in_app',
+      type VARCHAR(80) NOT NULL DEFAULT 'general',
+      title VARCHAR(190) NOT NULL,
+      message TEXT NOT NULL,
+      entity_type VARCHAR(80) NULL,
+      entity_id BIGINT NULL,
+      is_read BOOLEAN NOT NULL DEFAULT FALSE,
+      read_at TIMESTAMP NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await sql.query(`CREATE INDEX IF NOT EXISTS idx_notifications_recent ON notifications(created_at DESC)`);
+  await sql.query(`CREATE INDEX IF NOT EXISTS idx_notifications_role_read ON notifications(recipient_role, is_read, created_at DESC)`);
+}
+
 async function ensureAdminProfileTables(sql: ReturnType<typeof neon>): Promise<void> {
   await sql.query(`
     CREATE TABLE IF NOT EXISTS admin_profiles (
@@ -658,12 +714,87 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
   return {
     name: 'neon-appointments-api',
     configureServer(server) {
+      const realtimeClients = new Set<any>();
+      let realtimeClientSeq = 0;
+      let realtimeHeartbeat: ReturnType<typeof setInterval> | null = null;
+
+      const writeRealtimeEvent = (res: any, payload: Record<string, unknown>): void => {
+        res.write(`data: ${JSON.stringify({ at: new Date().toISOString(), ...payload })}\n\n`);
+      };
+
+      const broadcastRealtimeEvent = (payload: Record<string, unknown>): void => {
+        for (const client of realtimeClients) {
+          try {
+            writeRealtimeEvent(client.res, payload);
+          } catch {
+            realtimeClients.delete(client);
+          }
+        }
+      };
+
+      const ensureRealtimeHeartbeat = (): void => {
+        if (realtimeHeartbeat) return;
+        realtimeHeartbeat = setInterval(() => {
+          for (const client of realtimeClients) {
+            try {
+              client.res.write(`: heartbeat ${Date.now()}\n\n`);
+            } catch {
+              realtimeClients.delete(client);
+            }
+          }
+          if (!realtimeClients.size && realtimeHeartbeat) {
+            clearInterval(realtimeHeartbeat);
+            realtimeHeartbeat = null;
+          }
+        }, 20000);
+      };
+
       server.middlewares.use(async (req, res, next) => {
         const url = new URL(req.url || '', 'http://localhost');
+        const isBillingVerifyRoute = /^\/api\/billings\/\d+\/verify$/.test(url.pathname);
+        const isPaymentsApproveRoute = url.pathname === '/api/payments/approve';
+        const isPaymentsMarkFailedRoute = /^\/api\/payments\/\d+\/mark-failed$/.test(url.pathname);
+        const isInstallmentsRoute = url.pathname === '/api/installments';
+        const isPaymentAuthorizeRoute = /^\/api\/payment-transactions\/\d+\/authorize$/.test(url.pathname);
+        const isPaymentConfirmPaidRoute = /^\/api\/payment-transactions\/\d+\/confirm-paid$/.test(url.pathname);
+        const isReceiptsGenerateRoute = url.pathname === '/api/receipts/generate';
+        const isComplianceVerifyRoute = /^\/api\/compliance\/\d+\/verify-proof$/.test(url.pathname);
+        const isComplianceCompleteRoute = /^\/api\/compliance\/\d+\/complete$/.test(url.pathname);
+        const isReconciliationActionRoute = /^\/api\/reconciliation\/\d+\/(reconcile|archive|flag-discrepancy)$/.test(url.pathname);
+        const isWorkflowCorrectionRoute = /^\/api\/workflow\/\d+\/return-for-correction$/.test(url.pathname);
+        const isNotificationsSendRoute = url.pathname === '/api/notifications/send';
+        const isNotificationsRoute = url.pathname === '/api/notifications';
+        const isNotificationReadRoute = /^\/api\/notifications\/\d+\/read$/.test(url.pathname);
+        const isNotificationsReadAllRoute = url.pathname === '/api/notifications/read-all';
         if (
+          url.pathname !== '/api/realtime-stream' &&
+          url.pathname !== '/api/clinic-sync/status' &&
+          url.pathname !== '/api/report-center' &&
           url.pathname !== '/api/appointments' &&
           url.pathname !== '/api/admin-auth' &&
           url.pathname !== '/api/admin-profile' &&
+          url.pathname !== '/api/student-billing' &&
+          url.pathname !== '/api/process-payment' &&
+          url.pathname !== '/api/generate-receipt' &&
+          url.pathname !== '/api/reporting-reconciliation' &&
+          url.pathname !== '/api/reports/transactions' &&
+          url.pathname !== '/api/reports/export' &&
+          url.pathname !== '/api/integrated-flow' &&
+          !isBillingVerifyRoute &&
+          !isPaymentsApproveRoute &&
+          !isPaymentsMarkFailedRoute &&
+          !isInstallmentsRoute &&
+          !isPaymentAuthorizeRoute &&
+          !isPaymentConfirmPaidRoute &&
+          !isReceiptsGenerateRoute &&
+          !isComplianceVerifyRoute &&
+          !isComplianceCompleteRoute &&
+          !isReconciliationActionRoute &&
+          !isWorkflowCorrectionRoute &&
+          !isNotificationsSendRoute &&
+          !isNotificationsRoute &&
+          !isNotificationReadRoute &&
+          !isNotificationsReadAllRoute &&
           url.pathname !== '/api/registrations' &&
           url.pathname !== '/api/walk-ins' &&
           url.pathname !== '/api/checkups' &&
@@ -683,12 +814,35 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           return;
         }
 
+        if (url.pathname === '/api/realtime-stream' && (req.method || 'GET').toUpperCase() === 'GET') {
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+          res.setHeader('Cache-Control', 'no-cache, no-transform');
+          res.setHeader('Connection', 'keep-alive');
+          res.setHeader('X-Accel-Buffering', 'no');
+          res.write(`retry: 2000\n\n`);
+
+          const client = { id: ++realtimeClientSeq, res };
+          realtimeClients.add(client);
+          ensureRealtimeHeartbeat();
+          writeRealtimeEvent(res, { type: 'connected', module: 'system', action: 'Realtime Connected' });
+
+          req.on('close', () => {
+            realtimeClients.delete(client);
+            if (!realtimeClients.size && realtimeHeartbeat) {
+              clearInterval(realtimeHeartbeat);
+              realtimeHeartbeat = null;
+            }
+          });
+          return;
+        }
+
         if (!databaseUrl) {
           writeJson(res, 500, { ok: false, message: 'DATABASE_URL is missing in admin_template/.env' });
           return;
         }
 
-        const sql = neon(databaseUrl);
+        const sql = createSqlClient(databaseUrl) as ReturnType<typeof neon>;
         const pharmacyAllowedActions: Record<string, string[]> = {
           Admin: ['create_medicine', 'update_medicine', 'archive_medicine', 'restock', 'dispense', 'adjust_stock', 'fulfill_request', 'save_draft'],
           Pharmacist: ['create_medicine', 'update_medicine', 'restock', 'dispense', 'adjust_stock', 'fulfill_request', 'save_draft'],
@@ -732,6 +886,108 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             .replace(/\b\w/g, (ch) => ch.toUpperCase());
         };
 
+        const formatCurrency = (value: unknown): string => {
+          const amount = Number(value || 0);
+          return new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' }).format(Number.isFinite(amount) ? amount : 0);
+        };
+
+        const mapPaymentStatus = (raw: string): 'Processing' | 'Authorized' | 'Paid' | 'Failed' | 'Cancelled' => {
+          const value = String(raw || '').trim().toLowerCase();
+          if (value === 'authorized') return 'Authorized';
+          if (value === 'paid' || value === 'posted') return 'Paid';
+          if (value === 'failed') return 'Failed';
+          if (value === 'cancelled' || value === 'canceled') return 'Cancelled';
+          return 'Processing';
+        };
+
+        const mapReportingStatus = (raw: string): 'Logged' | 'Reconciled' | 'Reported' | 'Archived' | 'With Discrepancy' => {
+          const value = String(raw || '').trim().toLowerCase();
+          if (value === 'reconciled') return 'Reconciled';
+          if (value === 'reported') return 'Reported';
+          if (value === 'archived') return 'Archived';
+          if (value === 'with_discrepancy' || value === 'with discrepancy' || value === 'discrepancy') return 'With Discrepancy';
+          return 'Logged';
+        };
+
+        const mapReceiptStatus = (raw: string): 'Receipt Pending' | 'Receipt Generated' | 'Proof Verified' | 'Documentation Completed' => {
+          const value = String(raw || '').trim().toLowerCase();
+          if (value === 'proof_verified' || value === 'verified') return 'Proof Verified';
+          if (value === 'documentation_completed' || value === 'completed') return 'Documentation Completed';
+          if (value) return 'Receipt Generated';
+          return 'Receipt Pending';
+        };
+
+        const mapBillingStatusForVerification = (raw: string): 'Draft' | 'Active Billing' | 'Pending Payment' | 'Needs Correction' => {
+          const value = String(raw || '').trim().toLowerCase();
+          if (value.includes('correction')) return 'Needs Correction';
+          if (value === 'draft') return 'Draft';
+          if (value === 'active' || value === 'active billing') return 'Active Billing';
+          return 'Pending Payment';
+        };
+
+        const mapBillingStatusForManagement = (balance: number, paid: number, raw: string): 'Pending Payment' | 'Partially Paid' | 'Fully Paid' | 'Payment Failed' => {
+          if (Number(balance || 0) <= 0) return 'Fully Paid';
+          if (String(raw || '').toLowerCase().includes('failed')) return 'Payment Failed';
+          if (Number(paid || 0) > 0) return 'Partially Paid';
+          return 'Pending Payment';
+        };
+
+        const workflowLabel = (stage: string): string => toActionLabel(String(stage || '').replace(/\./g, ' '));
+
+        const integratedFlow = {
+          nodes: [
+            'Registrar',
+            'Cashier',
+            'Clinic',
+            'Guidance Office',
+            'Prefect Office',
+            'Computer Laboratory',
+            'CRAD Department',
+            'HR Department',
+            'PMED Department',
+            'School Administration'
+          ],
+          edges: [
+            { from: 'Registrar', to: 'Cashier', artifact: 'Student enrollment data' },
+            { from: 'Registrar', to: 'Clinic', artifact: 'Student personal information' },
+            { from: 'Registrar', to: 'Guidance Office', artifact: 'Student personal information' },
+            { from: 'Registrar', to: 'Prefect Office', artifact: 'Student personal information' },
+            { from: 'Registrar', to: 'Guidance Office', artifact: 'Student academic records' },
+            { from: 'Registrar', to: 'Computer Laboratory', artifact: 'Student list' },
+            { from: 'Registrar', to: 'CRAD Department', artifact: 'Student list' },
+            { from: 'Registrar', to: 'PMED Department', artifact: 'Enrollment statistics' },
+            { from: 'Cashier', to: 'Registrar', artifact: 'Payment confirmation' },
+            { from: 'Cashier', to: 'PMED Department', artifact: 'Financial reports' },
+            { from: 'Clinic', to: 'Registrar', artifact: 'Medical clearance' },
+            { from: 'Clinic', to: 'Guidance Office', artifact: 'Health reports' },
+            { from: 'Clinic', to: 'PMED Department', artifact: 'Health service reports' },
+            { from: 'Guidance Office', to: 'Registrar', artifact: 'Counseling reports' },
+            { from: 'Guidance Office', to: 'PMED Department', artifact: 'Counseling reports' },
+            { from: 'Guidance Office', to: 'Clinic', artifact: 'Health concerns' },
+            { from: 'Guidance Office', to: 'Prefect Office', artifact: 'Discipline reports' },
+            { from: 'Guidance Office', to: 'CRAD Department', artifact: 'Student recommendations' },
+            { from: 'Prefect Office', to: 'Registrar', artifact: 'Discipline records' },
+            { from: 'Prefect Office', to: 'Guidance Office', artifact: 'Discipline reports' },
+            { from: 'Prefect Office', to: 'Clinic', artifact: 'Incident reports' },
+            { from: 'Prefect Office', to: 'PMED Department', artifact: 'Discipline statistics' },
+            { from: 'Computer Laboratory', to: 'PMED Department', artifact: 'Laboratory usage reports' },
+            { from: 'CRAD Department', to: 'Registrar', artifact: 'Activity participation records' },
+            { from: 'CRAD Department', to: 'PMED Department', artifact: 'Program activity reports' },
+            { from: 'HR Department', to: 'Cashier', artifact: 'Payroll data' },
+            { from: 'HR Department', to: 'Registrar', artifact: 'Staff list' },
+            { from: 'HR Department', to: 'Computer Laboratory', artifact: 'Staff list' },
+            { from: 'HR Department', to: 'PMED Department', artifact: 'Employee performance records' },
+            { from: 'PMED Department', to: 'School Administration', artifact: 'Evaluation reports' },
+            { from: 'PMED Department', to: 'HR Department', artifact: 'Staff evaluation feedback' }
+          ],
+          functions: {
+            getIncomingByDepartment: (department: string) =>
+              (integratedFlow.edges || []).filter((edge) => String(edge.to).toLowerCase() === String(department || '').toLowerCase()),
+            getOutgoingByDepartment: (department: string) =>
+              (integratedFlow.edges || []).filter((edge) => String(edge.from).toLowerCase() === String(department || '').toLowerCase())
+          }
+        };
+
         async function insertModuleActivity(
           moduleName: string,
           action: string,
@@ -755,6 +1011,460 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               JSON.stringify(metadata || {})
             ]
           );
+        }
+
+        function formatRelativeTime(value: string | Date | null | undefined): string {
+          if (!value) return 'Just now';
+          const date = value instanceof Date ? value : new Date(value);
+          if (Number.isNaN(date.getTime())) return 'Just now';
+          const diffMs = Date.now() - date.getTime();
+          const diffMinutes = Math.max(0, Math.floor(diffMs / 60000));
+          if (diffMinutes < 1) return 'Just now';
+          if (diffMinutes < 60) return `${diffMinutes} min${diffMinutes === 1 ? '' : 's'} ago`;
+          const diffHours = Math.floor(diffMinutes / 60);
+          if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`;
+          const diffDays = Math.floor(diffHours / 24);
+          if (diffDays < 7) return `${diffDays} day${diffDays === 1 ? '' : 's'} ago`;
+          return date.toLocaleDateString();
+        }
+
+        function formatDateTimeLabel(value: string | Date | null | undefined): string {
+          if (!value) return '--';
+          const date = value instanceof Date ? value : new Date(value);
+          if (Number.isNaN(date.getTime())) return '--';
+          return new Intl.DateTimeFormat('en-US', {
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+            timeZone: 'Asia/Manila'
+          }).format(date) + ' GMT+8';
+        }
+
+        async function resolveDepartmentClearanceRelation(): Promise<string> {
+          const rows = (await sql.query(
+            `SELECT CASE
+               WHEN to_regclass('clinic.department_clearance_records') IS NOT NULL THEN 'clinic.department_clearance_records'
+               WHEN to_regclass('pmed.department_clearance_records') IS NOT NULL THEN 'pmed.department_clearance_records'
+               WHEN to_regclass('public.department_clearance_records') IS NOT NULL THEN 'public.department_clearance_records'
+               ELSE ''
+             END AS relation`
+          )) as Array<{ relation: string | null }>;
+          return toSafeText(rows[0]?.relation);
+        }
+
+        async function fetchPmedCashierRequestRows(limit = 50): Promise<Array<{
+          id: number;
+          action: string;
+          detail: string;
+          actor: string;
+          entity_key: string | null;
+          metadata: Record<string, unknown> | string | null;
+          created_at: string;
+        }>> {
+          const maxRows = Math.max(1, Math.trunc(limit));
+          await ensureModuleActivityLogsTable(sql);
+          const activityRows = (await sql.query(
+            `SELECT id, action, detail, actor, entity_key, metadata, created_at
+             FROM module_activity_logs
+             WHERE LOWER(module) = 'department_reports'
+               AND LOWER(COALESCE(metadata->>'source_department', '')) = 'pmed'
+               AND (
+                 LOWER(COALESCE(metadata->>'target_department', metadata->>'target_key', '')) IN ('cashier', 'reports')
+                 OR LOWER(COALESCE(metadata->>'target_department_name', '')) = 'cashier'
+               )
+               AND (
+                 LOWER(action) LIKE '%report requested%'
+                 OR LOWER(COALESCE(metadata->>'request_status', '')) = 'requested'
+                 OR LOWER(COALESCE(metadata->>'delivery_status', '')) = 'awaiting department'
+               )
+             ORDER BY created_at DESC
+             LIMIT ${maxRows}`
+          )) as Array<{
+            id: number;
+            action: string;
+            detail: string;
+            actor: string;
+            entity_key: string | null;
+            metadata: Record<string, unknown> | string | null;
+            created_at: string;
+          }>;
+
+          const unifiedRows = [...activityRows];
+          const seenReferences = new Set(
+            activityRows.map((row) => {
+              const metadata = typeof row.metadata === 'string'
+                ? (() => {
+                    try {
+                      return JSON.parse(row.metadata) as Record<string, unknown>;
+                    } catch {
+                      return {} as Record<string, unknown>;
+                    }
+                  })()
+                : ((row.metadata || {}) as Record<string, unknown>);
+              return (
+                toSafeText(metadata.report_reference) ||
+                toSafeText(row.entity_key) ||
+                String(row.id)
+              ).toLowerCase();
+            })
+          );
+
+          const clearanceRelation = await resolveDepartmentClearanceRelation();
+          if (clearanceRelation) {
+            const clearanceRows = (await sql.query(
+              `SELECT id, clearance_reference, department_key, department_name, status, remarks, requested_by, external_reference,
+                      metadata, created_at::text AS created_at, updated_at::text AS updated_at
+               FROM ${clearanceRelation}
+               WHERE LOWER(COALESCE(department_key, '')) = 'cashier'
+                 AND LOWER(COALESCE(status, '')) = 'pending'
+                 AND LOWER(COALESCE(metadata->>'source_department', '')) = 'pmed'
+                 AND (
+                   LOWER(COALESCE(metadata->>'requested_department', '')) = 'cashier'
+                   OR LOWER(COALESCE(metadata->>'requested_department_name', '')) = 'cashier'
+                 )
+                 AND (
+                   LOWER(COALESCE(metadata->>'request_status', '')) = 'requested'
+                   OR LOWER(COALESCE(metadata->>'delivery_status', '')) = 'awaiting department'
+                 )
+               ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+               LIMIT ${maxRows}`
+            )) as Array<{
+              id: number;
+              clearance_reference: string;
+              department_key: string;
+              department_name: string;
+              status: string;
+              remarks: string | null;
+              requested_by: string | null;
+              external_reference: string | null;
+              metadata: Record<string, unknown> | string | null;
+              created_at: string;
+              updated_at: string | null;
+            }>;
+
+            for (const row of clearanceRows) {
+              const metadata = typeof row.metadata === 'string'
+                ? (() => {
+                    try {
+                      return JSON.parse(row.metadata) as Record<string, unknown>;
+                    } catch {
+                      return {} as Record<string, unknown>;
+                    }
+                  })()
+                : ((row.metadata || {}) as Record<string, unknown>);
+              const reportReference =
+                toSafeText(metadata.report_reference) ||
+                toSafeText(row.external_reference) ||
+                toSafeText(row.clearance_reference);
+              const dedupeKey = (reportReference || String(row.id)).toLowerCase();
+              if (seenReferences.has(dedupeKey)) continue;
+              seenReferences.add(dedupeKey);
+              unifiedRows.push({
+                id: -Math.abs(Number(row.id || 0)),
+                action: 'PMED Report Requested',
+                detail: toSafeText(row.remarks) || `PMED requested ${toSafeText(row.department_name) || 'Cashier'} to submit ${toSafeText(metadata.report_name) || 'a report'}.`,
+                actor: toSafeText(row.requested_by) || 'PMED Reports Desk',
+                entity_key: reportReference || null,
+                metadata: {
+                  ...metadata,
+                  source_department: 'pmed',
+                  source_department_name: 'PMED',
+                  target_department: 'cashier',
+                  target_department_name: 'Cashier',
+                  target_key: 'cashier',
+                  request_status: toSafeText(metadata.request_status) || 'requested',
+                  report_reference: reportReference || null,
+                  report_name: toSafeText(metadata.report_name) || toSafeText(row.clearance_reference) || 'Requested Cashier Report',
+                  report_type: toSafeText(metadata.report_type) || 'Cashier Report',
+                  plan_reference: toSafeText(metadata.plan_reference) || null
+                },
+                created_at: toSafeText(row.updated_at) || toSafeText(row.created_at)
+              });
+            }
+          }
+
+          return unifiedRows
+            .sort((left, right) => new Date(String(right.created_at || '')).getTime() - new Date(String(left.created_at || '')).getTime())
+            .slice(0, maxRows);
+        }
+
+        async function syncPmedReportRequestNotifications(): Promise<void> {
+          try {
+            await ensureNotificationsTable(sql);
+            const requestRows = await fetchPmedCashierRequestRows(50);
+            for (const row of requestRows) {
+              const metadata = typeof row.metadata === 'string'
+                ? (() => {
+                    try {
+                      return JSON.parse(row.metadata) as Record<string, unknown>;
+                    } catch {
+                      return {} as Record<string, unknown>;
+                    }
+                  })()
+                : ((row.metadata || {}) as Record<string, unknown>);
+              const existing = (await sql.query(
+                `SELECT id
+                 FROM notifications
+                 WHERE entity_type = 'department_report_request'
+                   AND entity_id = $1
+                 LIMIT 1`,
+                [row.id]
+              )) as Array<{ id: number }>;
+              if (existing.length) continue;
+              const reportName = toSafeText(metadata.report_name) || toSafeText(row.entity_key) || 'Requested Cashier Report';
+              const reportReference = toSafeText(metadata.report_reference) || toSafeText(row.entity_key);
+              await sql.query(
+                `INSERT INTO notifications (
+                   recipient_role, recipient_name, channel, type, title, message, entity_type, entity_id, is_read, created_at
+                 )
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,$9)`,
+                [
+                  'cashier',
+                  'Cashier Reports Desk',
+                  'in_app',
+                  'pmed_report_request',
+                  `PMED requested ${reportName}`,
+                  `${toSafeText(row.detail) || 'PMED requested a cashier financial report.'}${reportReference ? ` Reference: ${reportReference}.` : ''}`,
+                  'department_report_request',
+                  row.id,
+                  row.created_at || new Date().toISOString()
+                ]
+              );
+            }
+          } catch (error) {
+            console.warn('[cashier] Unable to sync PMED request notifications:', error);
+          }
+        }
+
+        async function syncPatientMasterProfiles(): Promise<void> {
+          await ensurePatientMasterTables(sql);
+
+          const tableExists = async (tableName: string): Promise<boolean> => {
+            const rows = (await sql.query(`SELECT to_regclass($1) AS reg`, [`public.${tableName}`])) as Array<{ reg: string | null }>;
+            return Boolean(rows[0]?.reg);
+          };
+
+          const mergeTags = `ARRAY(SELECT DISTINCT tag FROM unnest(COALESCE(patient_master.source_tags, ARRAY[]::TEXT[]) || EXCLUDED.source_tags) AS tag)`;
+
+          if (await tableExists('patient_appointments')) {
+            await sql.query(
+              `INSERT INTO patient_master (
+                patient_code, patient_name, identity_key, email, contact, sex, age, emergency_contact, latest_status, risk_level, source_tags, last_seen_at
+             )
+             SELECT
+                COALESCE(NULLIF(TRIM(COALESCE(patient_id, '')), ''), 'PAT-A-' || id::text),
+                patient_name,
+                LOWER(TRIM(patient_name)) || '|' || COALESCE(regexp_replace(phone_number, '[^0-9]', '', 'g'), ''),
+                NULLIF(TRIM(COALESCE(patient_email, '')), ''),
+                NULLIF(TRIM(COALESCE(phone_number, '')), ''),
+                NULLIF(TRIM(COALESCE(patient_gender, '')), ''),
+                patient_age,
+                NULLIF(TRIM(COALESCE(emergency_contact, '')), ''),
+                LOWER(COALESCE(status, 'pending')),
+                CASE WHEN LOWER(COALESCE(appointment_priority, 'routine')) = 'urgent' THEN 'medium' ELSE 'low' END,
+                ARRAY['appointments'],
+                COALESCE(updated_at, created_at, NOW())
+             FROM patient_appointments
+             WHERE COALESCE(TRIM(patient_name), '') <> ''
+             ON CONFLICT (identity_key) DO UPDATE
+             SET patient_name = EXCLUDED.patient_name,
+                 email = COALESCE(EXCLUDED.email, patient_master.email),
+                 contact = COALESCE(EXCLUDED.contact, patient_master.contact),
+                 sex = COALESCE(EXCLUDED.sex, patient_master.sex),
+                 age = COALESCE(EXCLUDED.age, patient_master.age),
+                 emergency_contact = COALESCE(EXCLUDED.emergency_contact, patient_master.emergency_contact),
+                 latest_status = EXCLUDED.latest_status,
+                 risk_level = CASE
+                   WHEN EXCLUDED.risk_level = 'high' OR patient_master.risk_level = 'high' THEN 'high'
+                   WHEN EXCLUDED.risk_level = 'medium' OR patient_master.risk_level = 'medium' THEN 'medium'
+                   ELSE 'low'
+                 END,
+                 source_tags = ${mergeTags},
+                 last_seen_at = GREATEST(COALESCE(patient_master.last_seen_at, EXCLUDED.last_seen_at), EXCLUDED.last_seen_at),
+                 updated_at = NOW()`
+            );
+          }
+
+          if (await tableExists('patient_walkins')) {
+            await sql.query(
+              `INSERT INTO patient_master (
+                patient_code, patient_name, identity_key, contact, sex, date_of_birth, age, emergency_contact, latest_status, risk_level, source_tags, last_seen_at
+             )
+             SELECT
+                COALESCE(NULLIF(TRIM(COALESCE(patient_ref, '')), ''), 'PAT-W-' || id::text),
+                patient_name,
+                LOWER(TRIM(patient_name)) || '|' || COALESCE(regexp_replace(contact, '[^0-9]', '', 'g'), ''),
+                NULLIF(TRIM(COALESCE(contact, '')), ''),
+                NULLIF(TRIM(COALESCE(sex, '')), ''),
+                date_of_birth,
+                age,
+                NULLIF(TRIM(COALESCE(emergency_contact, '')), ''),
+                LOWER(COALESCE(status, 'waiting')),
+                CASE WHEN LOWER(COALESCE(severity, 'low')) = 'emergency' THEN 'high' WHEN LOWER(COALESCE(severity, 'low')) = 'moderate' THEN 'medium' ELSE 'low' END,
+                ARRAY['walkin'],
+                COALESCE(updated_at, created_at, NOW())
+             FROM patient_walkins
+             WHERE COALESCE(TRIM(patient_name), '') <> ''
+             ON CONFLICT (identity_key) DO UPDATE
+             SET patient_name = EXCLUDED.patient_name,
+                 contact = COALESCE(EXCLUDED.contact, patient_master.contact),
+                 sex = COALESCE(EXCLUDED.sex, patient_master.sex),
+                 date_of_birth = COALESCE(EXCLUDED.date_of_birth, patient_master.date_of_birth),
+                 age = COALESCE(EXCLUDED.age, patient_master.age),
+                 emergency_contact = COALESCE(EXCLUDED.emergency_contact, patient_master.emergency_contact),
+                 latest_status = EXCLUDED.latest_status,
+                 risk_level = CASE
+                   WHEN EXCLUDED.risk_level = 'high' OR patient_master.risk_level = 'high' THEN 'high'
+                   WHEN EXCLUDED.risk_level = 'medium' OR patient_master.risk_level = 'medium' THEN 'medium'
+                   ELSE 'low'
+                 END,
+                 source_tags = ${mergeTags},
+                 last_seen_at = GREATEST(COALESCE(patient_master.last_seen_at, EXCLUDED.last_seen_at), EXCLUDED.last_seen_at),
+                 updated_at = NOW()`
+            );
+          }
+
+          if (await tableExists('checkup_visits')) {
+            await sql.query(
+              `INSERT INTO patient_master (
+                patient_code, patient_name, identity_key, latest_status, risk_level, source_tags, last_seen_at
+             )
+             SELECT
+                'PAT-C-' || id::text,
+                patient_name,
+                LOWER(TRIM(patient_name)) || '|',
+                LOWER(COALESCE(status, 'intake')),
+                CASE WHEN is_emergency THEN 'high' ELSE 'low' END,
+                ARRAY['checkup'],
+                COALESCE(updated_at, created_at, NOW())
+             FROM checkup_visits
+             WHERE COALESCE(TRIM(patient_name), '') <> ''
+             ON CONFLICT (identity_key) DO UPDATE
+             SET patient_name = EXCLUDED.patient_name,
+                 latest_status = EXCLUDED.latest_status,
+                 risk_level = CASE WHEN EXCLUDED.risk_level = 'high' OR patient_master.risk_level = 'high' THEN 'high' ELSE patient_master.risk_level END,
+                 source_tags = ${mergeTags},
+                 last_seen_at = GREATEST(COALESCE(patient_master.last_seen_at, EXCLUDED.last_seen_at), EXCLUDED.last_seen_at),
+                 updated_at = NOW()`
+            );
+          }
+
+          if (await tableExists('mental_health_patients')) {
+            await sql.query(
+              `INSERT INTO patient_master (
+                patient_code, patient_name, identity_key, contact, sex, date_of_birth, guardian_contact, latest_status, risk_level, source_tags, last_seen_at
+             )
+             SELECT
+                patient_id,
+                patient_name,
+                LOWER(TRIM(patient_name)) || '|' || COALESCE(regexp_replace(contact_number, '[^0-9]', '', 'g'), ''),
+                NULLIF(TRIM(COALESCE(contact_number, '')), ''),
+                NULLIF(TRIM(COALESCE(sex, '')), ''),
+                date_of_birth,
+                NULLIF(TRIM(COALESCE(guardian_contact, '')), ''),
+                'active',
+                'low',
+                ARRAY['mental'],
+                NOW()
+             FROM mental_health_patients
+             WHERE COALESCE(TRIM(patient_name), '') <> ''
+             ON CONFLICT (identity_key) DO UPDATE
+             SET patient_name = EXCLUDED.patient_name,
+                 contact = COALESCE(EXCLUDED.contact, patient_master.contact),
+                 sex = COALESCE(EXCLUDED.sex, patient_master.sex),
+                 date_of_birth = COALESCE(EXCLUDED.date_of_birth, patient_master.date_of_birth),
+                 guardian_contact = COALESCE(EXCLUDED.guardian_contact, patient_master.guardian_contact),
+                 source_tags = ${mergeTags},
+                 last_seen_at = GREATEST(COALESCE(patient_master.last_seen_at, EXCLUDED.last_seen_at), EXCLUDED.last_seen_at),
+                 updated_at = NOW()`
+            );
+          }
+
+          if (await tableExists('mental_health_sessions')) {
+            await sql.query(
+              `UPDATE patient_master pm
+             SET risk_level = CASE
+               WHEN ms.max_risk = 'high' THEN 'high'
+               WHEN ms.max_risk = 'medium' AND pm.risk_level <> 'high' THEN 'medium'
+               ELSE pm.risk_level
+             END,
+             latest_status = COALESCE(ms.latest_status, pm.latest_status),
+             updated_at = NOW()
+             FROM (
+               SELECT
+                 LOWER(TRIM(patient_name)) || '|' AS identity_key_name,
+                 MAX(risk_level) FILTER (WHERE risk_level IN ('low', 'medium', 'high')) AS max_risk,
+                 (ARRAY_AGG(status ORDER BY updated_at DESC))[1] AS latest_status
+               FROM mental_health_sessions
+               GROUP BY LOWER(TRIM(patient_name))
+             ) ms
+             WHERE pm.identity_key = ms.identity_key_name`
+            );
+          }
+
+          await sql.query(`UPDATE patient_master SET appointment_count = 0, walkin_count = 0, checkup_count = 0, mental_count = 0, pharmacy_count = 0`);
+
+          if (await tableExists('patient_appointments')) {
+            await sql.query(
+              `UPDATE patient_master pm
+             SET appointment_count = sub.total
+             FROM (
+               SELECT LOWER(TRIM(patient_name)) || '|' || COALESCE(regexp_replace(phone_number, '[^0-9]', '', 'g'), '') AS identity_key, COUNT(*)::int AS total
+               FROM patient_appointments
+               GROUP BY 1
+             ) sub
+             WHERE pm.identity_key = sub.identity_key`
+            );
+          }
+          if (await tableExists('patient_walkins')) {
+            await sql.query(
+              `UPDATE patient_master pm
+             SET walkin_count = sub.total
+             FROM (
+               SELECT LOWER(TRIM(patient_name)) || '|' || COALESCE(regexp_replace(contact, '[^0-9]', '', 'g'), '') AS identity_key, COUNT(*)::int AS total
+               FROM patient_walkins
+               GROUP BY 1
+             ) sub
+             WHERE pm.identity_key = sub.identity_key`
+            );
+          }
+          if (await tableExists('checkup_visits')) {
+            await sql.query(
+              `UPDATE patient_master pm
+             SET checkup_count = sub.total
+             FROM (
+               SELECT LOWER(TRIM(patient_name)) || '|' AS identity_key, COUNT(*)::int AS total
+               FROM checkup_visits
+               GROUP BY 1
+             ) sub
+             WHERE pm.identity_key = sub.identity_key`
+            );
+          }
+          if (await tableExists('mental_health_sessions')) {
+            await sql.query(
+              `UPDATE patient_master pm
+             SET mental_count = sub.total
+             FROM (
+               SELECT LOWER(TRIM(patient_name)) || '|' AS identity_key, COUNT(*)::int AS total
+               FROM mental_health_sessions
+               GROUP BY 1
+             ) sub
+             WHERE pm.identity_key = sub.identity_key`
+            );
+          }
+          if (await tableExists('pharmacy_dispense_requests')) {
+            await sql.query(
+              `UPDATE patient_master pm
+             SET pharmacy_count = sub.total
+             FROM (
+               SELECT LOWER(TRIM(patient_name)) || '|' AS identity_key, COUNT(*)::int AS total
+               FROM pharmacy_dispense_requests
+               GROUP BY 1
+             ) sub
+             WHERE pm.identity_key = sub.identity_key`
+            );
+          }
         }
 
         async function getDoctorAvailabilitySnapshot(
@@ -3267,6 +3977,13 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               'patient_master',
               null
             );
+            await syncPatientMasterProfiles();
+            broadcastRealtimeEvent({
+              type: 'clinic_sync',
+              module: 'patients',
+              action: 'Patient Master Sync Requested',
+              detail: 'Patient profile sync requested from modules.'
+            });
             writeJson(res, 200, { ok: true, message: 'Sync requested. Use GET /api/patients to refresh merged profiles.' });
             return;
           }
@@ -3724,8 +4441,2803 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             return;
           }
 
+          const sanitizeCashierStudentKey = (value: string): string =>
+            value
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, '-')
+              .replace(/^-+|-+$/g, '') || 'clinic-record';
+
+          const deriveBillingConnectionMeta = (row: {
+            billing_code?: string | null;
+            student_no?: string | null;
+            student_email?: string | null;
+            course?: string | null;
+          }) => {
+            const billingCode = String(row.billing_code || '').toUpperCase();
+            const studentNo = String(row.student_no || '').toUpperCase();
+            const studentEmail = String(row.student_email || '').toLowerCase();
+            const course = String(row.course || '').trim();
+            const normalizedCourse = course && course.toLowerCase() !== 'clinic services' ? course : '';
+            const isClinicOrigin =
+              studentNo.startsWith('CLINIC-') ||
+              studentEmail.endsWith('@clinic.local') ||
+              billingCode.startsWith('BK-') ||
+              billingCode.startsWith('WALK-') ||
+              billingCode.startsWith('VISIT-') ||
+              billingCode.startsWith('LAB-') ||
+              billingCode.startsWith('DSP-') ||
+              billingCode.startsWith('MHS-');
+
+            if (!isClinicOrigin) {
+              return {
+                isClinicOrigin: false,
+                sourceModule: 'Cashier',
+                sourceDepartment: 'Cashier',
+                sourceCategory: 'Standard Billing'
+              };
+            }
+
+            if (studentNo.startsWith('CLINIC-APPT-') || billingCode.startsWith('BK-')) {
+              return {
+                isClinicOrigin: true,
+                sourceModule: 'Clinic',
+                sourceDepartment: 'Clinic',
+                sourceCategory: 'Appointment Booking'
+              };
+            }
+
+            if (studentNo.startsWith('CLINIC-WALK-') || billingCode.startsWith('WALK-')) {
+              return {
+                isClinicOrigin: true,
+                sourceModule: 'Clinic',
+                sourceDepartment: 'Clinic',
+                sourceCategory: 'Walk-In Visit'
+              };
+            }
+
+            if (studentNo.startsWith('CLINIC-CHK-') || billingCode.startsWith('VISIT-')) {
+              return {
+                isClinicOrigin: true,
+                sourceModule: 'Clinic',
+                sourceDepartment: 'Clinic',
+                sourceCategory: 'Check-Up Visit'
+              };
+            }
+
+            if (studentNo.startsWith('CLINIC-LAB-') || billingCode.startsWith('LAB-') || billingCode.startsWith('BILL-LAB-')) {
+              return {
+                isClinicOrigin: true,
+                sourceModule: 'Clinic',
+                sourceDepartment: 'Clinic',
+                sourceCategory: 'Lab Request'
+              };
+            }
+
+            if (studentNo.startsWith('CLINIC-MH-') || billingCode.startsWith('MHS-')) {
+              return {
+                isClinicOrigin: true,
+                sourceModule: 'Clinic',
+                sourceDepartment: 'Clinic',
+                sourceCategory: 'Counseling Session'
+              };
+            }
+
+            if (studentNo.startsWith('CLINIC-PHR-') || billingCode.startsWith('DSP-')) {
+              return {
+                isClinicOrigin: true,
+                sourceModule: 'Clinic',
+                sourceDepartment: 'Clinic',
+                sourceCategory: 'Dispense Request'
+              };
+            }
+
+            if (normalizedCourse) {
+              return {
+                isClinicOrigin: true,
+                sourceModule: 'Clinic',
+                sourceDepartment: 'Clinic',
+                sourceCategory: normalizedCourse
+              };
+            }
+
+            return {
+              isClinicOrigin: true,
+              sourceModule: 'Clinic',
+              sourceDepartment: 'Clinic',
+              sourceCategory: 'Clinic Booking'
+            };
+          };
+
+          async function ensureClinicBookingsSyncedToCashier(): Promise<void> {
+            const tableExists = async (tableName: string): Promise<boolean> => {
+              const rows = (await sql.query(`SELECT to_regclass($1) AS reg`, [`public.${tableName}`])) as Array<{ reg: string | null }>;
+              return Boolean(rows[0]?.reg);
+            };
+
+            const year = new Date().getFullYear();
+            const schoolYear = `${year}-${year + 1}`;
+            const semester = 'Clinic Services';
+
+            const upsertClinicStudent = async (
+              studentNo: string,
+              patientName: string,
+              departmentName: string,
+              emailHint = '',
+              phone: string | null = null
+            ): Promise<number> => {
+              const safeEmail = emailHint && emailHint.includes('@') ? emailHint : `${sanitizeCashierStudentKey(studentNo)}@clinic.local`;
+              const rows = (await sql.query(
+                `INSERT INTO students (student_no, full_name, course, year_level, email, phone, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'active')
+                 ON CONFLICT (student_no) DO UPDATE
+                 SET full_name = EXCLUDED.full_name,
+                     course = EXCLUDED.course,
+                     year_level = EXCLUDED.year_level,
+                     email = EXCLUDED.email,
+                     phone = COALESCE(EXCLUDED.phone, students.phone),
+                     status = 'active'
+                 RETURNING id`,
+                [studentNo, patientName, departmentName, 'Clinic', safeEmail, phone]
+              )) as Array<{ id: number }>;
+              return Number(rows[0]?.id || 0);
+            };
+
+            const ensureBillingRecord = async (payload: {
+              billingCode: string;
+              patientName: string;
+              departmentName: string;
+              studentNo: string;
+              emailHint?: string;
+              phone?: string | null;
+              items: Array<{ code: string; name: string; category: string; amount: number }>;
+            }): Promise<void> => {
+              if (!payload.billingCode || !payload.patientName || !payload.items.length) return;
+
+              const totalAmount = payload.items.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+              if (totalAmount <= 0) return;
+
+              const studentId = await upsertClinicStudent(
+                payload.studentNo,
+                payload.patientName,
+                payload.departmentName,
+                payload.emailHint || '',
+                payload.phone ?? null
+              );
+              if (!studentId) return;
+
+              const existingRows = (await sql.query(
+                `SELECT id FROM billing_records WHERE billing_code = $1 LIMIT 1`,
+                [payload.billingCode]
+              )) as Array<{ id: number }>;
+              if (existingRows[0]?.id) return;
+
+              const billingRows = (await sql.query(
+                `INSERT INTO billing_records (
+                   student_id, billing_code, semester, school_year, total_amount, paid_amount, balance_amount, billing_status, workflow_stage, created_at, updated_at
+                 ) VALUES (
+                   $1, $2, $3, $4, $5, 0, $5, 'pending_payment', 'student_portal_billing', NOW(), NOW()
+                 )
+                 RETURNING id`,
+                [studentId, payload.billingCode, semester, schoolYear, totalAmount]
+              )) as Array<{ id: number }>;
+              const billingId = Number(billingRows[0]?.id || 0);
+              if (!billingId) return;
+
+              for (const [index, item] of payload.items.entries()) {
+                await sql.query(
+                  `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+                  [billingId, item.code, item.name, item.category, item.amount, index + 1]
+                );
+              }
+            };
+
+            if (await tableExists('patient_appointments')) {
+              const appointmentRows = (await sql.query(
+                `SELECT booking_id, patient_name, department_name, appointment_priority, visit_type, visit_reason, patient_email, phone_number
+                 FROM patient_appointments
+                 ORDER BY created_at DESC
+                 LIMIT 120`
+              )) as Array<{
+                booking_id: string;
+                patient_name: string;
+                department_name: string | null;
+                appointment_priority: string | null;
+                visit_type: string | null;
+                visit_reason: string | null;
+                patient_email: string | null;
+                phone_number: string | null;
+              }>;
+
+              for (const row of appointmentRows) {
+                const departmentName = toSafeText(row.department_name) || 'Appointments';
+                const consultationFee = departmentName.toLowerCase().includes('dental') ? 700 : departmentName.toLowerCase().includes('pedia') ? 650 : 550;
+                const priorityFee = String(row.appointment_priority || '').toLowerCase() === 'urgent' ? 250 : 100;
+                await ensureBillingRecord({
+                  billingCode: toSafeText(row.booking_id),
+                  patientName: toSafeText(row.patient_name),
+                  departmentName,
+                  studentNo: `CLINIC-APPT-${sanitizeCashierStudentKey(toSafeText(row.booking_id))}`,
+                  emailHint: toSafeText(row.patient_email),
+                  phone: toSafeText(row.phone_number) || null,
+                  items: [
+                    { code: 'APPT-CONSULT', name: `${departmentName} Consultation`, category: departmentName, amount: consultationFee },
+                    { code: 'APPT-SVC', name: toSafeText(row.visit_type) || toSafeText(row.visit_reason) || 'Clinic Booking Fee', category: 'Appointment Booking', amount: priorityFee }
+                  ]
+                });
+              }
+            }
+
+            if (await tableExists('patient_walkins')) {
+              const walkinRows = (await sql.query(
+                `SELECT case_id, patient_name, visit_department, severity, chief_complaint, contact
+                 FROM patient_walkins
+                 ORDER BY created_at DESC
+                 LIMIT 120`
+              )) as Array<{
+                case_id: string;
+                patient_name: string;
+                visit_department: string | null;
+                severity: string | null;
+                chief_complaint: string | null;
+                contact: string | null;
+              }>;
+
+              for (const row of walkinRows) {
+                const severity = String(row.severity || '').toLowerCase();
+                const intakeFee = severity === 'emergency' ? 900 : severity === 'moderate' ? 650 : 420;
+                const departmentName = toSafeText(row.visit_department) || 'General OPD';
+                await ensureBillingRecord({
+                  billingCode: toSafeText(row.case_id),
+                  patientName: toSafeText(row.patient_name),
+                  departmentName,
+                  studentNo: `CLINIC-WALK-${sanitizeCashierStudentKey(toSafeText(row.case_id))}`,
+                  phone: toSafeText(row.contact) || null,
+                  items: [
+                    { code: 'WALK-TRIAGE', name: `${departmentName} Triage`, category: departmentName, amount: intakeFee },
+                    { code: 'WALK-CARE', name: toSafeText(row.chief_complaint) || 'Walk-In Care', category: 'Walk-In Visit', amount: 120 }
+                  ]
+                });
+              }
+            }
+
+            if (await tableExists('checkup_visits')) {
+              const checkupRows = (await sql.query(
+                `SELECT visit_id, patient_name, lab_requested, prescription_created, is_emergency
+                 FROM checkup_visits
+                 ORDER BY created_at DESC
+                 LIMIT 120`
+              )) as Array<{
+                visit_id: string;
+                patient_name: string;
+                lab_requested: boolean | number | null;
+                prescription_created: boolean | number | null;
+                is_emergency: boolean | number | null;
+              }>;
+
+              for (const row of checkupRows) {
+                const departmentName = 'General Check-Up';
+                const items = [
+                  { code: 'CHK-CONSULT', name: 'Check-Up Consultation', category: departmentName, amount: Number(row.is_emergency) ? 950 : 600 }
+                ];
+                if (Number(row.lab_requested)) items.push({ code: 'CHK-LAB', name: 'Diagnostic Workup Coordination', category: 'Lab Support', amount: 220 });
+                if (Number(row.prescription_created)) items.push({ code: 'CHK-RX', name: 'Prescription Processing', category: 'Medication Support', amount: 90 });
+                await ensureBillingRecord({
+                  billingCode: toSafeText(row.visit_id),
+                  patientName: toSafeText(row.patient_name),
+                  departmentName,
+                  studentNo: `CLINIC-CHK-${sanitizeCashierStudentKey(toSafeText(row.visit_id))}`,
+                  items
+                });
+              }
+            }
+
+            if (await tableExists('mental_health_sessions')) {
+              const mentalRows = (await sql.query(
+                `SELECT s.case_reference, s.patient_name, s.session_type, s.session_mode, p.contact_number
+                 FROM mental_health_sessions s
+                 LEFT JOIN mental_health_patients p ON p.patient_id = s.patient_id
+                 ORDER BY s.created_at DESC
+                 LIMIT 120`
+              )) as Array<{
+                case_reference: string;
+                patient_name: string;
+                session_type: string | null;
+                session_mode: string | null;
+                contact_number: string | null;
+              }>;
+
+              for (const row of mentalRows) {
+                const sessionFee = String(row.session_mode || '').toLowerCase() === 'online' ? 700 : 850;
+                const departmentName = 'Mental Health & Addiction';
+                await ensureBillingRecord({
+                  billingCode: toSafeText(row.case_reference),
+                  patientName: toSafeText(row.patient_name),
+                  departmentName,
+                  studentNo: `CLINIC-MH-${sanitizeCashierStudentKey(toSafeText(row.case_reference))}`,
+                  phone: toSafeText(row.contact_number) || null,
+                  items: [
+                    { code: 'MH-SESSION', name: toSafeText(row.session_type) || 'Mental Health Session', category: departmentName, amount: sessionFee }
+                  ]
+                });
+              }
+            }
+
+            if (await tableExists('pharmacy_dispense_requests') && await tableExists('pharmacy_medicines')) {
+              const pharmacyRows = (await sql.query(
+                `SELECT r.request_code, r.patient_name, r.quantity, COALESCE(m.medicine_name, 'Medicine') AS medicine_name, COALESCE(m.selling_price, 0) AS selling_price
+                 FROM pharmacy_dispense_requests r
+                 LEFT JOIN pharmacy_medicines m ON m.id = r.medicine_id
+                 ORDER BY r.requested_at DESC, r.id DESC
+                 LIMIT 120`
+              )) as Array<{
+                request_code: string;
+                patient_name: string;
+                quantity: number;
+                medicine_name: string;
+                selling_price: number;
+              }>;
+
+              for (const row of pharmacyRows) {
+                const unitPrice = Number(row.selling_price || 0);
+                const quantity = Math.max(1, Number(row.quantity || 0));
+                const totalPrice = unitPrice > 0 ? Number((unitPrice * quantity).toFixed(2)) : 120;
+                const departmentName = 'Pharmacy & Inventory';
+                await ensureBillingRecord({
+                  billingCode: toSafeText(row.request_code),
+                  patientName: toSafeText(row.patient_name),
+                  departmentName,
+                  studentNo: `CLINIC-PHR-${sanitizeCashierStudentKey(toSafeText(row.request_code))}`,
+                  items: [
+                    { code: 'PHR-DISPENSE', name: `${toSafeText(row.medicine_name)} x${quantity}`, category: departmentName, amount: totalPrice }
+                  ]
+                });
+              }
+            }
+          }
+
+          if (url.pathname === '/api/clinic-cashier/lab-billing' && (req.method || 'GET').toUpperCase() === 'POST') {
+            const body = await readJsonBody(req);
+            const requestId = toSafeInt(body.request_id, 0);
+            const patientName = toSafeText(body.patient_name);
+            const patientId = toSafeText(body.patient_id);
+            const visitId = toSafeText(body.visit_id);
+            const category = toSafeText(body.category) || 'Laboratory';
+            const requestedByDoctor = toSafeText(body.requested_by_doctor) || 'Clinic';
+            const doctorDepartment = toSafeText(body.doctor_department) || 'Laboratory';
+            const billingCode = toSafeText(body.billing_reference) || `BILL-LAB-${requestId || Date.now()}`;
+            const rawTests = Array.isArray(body.tests) ? body.tests.map((item) => toSafeText(item)).filter(Boolean) : [];
+            const tests = rawTests.length ? rawTests : [category];
+
+            if (!patientName) {
+              writeJson(res, 422, { ok: false, message: 'patient_name is required.' });
+              return;
+            }
+
+            const sanitizeEmailKey = (value: string): string => value.toLowerCase().replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '') || 'clinic.patient';
+            const studentNo = patientId || `CLINIC-LAB-${requestId || Date.now()}`;
+            const studentEmail = `${sanitizeEmailKey(studentNo)}@clinic.local`;
+
+            const priceFromTestName = (label: string): number => {
+              const text = label.toLowerCase();
+              if (text.includes('cbc')) return 350;
+              if (text.includes('metabolic')) return 650;
+              if (text.includes('lipid')) return 550;
+              if (text.includes('urinalysis')) return 220;
+              if (text.includes('microscopy')) return 180;
+              if (text.includes('culture')) return 900;
+              if (text.includes('ecg')) return 450;
+              if (text.includes('x-ray')) return 700;
+              if (text.includes('covid')) return 600;
+              if (text.includes('serology')) return 800;
+              if (text.includes('dengue')) return 950;
+              if (text.includes('hbsag')) return 500;
+              if (text.includes('histopathology')) return 1500;
+              if (text.includes('stool')) return 250;
+              return 400;
+            };
+
+            const labItems = tests.map((test, index) => ({
+              code: `LAB-${index + 1}`,
+              name: test,
+              category: 'Laboratory',
+              amount: priceFromTestName(test)
+            }));
+            const totalAmount = labItems.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+            if (totalAmount <= 0) {
+              writeJson(res, 422, { ok: false, message: 'Unable to build a valid cashier billing from this laboratory request.' });
+              return;
+            }
+
+            const year = new Date().getFullYear();
+            const schoolYear = `${year}-${year + 1}`;
+            const semester = 'Clinic Services';
+
+            const studentRows = (await sql.query(
+              `INSERT INTO students (student_no, full_name, course, year_level, email, phone, status)
+               VALUES ($1, $2, $3, $4, $5, NULL, 'active')
+               ON CONFLICT (student_no) DO UPDATE
+               SET full_name = EXCLUDED.full_name,
+                   course = EXCLUDED.course,
+                   year_level = EXCLUDED.year_level,
+                   email = EXCLUDED.email,
+                   status = 'active'
+               RETURNING id`,
+              [studentNo, patientName, doctorDepartment, 'Clinic', studentEmail]
+            )) as Array<{ id: number }>;
+            const studentId = Number(studentRows[0]?.id || 0);
+            if (!studentId) {
+              writeJson(res, 500, { ok: false, message: 'Unable to create or sync clinic patient in cashier students list.' });
+              return;
+            }
+
+            const existingRows = (await sql.query(
+              `SELECT id, workflow_stage, paid_amount
+               FROM billing_records
+               WHERE billing_code = $1
+               LIMIT 1`,
+              [billingCode]
+            )) as Array<{ id: number; workflow_stage: string; paid_amount: number }>;
+            const existingBilling = existingRows[0];
+
+            let billingId = Number(existingBilling?.id || 0);
+            let actionMessage = '';
+
+            if (existingBilling && String(existingBilling.workflow_stage || '') !== 'student_portal_billing') {
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  message: `${billingCode} already exists in Cashier under ${workflowLabel(String(existingBilling.workflow_stage || 'student_portal_billing'))}.`,
+                  billingId,
+                  billingCode,
+                  studentNumber: studentNo,
+                  workflowStage: String(existingBilling.workflow_stage || 'student_portal_billing')
+                }
+              });
+              return;
+            }
+
+            if (!billingId) {
+              const createdRows = (await sql.query(
+                `INSERT INTO billing_records (
+                   student_id, billing_code, semester, school_year, total_amount, paid_amount, balance_amount, billing_status, workflow_stage, created_at, updated_at
+                 ) VALUES (
+                   $1, $2, $3, $4, $5, 0, $5, 'pending_payment', 'student_portal_billing', NOW(), NOW()
+                 )
+                 RETURNING id`,
+                [studentId, billingCode, semester, schoolYear, totalAmount]
+              )) as Array<{ id: number }>;
+              billingId = Number(createdRows[0]?.id || 0);
+              actionMessage = `${billingCode} was created in Student Portal & Billing from the clinic laboratory queue.`;
+            } else {
+              await sql.query(
+                `UPDATE billing_records
+                 SET student_id = $2,
+                     semester = $3,
+                     school_year = $4,
+                     total_amount = $5,
+                     balance_amount = GREATEST($5 - COALESCE(paid_amount, 0), 0),
+                     billing_status = CASE WHEN COALESCE(paid_amount, 0) > 0 THEN billing_status ELSE 'pending_payment' END,
+                     workflow_stage = 'student_portal_billing',
+                     updated_at = NOW()
+                 WHERE id = $1`,
+                [billingId, studentId, semester, schoolYear, totalAmount]
+              );
+              await sql.query(`DELETE FROM billing_items WHERE billing_id = $1`, [billingId]);
+              actionMessage = `${billingCode} was refreshed in Student Portal & Billing from the clinic laboratory queue.`;
+            }
+
+            for (const [index, item] of labItems.entries()) {
+              await sql.query(
+                `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+                [billingId, item.code, item.name, item.category, item.amount, index + 1]
+              );
+            }
+
+            await ensureModuleActivityLogsTable(sql);
+            await sql.query(
+              `INSERT INTO module_activity_logs (module, action, detail, actor, entity_type, entity_key)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
+              [
+                'laboratory',
+                'Forwarded To Cashier',
+                `${patientName} (${billingCode}) was forwarded to Cashier from Clinic Laboratory. Visit: ${visitId || '--'}. Doctor: ${requestedByDoctor}.`,
+                'Clinic Laboratory',
+                'billing',
+                billingCode
+              ]
+            );
+            await sql.query(
+              `INSERT INTO module_activity_logs (module, action, detail, actor, entity_type, entity_key)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
+              [
+                'billing_verification',
+                'Clinic Billing Synced',
+                `${billingCode} was prepared from clinic laboratory services for ${patientName}.`,
+                'Clinic',
+                'billing',
+                billingCode
+              ]
+            );
+            await syncPatientMasterProfiles();
+            broadcastRealtimeEvent({
+              type: 'clinic_cashier_sync',
+              module: 'billing_verification',
+              action: 'Clinic Billing Synced',
+              detail: `${billingCode} was prepared from clinic laboratory services for ${patientName}.`,
+              entityKey: billingCode
+            });
+
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: actionMessage,
+                billingId,
+                billingCode,
+                studentNumber: studentNo,
+                workflowStage: 'student_portal_billing'
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/student-billing' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await ensureClinicBookingsSyncedToCashier();
+            const view = (url.searchParams.get('view') || 'verification').trim().toLowerCase();
+            const rows = (await sql.query(
+              `SELECT b.id, b.billing_code, b.billing_status, b.workflow_stage, b.total_amount, b.paid_amount, b.balance_amount,
+                      b.created_at::text AS created_at, s.full_name, s.student_no, s.course, COALESCE(s.email, '') AS student_email
+               FROM billing_records b
+               LEFT JOIN students s ON s.id = b.student_id
+               ORDER BY b.created_at DESC, b.id DESC
+               LIMIT 100`
+            )) as Array<{
+              id: number;
+              billing_code: string;
+              billing_status: string;
+              workflow_stage: string;
+              total_amount: number;
+              paid_amount: number;
+              balance_amount: number;
+              created_at: string;
+              full_name: string | null;
+              student_no: string | null;
+              course: string | null;
+              student_email: string | null;
+            }>;
+            const feeRows = (await sql.query(
+              `SELECT id, billing_id, item_code, item_name, category, amount
+               FROM billing_items
+               ORDER BY billing_id ASC, sort_order ASC, id ASC`
+            )) as Array<{
+              id: number;
+              billing_id: number;
+              item_code: string | null;
+              item_name: string;
+              category: string | null;
+              amount: number;
+            }>;
+            const feeMap = new Map<number, Array<{
+              id: number;
+              feeCode: string;
+              feeType: string;
+              feeName: string;
+              category: string;
+              amount: number;
+              amountFormatted: string;
+              paidAmount: number;
+              paidAmountFormatted: string;
+              pendingAmount: number;
+              pendingAmountFormatted: string;
+              committedAmount: number;
+              committedAmountFormatted: string;
+              remainingAmount: number;
+              remainingAmountFormatted: string;
+              status: 'Paid' | 'Partially Paid' | 'Unpaid';
+            }>>();
+            for (const feeRow of feeRows) {
+              const amount = Number(feeRow.amount || 0);
+              const existing = feeMap.get(Number(feeRow.billing_id)) || [];
+              existing.push({
+                id: Number(feeRow.id),
+                feeCode: String(feeRow.item_code || `FEE-${feeRow.id}`),
+                feeType: String(feeRow.category || 'Assessment'),
+                feeName: String(feeRow.item_name || 'Fee Item'),
+                category: String(feeRow.category || 'Assessment'),
+                amount,
+                amountFormatted: formatCurrency(amount),
+                paidAmount: 0,
+                paidAmountFormatted: formatCurrency(0),
+                pendingAmount: amount,
+                pendingAmountFormatted: formatCurrency(amount),
+                committedAmount: 0,
+                committedAmountFormatted: formatCurrency(0),
+                remainingAmount: amount,
+                remainingAmountFormatted: formatCurrency(amount),
+                status: 'Unpaid'
+              });
+              feeMap.set(Number(feeRow.billing_id), existing);
+            }
+            const isClinicOriginBilling = (row: { billing_code?: string | null; student_no: string | null; student_email?: string | null; course?: string | null }): boolean =>
+              deriveBillingConnectionMeta(row).isClinicOrigin;
+            const verificationRows = rows.filter((row) => String(row.workflow_stage || 'student_portal_billing') === 'student_portal_billing');
+            const managementRows = rows.filter((row) => {
+              const stage = String(row.workflow_stage || '');
+              return stage === 'pay_bills' || (stage === 'student_portal_billing' && isClinicOriginBilling(row));
+            });
+
+            if (view === 'management') {
+              const items = managementRows.map((row) => {
+                const feeItems = feeMap.get(Number(row.id)) || [];
+                const remainingAmount = Number(row.balance_amount || 0);
+                const paidAmount = Number(row.paid_amount || 0);
+                const paidCount = feeItems.filter((item) => item.remainingAmount <= 0).length;
+                const partialCount = feeItems.filter((item) => item.remainingAmount > 0 && item.remainingAmount < item.amount).length;
+                const unpaidCount = feeItems.filter((item) => item.remainingAmount >= item.amount).length;
+                const connectionMeta = deriveBillingConnectionMeta(row);
+                const clinicOrigin = connectionMeta.isClinicOrigin;
+                const stage = String(row.workflow_stage || 'pay_bills');
+                return {
+                  id: Number(row.id),
+                  billingCode: String(row.billing_code || `BILL-${row.id}`),
+                  studentName: String(row.full_name || 'Unknown Student'),
+                  semester: clinicOrigin && stage === 'student_portal_billing' ? 'Clinic Services' : '',
+                  category: clinicOrigin ? connectionMeta.sourceDepartment : String(row.course || 'General'),
+                  sourceModule: connectionMeta.sourceModule,
+                  sourceDepartment: connectionMeta.sourceDepartment,
+                  sourceCategory: connectionMeta.sourceCategory,
+                  total: formatCurrency(row.total_amount),
+                  balance: formatCurrency(row.balance_amount),
+                  status: mapBillingStatusForManagement(Number(row.balance_amount || 0), Number(row.paid_amount || 0), String(row.billing_status || '')),
+                  workflowStage: stage,
+                  workflowStageLabel: clinicOrigin && stage === 'student_portal_billing' ? 'Clinic Sync Ready' : workflowLabel(stage),
+                  remarks:
+                    clinicOrigin && stage === 'student_portal_billing'
+                      ? `${connectionMeta.sourceDepartment} billing synced and ready for cashier settlement in Pay Bills.`
+                      : '',
+                  feeItems,
+                  feeSummary: {
+                    totalFees: feeItems.length,
+                    paidCount,
+                    partialCount,
+                    unpaidCount,
+                    committedAmount: paidAmount,
+                    committedAmountFormatted: formatCurrency(paidAmount),
+                    finalizedAmount: paidAmount,
+                    finalizedAmountFormatted: formatCurrency(paidAmount),
+                    remainingAmount,
+                    remainingAmountFormatted: formatCurrency(remainingAmount),
+                    label: `${paidCount} Paid | ${partialCount} Partial | ${unpaidCount} Unpaid`
+                  }
+                };
+              });
+              const pending = items.filter((item) => item.status === 'Pending Payment').length;
+              const partial = items.filter((item) => item.status === 'Partially Paid').length;
+              const full = items.filter((item) => item.status === 'Fully Paid').length;
+              const clinicReady = items.filter((item) => item.workflowStage === 'student_portal_billing').length;
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  stats: [
+                    { title: 'Pending Payment', value: String(pending), subtitle: 'Awaiting settlement', icon: 'mdi-timer-sand', tone: 'blue' },
+                    { title: 'Clinic Ready', value: String(clinicReady), subtitle: 'Synced from clinic into Pay Bills', icon: 'mdi-hospital-box-outline', tone: 'purple' },
+                    { title: 'Partially Paid', value: String(partial), subtitle: 'With balance', icon: 'mdi-cash-multiple', tone: 'orange' },
+                    { title: 'Fully Paid', value: String(full), subtitle: 'Settled records', icon: 'mdi-check-decagram-outline', tone: 'green' }
+                  ],
+                  items,
+                  activityFeed: []
+                }
+              });
+              return;
+            }
+
+            const items = verificationRows.map((row) => {
+              const feeItems = feeMap.get(Number(row.id)) || [];
+              const remainingAmount = Number(row.balance_amount || 0);
+              const paidAmount = Number(row.paid_amount || 0);
+              const paidCount = feeItems.filter((item) => item.remainingAmount <= 0).length;
+              const partialCount = feeItems.filter((item) => item.remainingAmount > 0 && item.remainingAmount < item.amount).length;
+              const unpaidCount = feeItems.filter((item) => item.remainingAmount >= item.amount).length;
+              const connectionMeta = deriveBillingConnectionMeta(row);
+              return {
+                id: Number(row.id),
+                reference: String(row.billing_code || `BILL-${row.id}`),
+                studentName: String(row.full_name || 'Unknown Student'),
+                studentNumber: String(row.student_no || ''),
+                program: String(row.course || 'General'),
+                sourceModule: connectionMeta.sourceModule,
+                sourceDepartment: connectionMeta.sourceDepartment,
+                sourceCategory: connectionMeta.sourceCategory,
+                amount: formatCurrency(row.total_amount),
+                totalPaid: formatCurrency(row.paid_amount),
+                dueDate: String(row.created_at || '').slice(0, 10),
+                status: mapBillingStatusForVerification(String(row.billing_status || '')),
+                workflowStage: String(row.workflow_stage || 'student_portal_billing'),
+                workflowStageLabel: workflowLabel(String(row.workflow_stage || 'student_portal_billing')),
+                note: connectionMeta.isClinicOrigin
+                  ? `${connectionMeta.sourceDepartment} record synced from clinic and ready for cashier verification.`
+                  : '',
+                feeItems,
+                feeSummary: {
+                  totalFees: feeItems.length,
+                  paidCount,
+                  partialCount,
+                  unpaidCount,
+                  committedAmount: paidAmount,
+                  committedAmountFormatted: formatCurrency(paidAmount),
+                  finalizedAmount: paidAmount,
+                  finalizedAmountFormatted: formatCurrency(paidAmount),
+                  remainingAmount,
+                  remainingAmountFormatted: formatCurrency(remainingAmount),
+                  label: `${paidCount} Paid | ${partialCount} Partial | ${unpaidCount} Unpaid`
+                }
+              };
+            });
+            const forVerification = items.filter((item) => item.status === 'Pending Payment' || item.status === 'Draft').length;
+            const needsCorrection = items.filter((item) => item.status === 'Needs Correction').length;
+            const activeBilling = items.filter((item) => item.status === 'Active Billing').length;
+            const clinicLinked = items.filter((item) => item.sourceModule === 'Clinic').length;
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                stats: [
+                  { title: 'For Verification', value: String(forVerification), subtitle: 'Pending review', icon: 'mdi-clipboard-check-outline', tone: 'blue' },
+                  { title: 'Needs Correction', value: String(needsCorrection), subtitle: 'Returned records', icon: 'mdi-alert-circle-outline', tone: 'orange' },
+                  { title: 'Active Billing', value: String(activeBilling), subtitle: 'Eligible for payment', icon: 'mdi-cash-check', tone: 'green' },
+                  { title: 'Clinic Linked', value: String(clinicLinked), subtitle: 'Integrated clinic-origin records', icon: 'mdi-hospital-box-outline', tone: 'purple' }
+                ],
+                items,
+                activityFeed: []
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/process-payment' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await ensureClinicBookingsSyncedToCashier();
+            const upstreamRows = (await sql.query(
+              `SELECT
+                  b.id,
+                  b.billing_code,
+                  b.billing_status,
+                  b.workflow_stage,
+                  b.balance_amount,
+                  b.created_at::text AS created_at,
+                  COALESCE(s.full_name, 'Unknown Student') AS full_name,
+                  COALESCE(s.student_no, '') AS student_no,
+                  COALESCE(s.email, '') AS student_email
+               FROM billing_records b
+               LEFT JOIN students s ON s.id = b.student_id
+               WHERE b.workflow_stage = 'pay_bills'
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM payment_transactions p
+                   WHERE p.billing_id = b.id
+                     AND p.workflow_stage = 'payment_processing_gateway'
+                     AND LOWER(COALESCE(p.payment_status, 'processing')) IN ('processing', 'authorized')
+                 )
+               ORDER BY b.created_at DESC, b.id DESC
+               LIMIT 120`
+            )) as Array<{
+              id: number;
+              billing_code: string;
+              billing_status: string;
+              workflow_stage: string;
+              balance_amount: number;
+              created_at: string;
+              full_name: string;
+              student_no: string;
+              student_email: string;
+            }>;
+            const upstreamFeeRows = (await sql.query(
+              `SELECT id, billing_id, item_code, item_name, category, amount
+               FROM billing_items
+               ORDER BY billing_id ASC, sort_order ASC, id ASC`
+            )) as Array<{
+              id: number;
+              billing_id: number;
+              item_code: string | null;
+              item_name: string;
+              category: string | null;
+              amount: number;
+            }>;
+            const upstreamFeeMap = new Map<number, Array<{
+              id: number;
+              feeType: string;
+              feeCode: string;
+              category: string;
+              remainingAmount: number;
+              remainingAmountFormatted: string;
+            }>>();
+            for (const fee of upstreamFeeRows) {
+              const billingId = Number(fee.billing_id || 0);
+              const existing = upstreamFeeMap.get(billingId) || [];
+              existing.push({
+                id: Number(fee.id),
+                feeType: String(fee.item_name || fee.item_code || 'Fee Item'),
+                feeCode: String(fee.item_code || `FEE-${fee.id}`),
+                category: String(fee.category || 'Assessment'),
+                remainingAmount: Number(fee.amount || 0),
+                remainingAmountFormatted: formatCurrency(fee.amount)
+              });
+              upstreamFeeMap.set(billingId, existing);
+            }
+
+            const rows = (await sql.query(
+              `SELECT p.id, p.reference_number, p.amount_paid, p.payment_method, p.payment_status, p.workflow_stage, p.payment_date::text AS payment_date,
+                      b.billing_code, COALESCE(s.full_name, 'Unknown Student') AS full_name, COALESCE(s.student_no, '') AS student_no,
+                      COALESCE(s.email, '') AS student_email, COALESCE(s.course, '') AS course
+               FROM payment_transactions p
+               LEFT JOIN billing_records b ON b.id = p.billing_id
+               LEFT JOIN students s ON s.id = b.student_id
+               ORDER BY p.payment_date DESC NULLS LAST, p.created_at DESC, p.id DESC
+               LIMIT 120`
+            )) as Array<{
+              id: number;
+              reference_number: string;
+              amount_paid: number;
+              payment_method: string;
+              payment_status: string;
+              workflow_stage: string;
+              payment_date: string;
+              billing_code: string | null;
+              full_name: string;
+              student_no: string;
+              student_email: string;
+              course: string;
+            }>;
+            const mapped = rows.map((row) => {
+              const status = mapPaymentStatus(String(row.payment_status || ''));
+              const connectionMeta = deriveBillingConnectionMeta(row);
+              return {
+                id: Number(row.id),
+                reference: String(row.reference_number || `PAY-${row.id}`),
+                studentName: String(row.full_name || 'Unknown Student'),
+                channel: String(row.payment_method || 'Online'),
+                amount: formatCurrency(row.amount_paid),
+                billingCode: String(row.billing_code || ''),
+                sourceModule: connectionMeta.sourceModule,
+                sourceDepartment: connectionMeta.sourceDepartment,
+                sourceCategory: connectionMeta.sourceCategory,
+                status,
+                workflowStage: String(row.workflow_stage || 'payment_processing_gateway'),
+                workflowStageLabel: workflowLabel(String(row.workflow_stage || 'payment_processing_gateway')),
+                note: '',
+                allocations: [],
+                allocationSummary: '',
+                totalAllocated: formatCurrency(row.amount_paid)
+              };
+            });
+            const stageItems = mapped.filter((row) => row.workflowStage === 'payment_processing_gateway');
+            const historyItems = mapped.filter((row) => row.workflowStage !== 'payment_processing_gateway');
+            const items = stageItems.filter((row) => row.status === 'Processing' || row.status === 'Authorized');
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                stats: [
+                  { title: 'Pay Bills Intake', value: String(upstreamRows.length), subtitle: 'Ready from Pay Bills', icon: 'mdi-tray-arrow-down', tone: 'purple' },
+                  { title: 'Pending Gateway', value: String(items.filter((item) => item.status === 'Processing').length), subtitle: 'Awaiting action', icon: 'mdi-timer-sand', tone: 'blue' },
+                  { title: 'Authorized', value: String(items.filter((item) => item.status === 'Authorized').length), subtitle: 'Ready to confirm', icon: 'mdi-check-decagram-outline', tone: 'green' },
+                  { title: 'Failed/Cancelled', value: String(stageItems.filter((item) => item.status === 'Failed' || item.status === 'Cancelled').length), subtitle: 'Requires follow-up', icon: 'mdi-alert-outline', tone: 'orange' }
+                ],
+                upstreamItems: upstreamRows.map((row) => {
+                  const connectionMeta = deriveBillingConnectionMeta(row);
+                  const isClinicOrigin = connectionMeta.isClinicOrigin;
+                  const paymentLabel =
+                    String(row.billing_status || '').toLowerCase() === 'failed'
+                      ? 'failed'
+                      : Number(row.balance_amount || 0) <= 0
+                        ? 'paid'
+                        : 'unpaid';
+                  return {
+                    id: Number(row.id),
+                    reference: String(row.billing_code || `BILL-${row.id}`),
+                    patientName: String(row.full_name || 'Unknown Student'),
+                    amount: formatCurrency(row.balance_amount),
+                    rawAmount: Number(row.balance_amount || 0),
+                    payment: paymentLabel,
+                    sync: isClinicOrigin ? 'clinic_synced' : 'cashier_ready',
+                    createdAt: String(row.created_at || ''),
+                    workflowStage: String(row.workflow_stage || 'pay_bills'),
+                    workflowStageLabel: workflowLabel(String(row.workflow_stage || 'pay_bills')),
+                    isClinicOrigin,
+                    sourceModule: connectionMeta.sourceModule,
+                    sourceDepartment: connectionMeta.sourceDepartment,
+                    sourceCategory: connectionMeta.sourceCategory,
+                    note: isClinicOrigin
+                      ? `${connectionMeta.sourceDepartment} billing is ready for cashier payment update.`
+                      : 'Billing is ready in Pay Bills for gateway handoff.',
+                    feeItems: upstreamFeeMap.get(Number(row.id)) || []
+                  };
+                }),
+                items,
+                historyItems,
+                activityFeed: []
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/generate-receipt' && (req.method || 'GET').toUpperCase() === 'GET') {
+            const rows = (await sql.query(
+              `SELECT r.id, r.receipt_number, r.receipt_status, r.workflow_stage, r.issued_date::text AS issued_date,
+                      p.reference_number, p.amount_paid, p.payment_status, p.payment_method, p.id AS payment_id,
+                      b.billing_code, COALESCE(s.full_name, 'Unknown Student') AS full_name, COALESCE(s.student_no, '') AS student_no,
+                      COALESCE(s.email, '') AS student_email, COALESCE(s.course, '') AS course
+               FROM receipt_records r
+               LEFT JOIN payment_transactions p ON p.id = r.payment_id
+               LEFT JOIN billing_records b ON b.id = p.billing_id
+               LEFT JOIN students s ON s.id = b.student_id
+               ORDER BY r.issued_date DESC NULLS LAST, r.created_at DESC, r.id DESC
+               LIMIT 120`
+            )) as Array<{
+              id: number;
+              receipt_number: string | null;
+              receipt_status: string | null;
+              workflow_stage: string | null;
+              issued_date: string | null;
+              reference_number: string | null;
+              amount_paid: number | null;
+              payment_status: string | null;
+              payment_method: string | null;
+              payment_id: number | null;
+              billing_code: string | null;
+              full_name: string;
+              student_no: string;
+              student_email: string;
+              course: string;
+            }>;
+            const mapped = rows.map((row) => {
+              const status = mapReceiptStatus(String(row.receipt_status || ''));
+              const connectionMeta = deriveBillingConnectionMeta(row);
+              return {
+                id: Number(row.id),
+                receiptNo: String(row.receipt_number || '--'),
+                studentName: String(row.full_name || 'Unknown Student'),
+                paymentRef: String(row.reference_number || ''),
+                paymentMethod: String(row.payment_method || 'Online'),
+                paymentStatus: mapPaymentStatus(String(row.payment_status || '')),
+                amount: formatCurrency(row.amount_paid),
+                issuedFor: String(row.billing_code || 'Billing Settlement'),
+                sourceModule: connectionMeta.sourceModule,
+                sourceDepartment: connectionMeta.sourceDepartment,
+                sourceCategory: connectionMeta.sourceCategory,
+                status,
+                workflowStage: String(row.workflow_stage || 'compliance_documentation'),
+                workflowStageLabel: workflowLabel(String(row.workflow_stage || 'compliance_documentation')),
+                note: connectionMeta.isClinicOrigin
+                  ? `${connectionMeta.sourceDepartment} documentation is ready for compliance review.`
+                  : '',
+                receiptItems: [],
+                allocationSummary: ''
+              };
+            });
+            const items = mapped.filter((item) => item.workflowStage === 'compliance_documentation');
+            const historyItems = mapped.filter((item) => item.workflowStage !== 'compliance_documentation');
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                stats: [
+                  { title: 'Receipt Pending', value: String(items.filter((item) => item.status === 'Receipt Pending').length), subtitle: 'Awaiting generation', icon: 'mdi-receipt-text-outline', tone: 'blue' },
+                  { title: 'Receipt Generated', value: String(items.filter((item) => item.status === 'Receipt Generated').length), subtitle: 'Ready for proof review', icon: 'mdi-receipt-outline', tone: 'orange' },
+                  { title: 'Proof Verified', value: String(items.filter((item) => item.status === 'Proof Verified').length), subtitle: 'Validated records', icon: 'mdi-shield-check-outline', tone: 'green' },
+                  { title: 'Documentation', value: String(historyItems.filter((item) => item.status === 'Documentation Completed').length), subtitle: 'Completed docs', icon: 'mdi-file-document-outline', tone: 'purple' }
+                ],
+                items,
+                historyItems,
+                activityFeed: []
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/reporting-reconciliation' && (req.method || 'GET').toUpperCase() === 'GET') {
+            const rows = (await sql.query(
+              `SELECT p.id, p.reference_number, p.amount_paid, p.payment_status, p.reporting_status, p.workflow_stage, p.payment_date::text AS payment_date,
+                      b.billing_code, COALESCE(s.full_name, 'Unknown Student') AS full_name, COALESCE(s.student_no, '') AS student_no,
+                      COALESCE(s.email, '') AS student_email, COALESCE(s.course, '') AS course,
+                      COALESCE(r.receipt_number, '--') AS receipt_number, COALESCE(r.receipt_status, '') AS receipt_status
+               FROM payment_transactions p
+               LEFT JOIN billing_records b ON b.id = p.billing_id
+               LEFT JOIN students s ON s.id = b.student_id
+               LEFT JOIN receipt_records r ON r.payment_id = p.id
+               ORDER BY p.payment_date DESC NULLS LAST, p.created_at DESC, p.id DESC
+               LIMIT 120`
+            )) as Array<{
+              id: number;
+              reference_number: string;
+              amount_paid: number;
+              payment_status: string;
+              reporting_status: string;
+              workflow_stage: string;
+              payment_date: string;
+              billing_code: string | null;
+              full_name: string;
+              student_no: string;
+              student_email: string;
+              course: string;
+              receipt_number: string;
+              receipt_status: string;
+            }>;
+            const mapped = rows.map((row) => {
+              const connectionMeta = deriveBillingConnectionMeta(row);
+              return {
+                id: Number(row.id),
+                reference: String(row.reference_number || `PAY-${row.id}`),
+                studentName: String(row.full_name || 'Unknown Student'),
+                amount: formatCurrency(row.amount_paid),
+                billingCode: String(row.billing_code || ''),
+                receiptNumber: String(row.receipt_number || '--'),
+                sourceModule: connectionMeta.sourceModule,
+                sourceDepartment: connectionMeta.sourceDepartment,
+                sourceCategory: connectionMeta.sourceCategory,
+                paymentStatus: mapPaymentStatus(String(row.payment_status || '')),
+                documentStatus: mapReceiptStatus(String(row.receipt_status || '')),
+                status: mapReportingStatus(String(row.reporting_status || '')),
+                workflowStage: String(row.workflow_stage || 'reporting_reconciliation'),
+                workflowStageLabel: workflowLabel(String(row.workflow_stage || 'reporting_reconciliation')),
+                postedAt: String(row.payment_date || ''),
+                allocationSummary: '',
+                allocations: []
+              };
+            });
+            const pmedRequestRows = await fetchPmedCashierRequestRows(12);
+            const pmedRequestAlerts = pmedRequestRows.map((row) => {
+              const metadata = typeof row.metadata === 'string'
+                ? (() => {
+                    try {
+                      return JSON.parse(row.metadata) as Record<string, unknown>;
+                    } catch {
+                      return {} as Record<string, unknown>;
+                    }
+                  })()
+                : ((row.metadata || {}) as Record<string, unknown>);
+              const reportName = toSafeText(metadata.report_name) || toSafeText(row.entity_key) || 'Requested Financial Report';
+              const reportReference = toSafeText(metadata.report_reference) || toSafeText(row.entity_key);
+              return {
+                title: `PMED Request: ${reportName}`,
+                detail: `${toSafeText(row.detail) || 'PMED requested a cashier financial report.'}${reportReference ? ` Reference: ${reportReference}.` : ''}`,
+                time: formatRelativeTime(row.created_at)
+              };
+            });
+            const items = mapped.filter((item) => item.workflowStage === 'reporting_reconciliation');
+            const historyItems = mapped.filter((item) => item.workflowStage === 'completed');
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                stats: [
+                  { title: 'PMED Requests', value: String(pmedRequestRows.length), subtitle: 'Incoming report requests from PMED Department', icon: 'mdi-bell-badge-outline', tone: 'purple' },
+                  { title: 'Logged', value: String(items.filter((item) => item.status === 'Logged').length), subtitle: 'Captured records', icon: 'mdi-text-box-check-outline', tone: 'blue' },
+                  { title: 'Reconciled', value: String(items.filter((item) => item.status === 'Reconciled').length), subtitle: 'Balanced records', icon: 'mdi-check-outline', tone: 'green' },
+                  { title: 'PMED Ready', value: String(mapped.filter((item) => item.status === 'Reported' || item.status === 'Archived').length), subtitle: 'Financial reporting linked to PMED Department', icon: 'mdi-chart-box-outline', tone: 'orange' },
+                  { title: 'Archived', value: String(historyItems.filter((item) => item.status === 'Archived').length), subtitle: 'Completed records', icon: 'mdi-archive-outline', tone: 'purple' }
+                ],
+                items,
+                historyItems,
+                activityFeed: pmedRequestAlerts
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/report-center' && (req.method || 'GET').toUpperCase() === 'GET') {
+            const requestRows = await fetchPmedCashierRequestRows(40);
+
+            const candidateRows = (await sql.query(
+              `SELECT p.id, p.reference_number, p.amount_paid, p.payment_method, p.payment_status, p.reporting_status, p.workflow_stage, p.payment_date::text AS payment_date,
+                      b.billing_code, COALESCE(s.full_name, 'Unknown Student') AS full_name, COALESCE(r.receipt_number, '--') AS receipt_number
+               FROM payment_transactions p
+               LEFT JOIN billing_records b ON b.id = p.billing_id
+               LEFT JOIN students s ON s.id = b.student_id
+               LEFT JOIN receipt_records r ON r.payment_id = p.id
+               WHERE LOWER(COALESCE(p.workflow_stage, '')) = 'reporting_reconciliation'
+                 AND LOWER(COALESCE(p.reporting_status, '')) IN ('logged', 'with_discrepancy', 'reconciled', 'reported')
+               ORDER BY p.payment_date DESC NULLS LAST, p.created_at DESC, p.id DESC
+               LIMIT 60`
+            )) as Array<{
+              id: number;
+              reference_number: string;
+              amount_paid: number;
+              payment_method: string;
+              payment_status: string;
+              reporting_status: string;
+              workflow_stage: string;
+              payment_date: string;
+              billing_code: string | null;
+              full_name: string;
+              receipt_number: string;
+            }>;
+
+            const sentRows = (await sql.query(
+              `SELECT id, action, detail, actor, entity_key, metadata, created_at
+               FROM module_activity_logs
+               WHERE LOWER(module) = 'department_reports'
+                 AND LOWER(COALESCE(metadata->>'source_department', '')) = 'cashier'
+                 AND LOWER(COALESCE(metadata->>'target_department', metadata->>'target_key', '')) = 'pmed'
+               ORDER BY created_at DESC
+               LIMIT 60`
+            )) as Array<{
+              id: number;
+              action: string;
+              detail: string;
+              actor: string;
+              entity_key: string | null;
+              metadata: Record<string, unknown> | string | null;
+              created_at: string;
+            }>;
+
+            const parseMetadata = (value: Record<string, unknown> | string | null | undefined): Record<string, unknown> => {
+              if (!value) return {};
+              if (typeof value === 'string') {
+                try {
+                  return JSON.parse(value) as Record<string, unknown>;
+                } catch {
+                  return {};
+                }
+              }
+              return value;
+            };
+
+            const mappedRequests = requestRows.map((row) => {
+              const metadata = parseMetadata(row.metadata);
+              return {
+                id: Number(row.id),
+                requestReference: toSafeText(metadata.report_reference) || toSafeText(row.entity_key) || `REQ-${row.id}`,
+                reportName: toSafeText(metadata.report_name) || 'Requested Cashier Report',
+                reportType: toSafeText(metadata.report_type) || 'Cashier Financial Report',
+                targetDepartment: toSafeText(metadata.target_department_name) || 'Cashier',
+                requestedBy: toSafeText(row.actor) || 'PMED',
+                requestedAt: toSafeText(row.created_at),
+                requestedAtLabel: formatDateTimeLabel(toSafeText(row.created_at)),
+                requestedAtRelative: formatRelativeTime(row.created_at),
+                detail: toSafeText(row.detail) || 'PMED requested a cashier financial report package.',
+                planReference: toSafeText(metadata.plan_reference),
+                status: toSafeText(metadata.request_status) || 'requested'
+              };
+            });
+
+            const mappedCandidates = candidateRows.map((row) => {
+              const connectionMeta = deriveBillingConnectionMeta(row);
+              return {
+                id: Number(row.id),
+                reference: String(row.reference_number || `PAY-${row.id}`),
+                studentName: String(row.full_name || 'Unknown Student'),
+                amount: formatCurrency(row.amount_paid),
+                rawAmount: Number(row.amount_paid || 0),
+                billingCode: String(row.billing_code || ''),
+                receiptNumber: String(row.receipt_number || '--'),
+                paymentMethod: String(row.payment_method || 'Cash'),
+                paymentStatus: mapPaymentStatus(String(row.payment_status || '')),
+                sourceDepartment: connectionMeta.sourceDepartment,
+                sourceCategory: connectionMeta.sourceCategory,
+                postedAt: String(row.payment_date || ''),
+                status: mapReportingStatus(String(row.reporting_status || '')),
+                workflowStage: String(row.workflow_stage || 'reporting_reconciliation'),
+                workflowStageLabel: workflowLabel(String(row.workflow_stage || 'reporting_reconciliation'))
+              };
+            });
+
+            const mappedReady = mappedCandidates
+              .filter((item) => item.status === 'Reconciled')
+              .map((item) => ({
+                id: item.id,
+                reference: item.reference,
+                studentName: item.studentName,
+                amount: item.amount,
+                rawAmount: item.rawAmount,
+                billingCode: item.billingCode,
+                receiptNumber: item.receiptNumber,
+                paymentMethod: item.paymentMethod,
+                paymentStatus: item.paymentStatus,
+                sourceDepartment: item.sourceDepartment,
+                sourceCategory: item.sourceCategory,
+                postedAt: item.postedAt
+              }));
+
+            const mappedSent = sentRows.map((row) => {
+              const metadata = parseMetadata(row.metadata);
+              return {
+                id: Number(row.id),
+                reportReference: toSafeText(metadata.report_reference) || toSafeText(row.entity_key) || `CASHIER-RPT-${row.id}`,
+                requestReference: toSafeText(metadata.request_reference),
+                paymentReference: toSafeText(metadata.source_payment_reference),
+                billingCode: toSafeText(metadata.source_billing_code),
+                studentName: toSafeText(metadata.source_student_name) || 'Unknown Student',
+                amount: formatCurrency(metadata.summary && typeof metadata.summary === 'object' ? (metadata.summary as Record<string, unknown>).amount_paid : 0),
+                status: 'Sent to PMED',
+                reportName: toSafeText(metadata.report_name) || 'Cashier Financial Report',
+                sentAt: toSafeText(row.created_at),
+                sentAtLabel: formatDateTimeLabel(toSafeText(row.created_at)),
+                sentAtRelative: formatRelativeTime(row.created_at),
+                actor: toSafeText(row.actor) || 'Cashier Reports Analyst'
+              };
+            });
+
+            const activityFeed = [
+              ...mappedRequests.slice(0, 6).map((item) => ({
+                title: `PMED Request: ${item.reportName}`,
+                detail: `${item.detail}${item.requestReference ? ` Reference: ${item.requestReference}.` : ''}`,
+                time: item.requestedAtRelative || formatRelativeTime(item.requestedAt),
+                sortAt: item.requestedAt
+              })),
+              ...mappedSent.slice(0, 6).map((item) => ({
+                title: `Sent to PMED: ${item.reportReference}`,
+                detail: `${item.reportName} for ${item.studentName} was delivered to PMED.`,
+                time: item.sentAtRelative || formatRelativeTime(item.sentAt),
+                sortAt: item.sentAt
+              }))
+            ]
+              .sort((left, right) => new Date(String(right.sortAt || '')).getTime() - new Date(String(left.sortAt || '')).getTime())
+              .slice(0, 8)
+              .map(({ title, detail, time }) => ({ title, detail, time }));
+
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                stats: [
+                  { title: 'PMED Requests', value: String(mappedRequests.length), subtitle: 'Inbound financial report requests from PMED', icon: 'mdi-alert-circle-outline', tone: 'purple' },
+                  { title: 'Ready to Send', value: String(mappedReady.length), subtitle: 'Reconciled cashier reports ready for PMED handoff', icon: 'mdi-file-document-check-outline', tone: 'green' },
+                  { title: 'Sent to PMED', value: String(mappedSent.length), subtitle: 'Cashier report packages already delivered to PMED', icon: 'mdi-bank-transfer', tone: 'blue' },
+                  { title: 'Pending Match', value: String(Math.max(mappedRequests.length - mappedReady.length, 0)), subtitle: 'PMED requests waiting for a reconciled cashier record', icon: 'mdi-timer-sand', tone: 'orange' }
+                ],
+                requests: mappedRequests,
+                candidateItems: mappedCandidates,
+                readyItems: mappedReady,
+                sentItems: mappedSent,
+                activityFeed
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/reporting-reconciliation' && (req.method || 'GET').toUpperCase() === 'POST') {
+            const body = await readJsonBody(req);
+            const paymentId = Number(body.paymentId || 0);
+            const action = String(body.action || '').trim().toLowerCase();
+            if (!paymentId || !['reconcile', 'report', 'archive'].includes(action)) {
+              writeJson(res, 422, { ok: false, message: 'Invalid reporting action payload.' });
+              return;
+            }
+
+            const requestReference = toSafeText(body.requestReference);
+            const paymentRows = (await sql.query(
+              `SELECT p.id, p.reference_number, p.amount_paid, p.payment_method, p.payment_status, p.reporting_status, p.workflow_stage,
+                      p.payment_date::text AS payment_date, COALESCE(p.remarks, '') AS payment_remarks,
+                      b.id AS billing_id, b.billing_code, b.balance_amount,
+                      COALESCE(s.full_name, 'Unknown Student') AS full_name,
+                      COALESCE(r.receipt_number, '--') AS receipt_number, COALESCE(r.receipt_status, '') AS receipt_status
+               FROM payment_transactions p
+               LEFT JOIN billing_records b ON b.id = p.billing_id
+               LEFT JOIN students s ON s.id = b.student_id
+               LEFT JOIN receipt_records r ON r.payment_id = p.id
+               WHERE p.id = $1
+               LIMIT 1`,
+              [paymentId]
+            )) as Array<{
+              id: number;
+              reference_number: string;
+              amount_paid: number;
+              payment_method: string;
+              payment_status: string;
+              reporting_status: string;
+              workflow_stage: string;
+              payment_date: string;
+              payment_remarks: string;
+              billing_id: number | null;
+              billing_code: string | null;
+              balance_amount: number | null;
+              full_name: string;
+              receipt_number: string;
+              receipt_status: string;
+            }>;
+            const paymentRow = paymentRows[0];
+            if (!paymentRow) {
+              writeJson(res, 404, { ok: false, message: 'Payment record not found.' });
+              return;
+            }
+
+            const currentReportingStatus = String(paymentRow.reporting_status || '').trim().toLowerCase();
+            const currentWorkflowStage = String(paymentRow.workflow_stage || '').trim().toLowerCase();
+            if (action === 'reconcile' && currentWorkflowStage === 'completed') {
+              writeJson(res, 422, { ok: false, message: 'Completed records cannot be reconciled again.' });
+              return;
+            }
+            if (action === 'report' && currentReportingStatus !== 'reconciled') {
+              writeJson(res, 422, { ok: false, message: 'Only reconciled records can be sent to PMED.' });
+              return;
+            }
+            if (action === 'archive' && !['reported', 'archived'].includes(currentReportingStatus)) {
+              writeJson(res, 422, { ok: false, message: 'Only PMED-sent records can be archived into completed history.' });
+              return;
+            }
+
+            const nextReportingStatus = action === 'reconcile' ? 'reconciled' : action === 'report' ? 'reported' : 'archived';
+            const nextWorkflowStage = action === 'archive' ? 'completed' : 'reporting_reconciliation';
+
+            await sql.query(
+              `UPDATE payment_transactions
+               SET reporting_status = $1, workflow_stage = $2
+               WHERE id = $3`,
+              [nextReportingStatus, nextWorkflowStage, paymentId]
+            );
+            if (action === 'archive') {
+              await sql.query(
+                `UPDATE receipt_records
+                 SET workflow_stage = 'completed'
+                 WHERE payment_id = $1`,
+                [paymentId]
+              );
+            }
+            await ensureModuleActivityLogsTable(sql);
+            if (action === 'report') {
+              const reportReference = `CASHIER-RPT-${String(paymentRow.reference_number || paymentId).replace(/[^A-Za-z0-9-]/g, '')}`;
+              const feeRows = paymentRow.billing_id
+                ? (await sql.query(
+                    `SELECT item_name, category, amount
+                     FROM billing_items
+                     WHERE billing_id = $1
+                     ORDER BY sort_order ASC, id ASC`,
+                    [paymentRow.billing_id]
+                  )) as Array<{ item_name: string; category: string | null; amount: number }>
+                : [];
+              const packageSections = feeRows.length
+                ? feeRows.map((fee, index) => ({
+                    id: `${reportReference}-SEC-${index + 1}`,
+                    title: String(fee.item_name || `Fee Item ${index + 1}`),
+                    source: 'Cashier',
+                    description: `${String(fee.category || 'Assessment')} allocation captured for ${formatCurrency(fee.amount)}.`,
+                    amount: Number(fee.amount || 0),
+                    category: String(fee.category || 'Assessment')
+                  }))
+                : [
+                    {
+                      id: `${reportReference}-SEC-1`,
+                      title: 'Cashier Settlement Summary',
+                      source: 'Cashier',
+                      description: 'Completed payment moved from cashier reconciliation to PMED financial reporting.',
+                      amount: Number(paymentRow.amount_paid || 0),
+                      category: 'Settlement'
+                    }
+                  ];
+              const reportMetadata = {
+                target_key: 'pmed',
+                target_department: 'pmed',
+                source_department: 'cashier',
+                source_department_name: 'Cashier',
+                report_reference: reportReference,
+                plan_reference: String(paymentRow.billing_code || paymentRow.reference_number || paymentId),
+                report_name: `Cashier Financial Report - ${paymentRow.reference_number}`,
+                report_type: 'Cashier Financial Report',
+                owner_name: 'Cashier Reports Analyst',
+                export_format: 'JSON',
+                delivery_status: 'Received',
+                archive_status: 'Active',
+                summary: {
+                  source_department: 'Cashier',
+                  payment_reference: String(paymentRow.reference_number || ''),
+                  billing_code: String(paymentRow.billing_code || ''),
+                  student_name: String(paymentRow.full_name || 'Unknown Student'),
+                  amount_paid: Number(paymentRow.amount_paid || 0),
+                  payment_method: String(paymentRow.payment_method || 'Unknown'),
+                  payment_status: String(paymentRow.payment_status || 'Unknown'),
+                  receipt_number: String(paymentRow.receipt_number || '--'),
+                  receipt_status: String(paymentRow.receipt_status || ''),
+                  fee_item_count: packageSections.length,
+                  remaining_balance: Number(paymentRow.balance_amount || 0)
+                },
+                pmed_sections: packageSections,
+                source_payment_id: paymentId,
+                source_payment_reference: String(paymentRow.reference_number || ''),
+                source_billing_id: paymentRow.billing_id,
+                source_billing_code: String(paymentRow.billing_code || ''),
+                source_receipt_number: String(paymentRow.receipt_number || '--'),
+                source_student_name: String(paymentRow.full_name || 'Unknown Student'),
+                request_reference: requestReference || null,
+                generated_at: new Date().toISOString()
+              };
+              const existingDelivery = (await sql.query(
+                `SELECT id
+                 FROM module_activity_logs
+                 WHERE LOWER(module) = 'department_reports'
+                   AND entity_key = $1
+                 LIMIT 1`,
+                [reportReference]
+              )) as Array<{ id: number }>;
+              if (!existingDelivery.length) {
+                await insertModuleActivity(
+                  'department_reports',
+                  'DEPARTMENT_REPORT_RECEIVED',
+                  `Cashier delivered ${reportReference} to PMED for ${paymentRow.reference_number}.`,
+                  'Cashier Reports Analyst',
+                  'report',
+                  reportReference,
+                  reportMetadata
+                );
+              }
+              await insertModuleActivity(
+                'reports',
+                'PMED Report Sent',
+                `${paymentRow.reference_number} was packaged and sent to PMED as ${reportReference}.`,
+                'Cashier Reports Analyst',
+                'payment',
+                String(paymentId),
+                {
+                  target_department: 'pmed',
+                  report_reference: reportReference,
+                  request_reference: requestReference || null,
+                  payment_reference: paymentRow.reference_number,
+                  billing_code: paymentRow.billing_code
+                }
+              );
+              broadcastRealtimeEvent({
+                type: 'department_report',
+                module: 'reports',
+                action: 'PMED Report Sent',
+                detail: `${paymentRow.reference_number} was sent to PMED as ${reportReference}.`,
+                entityKey: reportReference
+              });
+            }
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message:
+                  action === 'report'
+                    ? `${paymentRow.reference_number} was sent to PMED as part of the cashier financial reporting flow.`
+                    : `Payment ${paymentId} marked as ${toActionLabel(nextReportingStatus)}.`,
+                status: toActionLabel(nextReportingStatus),
+                workflow_stage: nextWorkflowStage,
+                next_module: action === 'report' ? 'PMED Department' : nextWorkflowStage
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/reports/transactions' && (req.method || 'GET').toUpperCase() === 'GET') {
+            const search = String(url.searchParams.get('search') || '').trim().toLowerCase();
+            const statusFilter = String(url.searchParams.get('status') || '').trim().toLowerCase();
+            const departmentFilter = String(url.searchParams.get('department') || '').trim().toLowerCase();
+            const categoryFilter = String(url.searchParams.get('category') || '').trim().toLowerCase();
+            const paymentMethodFilter = String(url.searchParams.get('payment_method') || '').trim().toLowerCase();
+            const workflowStageFilter = String(url.searchParams.get('workflow_stage') || '').trim().toLowerCase();
+            const dateFrom = String(url.searchParams.get('date_from') || '').trim();
+            const dateTo = String(url.searchParams.get('date_to') || '').trim();
+            const page = Math.max(1, Number(url.searchParams.get('page') || '1'));
+            const perPage = Math.min(100, Math.max(1, Number(url.searchParams.get('per_page') || '20')));
+
+            let items = (await sql.query(
+              `SELECT p.id, p.reference_number, p.amount_paid, p.payment_method, p.payment_status, p.reporting_status, p.workflow_stage, p.payment_date::text AS payment_date,
+                      b.billing_code, COALESCE(s.full_name, 'Unknown Student') AS full_name, COALESCE(s.student_no, '') AS student_no,
+                      COALESCE(s.email, '') AS student_email, COALESCE(s.course, '') AS course,
+                      COALESCE(r.receipt_number, '--') AS receipt_number, COALESCE(r.receipt_status, '') AS receipt_status
+               FROM payment_transactions p
+               LEFT JOIN billing_records b ON b.id = p.billing_id
+               LEFT JOIN students s ON s.id = b.student_id
+               LEFT JOIN receipt_records r ON r.payment_id = p.id
+               ORDER BY p.payment_date DESC NULLS LAST, p.created_at DESC, p.id DESC`
+            )) as Array<{
+              id: number;
+              reference_number: string;
+              amount_paid: number;
+              payment_method: string;
+              payment_status: string;
+              reporting_status: string;
+              workflow_stage: string;
+              payment_date: string;
+              billing_code: string | null;
+              full_name: string;
+              student_no: string;
+              student_email: string;
+              course: string;
+              receipt_number: string;
+              receipt_status: string;
+            }>;
+
+            const mapped = items.map((row) => {
+              const connectionMeta = deriveBillingConnectionMeta(row);
+              return {
+                id: Number(row.id),
+                referenceNumber: String(row.reference_number || `PAY-${row.id}`),
+                studentName: String(row.full_name || 'Unknown Student'),
+                billingCode: String(row.billing_code || ''),
+                receiptNumber: String(row.receipt_number || '--'),
+                sourceModule: connectionMeta.sourceModule,
+                sourceDepartment: connectionMeta.sourceDepartment,
+                sourceCategory: connectionMeta.sourceCategory,
+                amount: Number(row.amount_paid || 0),
+                amountFormatted: formatCurrency(row.amount_paid),
+                paymentMethod: String(row.payment_method || 'Online'),
+                paymentStatus: mapPaymentStatus(String(row.payment_status || '')),
+                documentationStatus: mapReceiptStatus(String(row.receipt_status || '')),
+                reportingStatus: mapReportingStatus(String(row.reporting_status || '')),
+                workflowStage: String(row.workflow_stage || 'reporting_reconciliation'),
+                workflowStageLabel: workflowLabel(String(row.workflow_stage || 'reporting_reconciliation')),
+                createdAt: String(row.payment_date || ''),
+                allocationSummary: '',
+                allocations: []
+              };
+            });
+            const completedOnly = mapped.filter((item) => item.workflowStage === 'completed');
+
+            const filtered = completedOnly.filter((item) => {
+              if (statusFilter && String(item.reportingStatus || '').toLowerCase() !== statusFilter) return false;
+              if (departmentFilter && String(item.sourceDepartment || '').toLowerCase() !== departmentFilter) return false;
+              if (categoryFilter && String(item.sourceCategory || '').toLowerCase() !== categoryFilter) return false;
+              if (paymentMethodFilter && !String(item.paymentMethod || '').toLowerCase().includes(paymentMethodFilter)) return false;
+              if (workflowStageFilter && String(item.workflowStage || '').toLowerCase() !== workflowStageFilter) return false;
+              if (dateFrom && String(item.createdAt || '').slice(0, 10) < dateFrom) return false;
+              if (dateTo && String(item.createdAt || '').slice(0, 10) > dateTo) return false;
+              if (search) {
+                const haystack =
+                  `${item.referenceNumber} ${item.studentName} ${item.billingCode} ${item.receiptNumber} ${item.paymentStatus} ${item.reportingStatus} ${item.sourceDepartment} ${item.sourceCategory}`.toLowerCase();
+                if (!haystack.includes(search)) return false;
+              }
+              return true;
+            });
+
+            const total = filtered.length;
+            const offset = (page - 1) * perPage;
+            const paged = filtered.slice(offset, offset + perPage);
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                items: paged,
+                meta: {
+                  total,
+                  page,
+                  perPage,
+                  totalPages: Math.max(1, Math.ceil(total / perPage))
+                }
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/reports/export' && (req.method || 'GET').toUpperCase() === 'GET') {
+            const search = String(url.searchParams.get('search') || '').trim().toLowerCase();
+            const statusFilter = String(url.searchParams.get('status') || '').trim().toLowerCase();
+            const departmentFilter = String(url.searchParams.get('department') || '').trim().toLowerCase();
+            const categoryFilter = String(url.searchParams.get('category') || '').trim().toLowerCase();
+            const dateFrom = String(url.searchParams.get('date_from') || '').trim();
+            const dateTo = String(url.searchParams.get('date_to') || '').trim();
+            const rows = (await sql.query(
+              `SELECT p.reference_number, s.full_name, b.billing_code, p.amount_paid, p.payment_status, p.reporting_status, p.workflow_stage, p.payment_date::text AS payment_date,
+                      COALESCE(s.student_no, '') AS student_no, COALESCE(s.email, '') AS student_email, COALESCE(s.course, '') AS course,
+                      COALESCE(r.receipt_number, '--') AS receipt_number
+               FROM payment_transactions p
+               LEFT JOIN billing_records b ON b.id = p.billing_id
+               LEFT JOIN students s ON s.id = b.student_id
+               LEFT JOIN receipt_records r ON r.payment_id = p.id
+               ORDER BY p.payment_date DESC NULLS LAST, p.created_at DESC, p.id DESC`
+            )) as Array<{
+              reference_number: string;
+              full_name: string | null;
+              billing_code: string | null;
+              amount_paid: number;
+              payment_status: string;
+              reporting_status: string;
+              workflow_stage: string;
+              payment_date: string;
+              student_no: string;
+              student_email: string;
+              course: string;
+              receipt_number: string;
+            }>;
+            const completedRows = rows
+              .map((row) => {
+                const connectionMeta = deriveBillingConnectionMeta(row);
+                return {
+                  ...row,
+                  sourceDepartment: connectionMeta.sourceDepartment,
+                  sourceCategory: connectionMeta.sourceCategory
+                };
+              })
+              .filter((row) => {
+                if (String(row.workflow_stage || '') !== 'completed') return false;
+                if (statusFilter && mapReportingStatus(String(row.reporting_status || '')).toLowerCase() !== statusFilter) return false;
+                if (departmentFilter && String(row.sourceDepartment || '').toLowerCase() !== departmentFilter) return false;
+                if (categoryFilter && String(row.sourceCategory || '').toLowerCase() !== categoryFilter) return false;
+                if (dateFrom && String(row.payment_date || '').slice(0, 10) < dateFrom) return false;
+                if (dateTo && String(row.payment_date || '').slice(0, 10) > dateTo) return false;
+                if (search) {
+                  const haystack =
+                    `${row.reference_number || ''} ${row.full_name || ''} ${row.billing_code || ''} ${row.receipt_number || ''} ${row.sourceDepartment || ''} ${row.sourceCategory || ''}`.toLowerCase();
+                  if (!haystack.includes(search)) return false;
+                }
+                return true;
+              });
+            const header = [
+              'Reference Number',
+              'Student Name',
+              'Billing Code',
+              'Department',
+              'Category Type',
+              'Amount',
+              'Payment Status',
+              'Reporting Status',
+              'Workflow Stage',
+              'Payment Date',
+              'Receipt Number'
+            ];
+            const lines = [header.join(',')];
+            for (const row of completedRows) {
+              lines.push(
+                [
+                  row.reference_number || '',
+                  row.full_name || '',
+                  row.billing_code || '',
+                  row.sourceDepartment || '',
+                  row.sourceCategory || '',
+                  formatCurrency(row.amount_paid),
+                  mapPaymentStatus(String(row.payment_status || '')),
+                  mapReportingStatus(String(row.reporting_status || '')),
+                  row.workflow_stage || '',
+                  String(row.payment_date || '').slice(0, 19),
+                  row.receipt_number || '--'
+                ]
+                  .map((value) => `"${String(value).replace(/"/g, '""')}"`)
+                  .join(',')
+              );
+            }
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                filename: `completed-transactions-${new Date().toISOString().slice(0, 10)}.csv`,
+                mimeType: 'text/csv;charset=utf-8;',
+                content: lines.join('\n')
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/integrated-flow' && (req.method || 'GET').toUpperCase() === 'GET') {
+            const department = String(url.searchParams.get('department') || '').trim();
+            const incoming = department ? integratedFlow.functions.getIncomingByDepartment(department) : [];
+            const outgoing = department ? integratedFlow.functions.getOutgoingByDepartment(department) : [];
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                flow: {
+                  nodes: integratedFlow.nodes,
+                  edges: integratedFlow.edges
+                },
+                department,
+                incoming,
+                outgoing
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/clinic-sync/status' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await ensureClinicBookingsSyncedToCashier();
+            await ensureModuleActivityLogsTable(sql);
+            await ensurePatientMasterTables(sql);
+
+            const billingRows = (await sql.query(
+              `SELECT
+                  COUNT(*)::int AS clinic_origin_billings,
+                  COUNT(*) FILTER (WHERE workflow_stage = 'student_portal_billing')::int AS pending_cashier_queue,
+                  COUNT(*) FILTER (WHERE workflow_stage <> 'student_portal_billing')::int AS forwarded_to_pay_bills
+               FROM billing_records b
+               INNER JOIN students s ON s.id = b.student_id
+               WHERE s.student_no LIKE 'CLINIC-%' OR LOWER(COALESCE(s.email, '')) LIKE '%@clinic.local'`
+            )) as Array<{
+              clinic_origin_billings: number;
+              pending_cashier_queue: number;
+              forwarded_to_pay_bills: number;
+            }>;
+
+            const patientRows = (await sql.query(`SELECT COUNT(*)::int AS total FROM patient_master`)) as Array<{ total: number }>;
+            const activityRows = (await sql.query(
+              `SELECT id, module, action, detail, actor, entity_key, created_at::text AS created_at
+               FROM module_activity_logs
+               WHERE module IN ('laboratory', 'billing_verification', 'patients', 'appointments', 'walkin', 'checkup')
+               ORDER BY created_at DESC
+               LIMIT 6`
+            )) as Array<{
+              id: number;
+              module: string;
+              action: string;
+              detail: string;
+              actor: string;
+              entity_key: string | null;
+              created_at: string;
+            }>;
+
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                generatedAt: new Date().toISOString(),
+                counters: {
+                  clinicOriginBillings: Number(billingRows[0]?.clinic_origin_billings || 0),
+                  pendingCashierQueue: Number(billingRows[0]?.pending_cashier_queue || 0),
+                  forwardedToPayBills: Number(billingRows[0]?.forwarded_to_pay_bills || 0),
+                  patientProfiles: Number(patientRows[0]?.total || 0)
+                },
+                recentActivity: activityRows.map((row) => ({
+                  id: Number(row.id),
+                  module: String(row.module || ''),
+                  action: String(row.action || ''),
+                  detail: String(row.detail || ''),
+                  actor: String(row.actor || ''),
+                  entityKey: row.entity_key ? String(row.entity_key) : null,
+                  createdAt: String(row.created_at || '')
+                }))
+              }
+            });
+            return;
+          }
+
+          if (isBillingVerifyRoute && (req.method || 'GET').toUpperCase() === 'POST') {
+            const idMatch = url.pathname.match(/^\/api\/billings\/(\d+)\/verify$/);
+            const billingId = Number(idMatch?.[1] || 0);
+            const body = await readJsonBody(req);
+            const remarks = toSafeText(body.remarks) || 'Billing verified and ready for payment.';
+            const validationChecklist = toSafeText(body.validation_checklist);
+            const studentProfileCheck = toSafeText(body.student_profile_check);
+            const feeBreakdownCheck = toSafeText(body.fee_breakdown_check);
+            const paymentEligibilityCheck = toSafeText(body.payment_eligibility_check);
+            const duplicateBillingCheck = toSafeText(body.duplicate_billing_check);
+            if (!billingId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid billing id.' });
+              return;
+            }
+            const rows = (await sql.query(
+              `SELECT id, billing_code, billing_status, workflow_stage, balance_amount
+               FROM billing_records
+               WHERE id = $1
+               LIMIT 1`,
+              [billingId]
+            )) as Array<{
+              id: number;
+              billing_code: string;
+              billing_status: string;
+              workflow_stage: string;
+              balance_amount: number;
+            }>;
+            const row = rows[0];
+            if (!row) {
+              writeJson(res, 404, { ok: false, message: 'Billing record not found.' });
+              return;
+            }
+            if (String(row.workflow_stage || '') !== 'student_portal_billing') {
+              writeJson(res, 422, { ok: false, message: 'Billing is not in Student Portal & Billing stage.' });
+              return;
+            }
+            if (Number(row.balance_amount || 0) <= 0) {
+              writeJson(res, 422, { ok: false, message: 'Only billings with active outstanding balance can be verified.' });
+              return;
+            }
+            if (!validationChecklist) {
+              writeJson(res, 422, { ok: false, message: 'Validation checklist is required before verifying billing.' });
+              return;
+            }
+            if (studentProfileCheck !== 'Complete') {
+              writeJson(res, 422, {
+                ok: false,
+                message: 'Student profile must be marked Complete before the billing can move to Pay Bills.'
+              });
+              return;
+            }
+            if (feeBreakdownCheck !== 'Validated') {
+              writeJson(res, 422, {
+                ok: false,
+                message: 'Fee breakdown must be validated before the billing can move to Pay Bills.'
+              });
+              return;
+            }
+            if (paymentEligibilityCheck !== 'Eligible') {
+              writeJson(res, 422, {
+                ok: false,
+                message: 'Only payment-eligible billings can be forwarded to Pay Bills.'
+              });
+              return;
+            }
+            if (duplicateBillingCheck !== 'No Duplicate Found') {
+              writeJson(res, 422, {
+                ok: false,
+                message: 'Duplicate billing review must be cleared before verification can proceed.'
+              });
+              return;
+            }
+            const itemRows = (await sql.query(
+              `SELECT COUNT(*)::int AS total
+               FROM billing_items
+               WHERE billing_id = $1`,
+              [billingId]
+            )) as Array<{ total: number }>;
+            if (Number(itemRows?.[0]?.total || 0) <= 0) {
+              writeJson(res, 422, {
+                ok: false,
+                message: 'This billing record has no fee items yet. Add fee details before verification.'
+              });
+              return;
+            }
+            const consolidatedRemarks = [
+              remarks,
+              `Checklist: ${validationChecklist}`,
+              `Student Profile: ${studentProfileCheck}`,
+              `Fee Breakdown: ${feeBreakdownCheck}`,
+              `Payment Eligibility: ${paymentEligibilityCheck}`,
+              `Duplicate Check: ${duplicateBillingCheck}`
+            ].join(' | ');
+            await sql.query(
+              `UPDATE billing_records
+               SET billing_status = 'verified',
+                   workflow_stage = 'pay_bills',
+                   remarks = $2,
+                   updated_at = NOW(),
+                   action_at = NOW()
+               WHERE id = $1`,
+              [billingId, consolidatedRemarks]
+            );
+            await ensureModuleActivityLogsTable(sql);
+            await sql.query(
+              `INSERT INTO module_activity_logs (module, action, detail, actor, entity_type, entity_key, metadata)
+               VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+              [
+                'billing_verification',
+                'Billing Verified',
+                `Billing ${row.billing_code} was verified and moved to Pay Bills. ${consolidatedRemarks}`,
+                'Cashier',
+                'billing',
+                row.billing_code,
+                JSON.stringify({ billingId, from: 'student_portal_billing', to: 'pay_bills' })
+              ]
+            );
+            broadcastRealtimeEvent({
+              type: 'clinic_cashier_sync',
+              module: 'billing_verification',
+              action: 'Billing Verified',
+              detail: `Billing ${row.billing_code} was verified and moved to Pay Bills.`,
+              entityKey: row.billing_code
+            });
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: 'Billing verified successfully.',
+                status: 'Verified',
+                workflow_stage: 'pay_bills',
+                next_module: 'Pay Bills'
+              }
+            });
+            return;
+          }
+
+          if (isPaymentsApproveRoute && (req.method || 'GET').toUpperCase() === 'POST') {
+            const body = await readJsonBody(req);
+            const billingId = Number(body.billingId || 0);
+            const amount = toSafeMoney(body.amount, 0);
+            const paymentMethod = toSafeText(body.paymentMethod || body.payment_method) || 'Cash';
+            const remarks = toSafeText(body.remarks) || 'Payment request approved for processing.';
+            if (!billingId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid billing id.' });
+              return;
+            }
+            if (amount <= 0) {
+              writeJson(res, 422, { ok: false, message: 'Approved amount must be greater than zero.' });
+              return;
+            }
+            const rows = (await sql.query(
+              `SELECT b.id, b.billing_code, b.workflow_stage, b.total_amount, b.paid_amount, b.balance_amount,
+                      COALESCE(s.student_no, '') AS student_no, COALESCE(s.email, '') AS student_email, COALESCE(s.course, '') AS course
+               FROM billing_records b
+               LEFT JOIN students s ON s.id = b.student_id
+               WHERE b.id = $1
+               LIMIT 1`,
+              [billingId]
+            )) as Array<{
+              id: number;
+              billing_code: string;
+              workflow_stage: string;
+              total_amount: number;
+              paid_amount: number;
+              balance_amount: number;
+              student_no: string;
+              student_email: string;
+              course: string;
+            }>;
+            const row = rows[0];
+            if (!row) {
+              writeJson(res, 404, { ok: false, message: 'Billing record not found.' });
+              return;
+            }
+            const connectionMeta = deriveBillingConnectionMeta(row);
+            const currentStage = String(row.workflow_stage || '');
+            const canApproveFromStage =
+              currentStage === 'pay_bills' ||
+              (currentStage === 'student_portal_billing' && connectionMeta.isClinicOrigin);
+            if (!canApproveFromStage) {
+              writeJson(res, 422, { ok: false, message: 'Only billings in Pay Bills can be forwarded to payment processing.' });
+              return;
+            }
+            if (amount > Number(row.balance_amount || 0)) {
+              writeJson(res, 422, { ok: false, message: 'Approved amount cannot exceed the remaining balance.' });
+              return;
+            }
+            const existingQueue = (await sql.query(
+              `SELECT id, reference_number
+               FROM payment_transactions
+               WHERE billing_id = $1
+                 AND workflow_stage = 'payment_processing_gateway'
+                 AND LOWER(COALESCE(payment_status, 'processing')) IN ('processing', 'authorized')
+               ORDER BY id DESC
+               LIMIT 1`,
+              [billingId]
+            )) as Array<{ id: number; reference_number: string }>;
+            if (existingQueue[0]) {
+              await sql.query(
+                `UPDATE billing_records
+                 SET billing_status = 'payment_in_progress',
+                     workflow_stage = 'payment_processing_gateway',
+                     remarks = $2,
+                     updated_at = NOW(),
+                     action_at = NOW()
+                 WHERE id = $1`,
+                [billingId, remarks]
+              );
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  message: `${existingQueue[0].reference_number} is already active in Payment Processing & Gateway.`,
+                  status: 'Processing',
+                  workflow_stage: 'payment_processing_gateway',
+                  next_module: 'Payment Processing & Gateway'
+                }
+              });
+              return;
+            }
+            const referenceNumber = `PAY-${Date.now()}-${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`;
+            await sql.query(
+               `INSERT INTO payment_transactions (
+                 billing_id, reference_number, amount_paid, payment_method, payment_status, reporting_status, workflow_stage,
+                 payment_date, processed_by, remarks, created_at
+               )
+               VALUES ($1,$2,$3,$4,'processing','logged','payment_processing_gateway',NOW(),NULL,$5,NOW())`,
+              [billingId, referenceNumber, amount, paymentMethod, remarks]
+            );
+            await sql.query(
+              `UPDATE billing_records
+               SET billing_status = 'payment_in_progress',
+                   workflow_stage = 'payment_processing_gateway',
+                   remarks = $2,
+                   updated_at = NOW(),
+                   action_at = NOW()
+               WHERE id = $1`,
+              [billingId, remarks]
+            );
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: `${row.billing_code} was forwarded to Payment Processing & Gateway.`,
+                status: 'Processing',
+                workflow_stage: 'payment_processing_gateway',
+                next_module: 'Payment Processing & Gateway'
+              }
+            });
+            return;
+          }
+
+          if (isInstallmentsRoute && (req.method || 'GET').toUpperCase() === 'POST') {
+            const body = await readJsonBody(req);
+            const billingId = Number(body.billingId || 0);
+            const installmentAmount = toSafeMoney(body.installmentAmount, 0);
+            const installmentCount = Math.max(1, Number(body.installmentCount || 1));
+            const dueSchedule = toSafeText(body.dueSchedule) || 'Installment schedule pending';
+            const paymentMethod = toSafeText(body.paymentMethod) || 'Cash';
+            const remarks = toSafeText(body.remarks) || 'Installment payment request created.';
+            if (!billingId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid billing id.' });
+              return;
+            }
+            if (installmentAmount <= 0) {
+              writeJson(res, 422, { ok: false, message: 'Installment amount must be greater than zero.' });
+              return;
+            }
+            const rows = (await sql.query(
+              `SELECT b.id, b.billing_code, b.workflow_stage, b.balance_amount,
+                      COALESCE(s.student_no, '') AS student_no, COALESCE(s.email, '') AS student_email, COALESCE(s.course, '') AS course
+               FROM billing_records b
+               LEFT JOIN students s ON s.id = b.student_id
+               WHERE b.id = $1
+               LIMIT 1`,
+              [billingId]
+            )) as Array<{
+              id: number;
+              billing_code: string;
+              workflow_stage: string;
+              balance_amount: number;
+              student_no: string;
+              student_email: string;
+              course: string;
+            }>;
+            const row = rows[0];
+            if (!row) {
+              writeJson(res, 404, { ok: false, message: 'Billing record not found.' });
+              return;
+            }
+            const connectionMeta = deriveBillingConnectionMeta(row);
+            const currentStage = String(row.workflow_stage || '');
+            const canApproveFromStage =
+              currentStage === 'pay_bills' ||
+              (currentStage === 'student_portal_billing' && connectionMeta.isClinicOrigin);
+            if (!canApproveFromStage) {
+              writeJson(res, 422, { ok: false, message: 'Only billings in Pay Bills can be scheduled for installment processing.' });
+              return;
+            }
+            if (installmentAmount > Number(row.balance_amount || 0)) {
+              writeJson(res, 422, { ok: false, message: 'Installment amount cannot exceed the remaining balance.' });
+              return;
+            }
+            const existingQueue = (await sql.query(
+              `SELECT id, reference_number
+               FROM payment_transactions
+               WHERE billing_id = $1
+                 AND workflow_stage = 'payment_processing_gateway'
+                 AND LOWER(COALESCE(payment_status, 'processing')) IN ('processing', 'authorized')
+               ORDER BY id DESC
+               LIMIT 1`,
+              [billingId]
+            )) as Array<{ id: number; reference_number: string }>;
+            if (existingQueue[0]) {
+              await sql.query(
+                `UPDATE billing_records
+                 SET billing_status = 'payment_in_progress',
+                     workflow_stage = 'payment_processing_gateway',
+                     remarks = $2,
+                     updated_at = NOW(),
+                     action_at = NOW()
+                 WHERE id = $1`,
+                [billingId, `${remarks} | ${installmentCount} installment(s) | ${dueSchedule}`]
+              );
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  message: `${existingQueue[0].reference_number} is already active in Payment Processing & Gateway.`,
+                  status: 'Processing',
+                  workflow_stage: 'payment_processing_gateway',
+                  next_module: 'Payment Processing & Gateway'
+                }
+              });
+              return;
+            }
+            const referenceNumber = `PAY-INST-${Date.now()}-${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`;
+            await sql.query(
+               `INSERT INTO payment_transactions (
+                 billing_id, reference_number, amount_paid, payment_method, payment_status, reporting_status, workflow_stage,
+                 payment_date, processed_by, remarks, created_at
+               )
+               VALUES ($1,$2,$3,$4,'processing','logged','payment_processing_gateway',NOW(),NULL,$5,NOW())`,
+              [billingId, referenceNumber, installmentAmount, paymentMethod, `${remarks} | ${installmentCount} installment(s) | ${dueSchedule}`]
+            );
+            await sql.query(
+              `UPDATE billing_records
+               SET billing_status = 'payment_in_progress',
+                   workflow_stage = 'payment_processing_gateway',
+                   remarks = $2,
+                   updated_at = NOW(),
+                   action_at = NOW()
+               WHERE id = $1`,
+              [billingId, `${remarks} | ${installmentCount} installment(s) | ${dueSchedule}`]
+            );
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: `${row.billing_code} installment request was forwarded to Payment Processing & Gateway.`,
+                status: 'Processing',
+                workflow_stage: 'payment_processing_gateway',
+                next_module: 'Payment Processing & Gateway'
+              }
+            });
+            return;
+          }
+
+          if (isPaymentAuthorizeRoute && (req.method || 'GET').toUpperCase() === 'PATCH') {
+            const idMatch = url.pathname.match(/^\/api\/payment-transactions\/(\d+)\/authorize$/);
+            const paymentId = Number(idMatch?.[1] || 0);
+            const body = await readJsonBody(req);
+            const remarks = [toSafeText(body.remarks), toSafeText(body.authorizationNotes)].filter(Boolean).join(' | ');
+            if (!paymentId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid payment id.' });
+              return;
+            }
+            const rows = (await sql.query(
+              `SELECT id, reference_number, workflow_stage
+               FROM payment_transactions
+               WHERE id = $1
+               LIMIT 1`,
+              [paymentId]
+            )) as Array<{ id: number; reference_number: string; workflow_stage: string }>;
+            const row = rows[0];
+            if (!row) {
+              writeJson(res, 404, { ok: false, message: 'Payment transaction not found.' });
+              return;
+            }
+            await sql.query(
+              `UPDATE payment_transactions
+               SET payment_status = 'authorized',
+                   remarks = $2
+               WHERE id = $1`,
+              [paymentId, remarks || 'Gateway validation completed.']
+            );
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: `${row.reference_number} was authorized successfully.`,
+                status: 'Authorized',
+                workflow_stage: 'payment_processing_gateway',
+                next_module: 'Payment Processing & Gateway'
+              }
+            });
+            return;
+          }
+
+          if (isPaymentConfirmPaidRoute && (req.method || 'GET').toUpperCase() === 'PATCH') {
+            const idMatch = url.pathname.match(/^\/api\/payment-transactions\/(\d+)\/confirm-paid$/);
+            const paymentId = Number(idMatch?.[1] || 0);
+            const body = await readJsonBody(req);
+            const remarks = toSafeText(body.remarks) || 'Payment confirmed successfully.';
+            if (!paymentId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid payment id.' });
+              return;
+            }
+            const rows = (await sql.query(
+              `SELECT p.id, p.reference_number, p.billing_id, p.amount_paid,
+                      b.billing_code, b.total_amount, b.paid_amount, b.balance_amount
+               FROM payment_transactions p
+               LEFT JOIN billing_records b ON b.id = p.billing_id
+               WHERE p.id = $1
+               LIMIT 1`,
+              [paymentId]
+            )) as Array<{
+              id: number;
+              reference_number: string;
+              billing_id: number;
+              amount_paid: number;
+              billing_code: string;
+              total_amount: number;
+              paid_amount: number;
+              balance_amount: number;
+            }>;
+            const row = rows[0];
+            if (!row || !row.billing_id) {
+              writeJson(res, 404, { ok: false, message: 'Payment transaction not found.' });
+              return;
+            }
+            const nextPaid = Math.min(Number(row.total_amount || 0), Number(row.paid_amount || 0) + Number(row.amount_paid || 0));
+            const nextBalance = Math.max(0, Number(row.total_amount || 0) - nextPaid);
+            await sql.query(
+              `UPDATE payment_transactions
+               SET payment_status = 'paid',
+                   reporting_status = 'logged',
+                   workflow_stage = 'compliance_documentation',
+                   payment_date = NOW(),
+                   remarks = $2
+               WHERE id = $1`,
+              [paymentId, remarks]
+            );
+            await sql.query(
+              `UPDATE billing_records
+               SET paid_amount = $2,
+                   balance_amount = $3,
+                   billing_status = $4,
+                   workflow_stage = $5,
+                   remarks = $6,
+                   updated_at = NOW(),
+                   action_at = NOW()
+               WHERE id = $1`,
+              [
+                row.billing_id,
+                nextPaid,
+                nextBalance,
+                nextBalance <= 0 ? 'paid' : 'partial_payment',
+                nextBalance <= 0 ? 'completed' : 'pay_bills',
+                remarks
+              ]
+            );
+            const existingReceipt = (await sql.query(
+              `SELECT id
+               FROM receipt_records
+               WHERE payment_id = $1
+               LIMIT 1`,
+              [paymentId]
+            )) as Array<{ id: number }>;
+            if (existingReceipt[0]) {
+              await sql.query(
+                `UPDATE receipt_records
+                 SET workflow_stage = 'compliance_documentation',
+                     issued_date = COALESCE(issued_date, NOW()),
+                     remarks = $2
+                 WHERE id = $1`,
+                [existingReceipt[0].id, 'Ready for receipt generation.']
+              );
+            } else {
+              await sql.query(
+                `INSERT INTO receipt_records (
+                   payment_id, receipt_number, issued_date, receipt_status, workflow_stage, remarks, created_at
+                 )
+                 VALUES ($1,NULL,NOW(),'','compliance_documentation',$2,NOW())`,
+                [paymentId, 'Ready for receipt generation.']
+              );
+            }
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: `${row.reference_number} was confirmed as paid and moved to Compliance & Documentation.`,
+                status: 'Paid',
+                workflow_stage: 'compliance_documentation',
+                next_module: 'Compliance & Documentation'
+              }
+            });
+            return;
+          }
+
+          if (isReceiptsGenerateRoute && (req.method || 'GET').toUpperCase() === 'POST') {
+            const body = await readJsonBody(req);
+            const receiptId = Number(body.paymentId || 0);
+            const receiptType = toSafeText(body.receipt_type) || 'Official Receipt';
+            const remarks = toSafeText(body.remarks) || 'Official receipt generated.';
+            if (!receiptId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid receipt record id.' });
+              return;
+            }
+            const rows = (await sql.query(
+              `SELECT id, receipt_number
+               FROM receipt_records
+               WHERE id = $1
+               LIMIT 1`,
+              [receiptId]
+            )) as Array<{ id: number; receipt_number: string | null }>;
+            const row = rows[0];
+            if (!row) {
+              writeJson(res, 404, { ok: false, message: 'Receipt record not found.' });
+              return;
+            }
+            const nextReceiptNo = toSafeText(row.receipt_number) || `RCPT-${Date.now()}-${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`;
+            await sql.query(
+              `UPDATE receipt_records
+               SET receipt_number = $2,
+                   issued_date = NOW(),
+                   receipt_status = 'receipt_generated',
+                   workflow_stage = 'compliance_documentation',
+                   remarks = $3
+               WHERE id = $1`,
+              [receiptId, nextReceiptNo, `${receiptType} | ${remarks}`]
+            );
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: `${nextReceiptNo} was generated successfully.`,
+                status: 'Receipt Generated',
+                workflow_stage: 'compliance_documentation',
+                next_module: 'Compliance & Documentation',
+                receipt_no: nextReceiptNo
+              }
+            });
+            return;
+          }
+
+          if (isComplianceVerifyRoute && (req.method || 'GET').toUpperCase() === 'POST') {
+            const idMatch = url.pathname.match(/^\/api\/compliance\/(\d+)\/verify-proof$/);
+            const receiptId = Number(idMatch?.[1] || 0);
+            const body = await readJsonBody(req);
+            if (!receiptId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid compliance record id.' });
+              return;
+            }
+            const remarks = [toSafeText(body.proofType), toSafeText(body.verifiedBy), toSafeText(body.decision), toSafeText(body.verificationNotes)]
+              .filter(Boolean)
+              .join(' | ');
+            await sql.query(
+              `UPDATE receipt_records
+               SET receipt_status = 'proof_verified',
+                   workflow_stage = 'compliance_documentation',
+                   remarks = $2
+               WHERE id = $1`,
+              [receiptId, remarks || 'Proof of payment verified.']
+            );
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: 'Proof of payment was verified successfully.',
+                status: 'Proof Verified',
+                workflow_stage: 'compliance_documentation',
+                next_module: 'Compliance & Documentation'
+              }
+            });
+            return;
+          }
+
+          if (isComplianceCompleteRoute && (req.method || 'GET').toUpperCase() === 'POST') {
+            const idMatch = url.pathname.match(/^\/api\/compliance\/(\d+)\/complete$/);
+            const receiptId = Number(idMatch?.[1] || 0);
+            const body = await readJsonBody(req);
+            if (!receiptId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid compliance record id.' });
+              return;
+            }
+            const rows = (await sql.query(
+              `SELECT id, payment_id
+               FROM receipt_records
+               WHERE id = $1
+               LIMIT 1`,
+              [receiptId]
+            )) as Array<{ id: number; payment_id: number }>;
+            const row = rows[0];
+            if (!row) {
+              writeJson(res, 404, { ok: false, message: 'Compliance record not found.' });
+              return;
+            }
+            const remarks = [toSafeText(body.checklistSummary), toSafeText(body.finalDecision), toSafeText(body.completionNotes)]
+              .filter(Boolean)
+              .join(' | ');
+            await sql.query(
+              `UPDATE receipt_records
+               SET receipt_status = 'documentation_completed',
+                   workflow_stage = 'reporting_reconciliation',
+                   remarks = $2
+               WHERE id = $1`,
+              [receiptId, remarks || 'Documentation completed.']
+            );
+            await sql.query(
+              `UPDATE payment_transactions
+               SET workflow_stage = 'reporting_reconciliation',
+                   reporting_status = 'logged'
+               WHERE id = $1`,
+              [row.payment_id]
+            );
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: 'Compliance documentation completed successfully.',
+                status: 'Documentation Completed',
+                workflow_stage: 'reporting_reconciliation',
+                next_module: 'Reporting & Reconciliation'
+              }
+            });
+            return;
+          }
+
+          if (isReconciliationActionRoute && (req.method || 'GET').toUpperCase() === 'POST') {
+            const idMatch = url.pathname.match(/^\/api\/reconciliation\/(\d+)\/(reconcile|archive|flag-discrepancy)$/);
+            const paymentId = Number(idMatch?.[1] || 0);
+            const action = String(idMatch?.[2] || '').trim().toLowerCase();
+            const body = await readJsonBody(req);
+            if (!paymentId || !action) {
+              writeJson(res, 422, { ok: false, message: 'Invalid reconciliation action payload.' });
+              return;
+            }
+            const rows = (await sql.query(
+              `SELECT id, reference_number
+               FROM payment_transactions
+               WHERE id = $1
+               LIMIT 1`,
+              [paymentId]
+            )) as Array<{ id: number; reference_number: string }>;
+            const row = rows[0];
+            if (!row) {
+              writeJson(res, 404, { ok: false, message: 'Payment transaction not found.' });
+              return;
+            }
+            const statusValue =
+              action === 'reconcile' ? 'reconciled' :
+              action === 'archive' ? 'archived' :
+              'with_discrepancy';
+            const nextStage =
+              action === 'archive' ? 'completed' : 'reporting_reconciliation';
+            const notes =
+              action === 'flag-discrepancy'
+                ? [toSafeText(body.note), toSafeText(body.reason), toSafeText(body.notes)].filter(Boolean).join(' | ')
+                : toSafeText(body.remarks);
+            await sql.query(
+              `UPDATE payment_transactions
+               SET reporting_status = $2,
+                   workflow_stage = $3,
+                   remarks = COALESCE($4, remarks)
+               WHERE id = $1`,
+              [paymentId, statusValue, nextStage, notes || null]
+            );
+            if (action === 'archive') {
+              await sql.query(
+                `UPDATE receipt_records
+                 SET workflow_stage = 'completed'
+                 WHERE payment_id = $1`,
+                [paymentId]
+              );
+            }
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: `${row.reference_number} was marked as ${toActionLabel(statusValue)}.`,
+                status: toActionLabel(statusValue),
+                workflow_stage: nextStage,
+                next_module: nextStage === 'completed' ? 'Completed Transactions' : 'Reporting & Reconciliation'
+              }
+            });
+            return;
+          }
+
+          if (isPaymentsMarkFailedRoute && (req.method || 'GET').toUpperCase() === 'POST') {
+            const idMatch = url.pathname.match(/^\/api\/payments\/(\d+)\/mark-failed$/);
+            const billingId = Number(idMatch?.[1] || 0);
+            const body = await readJsonBody(req);
+            const reason = toSafeText(body.reason) || 'Payment request failed validation.';
+            const remarks = toSafeText(body.remarks);
+            if (!billingId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid billing id.' });
+              return;
+            }
+            const rows = (await sql.query(
+              `SELECT id, billing_code, billing_status, workflow_stage, balance_amount
+               FROM billing_records
+               WHERE id = $1
+               LIMIT 1`,
+              [billingId]
+            )) as Array<{
+              id: number;
+              billing_code: string;
+              billing_status: string;
+              workflow_stage: string;
+              balance_amount: number;
+            }>;
+            const row = rows[0];
+            if (!row) {
+              writeJson(res, 404, { ok: false, message: 'Billing record not found.' });
+              return;
+            }
+            if (String(row.workflow_stage || '') !== 'pay_bills') {
+              writeJson(res, 422, { ok: false, message: 'Only billings in Pay Bills can be marked as failed.' });
+              return;
+            }
+            const combinedRemarks = remarks ? `${reason}. ${remarks}` : reason;
+            await sql.query(
+              `UPDATE billing_records
+               SET billing_status = 'failed',
+                   workflow_stage = 'pay_bills',
+                   remarks = $2,
+                   updated_at = NOW(),
+                   action_at = NOW()
+               WHERE id = $1`,
+              [billingId, combinedRemarks]
+            );
+            await ensureModuleActivityLogsTable(sql);
+            await sql.query(
+              `INSERT INTO module_activity_logs (module, action, detail, actor, entity_type, entity_key, metadata)
+               VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+              [
+                'manage_billing',
+                'Payment Failed',
+                `${row.billing_code} was marked as failed. ${reason}${remarks ? ` ${remarks}` : ''}`,
+                'Cashier',
+                'billing',
+                row.billing_code,
+                JSON.stringify({ billingId, stage: 'pay_bills', reason })
+              ]
+            );
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: `${row.billing_code} was marked as failed and remains in Pay Bills.`,
+                status: 'Payment Failed',
+                workflow_stage: 'pay_bills',
+                next_module: 'Pay Bills'
+              }
+            });
+            return;
+          }
+
+          if (isWorkflowCorrectionRoute && (req.method || 'GET').toUpperCase() === 'POST') {
+            const idMatch = url.pathname.match(/^\/api\/workflow\/(\d+)\/return-for-correction$/);
+            const recordId = Number(idMatch?.[1] || 0);
+            const body = await readJsonBody(req);
+            const reason = toSafeText(body.reason) || 'Correction requested';
+            const currentModule = toSafeText(body.current_module).toLowerCase();
+            const remarks = toSafeText(body.remarks);
+            if (!recordId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid record id.' });
+              return;
+            }
+
+            if (currentModule === 'payment_processing_gateway') {
+              const rows = (await sql.query(
+                `SELECT id, billing_id, reference_number
+                 FROM payment_transactions
+                 WHERE id = $1
+                 LIMIT 1`,
+                [recordId]
+              )) as Array<{ id: number; billing_id: number; reference_number: string }>;
+              const row = rows[0];
+              if (!row) {
+                writeJson(res, 404, { ok: false, message: 'Payment transaction not found.' });
+                return;
+              }
+              await sql.query(
+                `UPDATE payment_transactions
+                 SET payment_status = 'cancelled',
+                     workflow_stage = 'pay_bills',
+                     remarks = $2
+                 WHERE id = $1`,
+                [recordId, [reason, remarks].filter(Boolean).join(' | ')]
+              );
+              await sql.query(
+                `UPDATE billing_records
+                 SET billing_status = 'needs_correction',
+                     workflow_stage = 'pay_bills',
+                     correction_reason = $2,
+                     correction_notes = $3,
+                     needs_correction = 1,
+                     updated_at = NOW(),
+                     action_at = NOW()
+                 WHERE id = $1`,
+                [row.billing_id, reason, remarks]
+              );
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  message: `${row.reference_number} returned to Pay Bills for correction.`,
+                  status: 'Needs Correction',
+                  workflow_stage: 'pay_bills',
+                  returned_to: 'Pay Bills',
+                  next_module: 'Pay Bills'
+                }
+              });
+              return;
+            }
+
+            if (currentModule === 'compliance_documentation') {
+              const rows = (await sql.query(
+                `SELECT id, payment_id, receipt_number
+                 FROM receipt_records
+                 WHERE id = $1
+                 LIMIT 1`,
+                [recordId]
+              )) as Array<{ id: number; payment_id: number; receipt_number: string | null }>;
+              const row = rows[0];
+              if (!row) {
+                writeJson(res, 404, { ok: false, message: 'Compliance record not found.' });
+                return;
+              }
+              await sql.query(
+                `UPDATE receipt_records
+                 SET workflow_stage = 'payment_processing_gateway',
+                     remarks = $2
+                 WHERE id = $1`,
+                [recordId, [reason, remarks].filter(Boolean).join(' | ')]
+              );
+              await sql.query(
+                `UPDATE payment_transactions
+                 SET workflow_stage = 'payment_processing_gateway',
+                     payment_status = 'authorized',
+                     remarks = $2
+                 WHERE id = $1`,
+                [row.payment_id, [reason, remarks].filter(Boolean).join(' | ')]
+              );
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  message: `${row.receipt_number || `RCPT-${recordId}`} returned to Payment Processing & Gateway for correction.`,
+                  status: 'Needs Correction',
+                  workflow_stage: 'payment_processing_gateway',
+                  returned_to: 'Payment Processing & Gateway',
+                  next_module: 'Payment Processing & Gateway'
+                }
+              });
+              return;
+            }
+
+            if (currentModule === 'reporting_reconciliation') {
+              const rows = (await sql.query(
+                `SELECT id, reference_number
+                 FROM payment_transactions
+                 WHERE id = $1
+                 LIMIT 1`,
+                [recordId]
+              )) as Array<{ id: number; reference_number: string }>;
+              const row = rows[0];
+              if (!row) {
+                writeJson(res, 404, { ok: false, message: 'Reporting record not found.' });
+                return;
+              }
+              await sql.query(
+                `UPDATE payment_transactions
+                 SET reporting_status = 'logged',
+                     workflow_stage = 'compliance_documentation',
+                     remarks = $2
+                 WHERE id = $1`,
+                [recordId, [reason, remarks].filter(Boolean).join(' | ')]
+              );
+              await sql.query(
+                `UPDATE receipt_records
+                 SET receipt_status = 'proof_verified',
+                     workflow_stage = 'compliance_documentation',
+                     remarks = $2
+                 WHERE payment_id = $1`,
+                [recordId, [reason, remarks].filter(Boolean).join(' | ')]
+              );
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  message: `${row.reference_number} returned to Compliance & Documentation for correction.`,
+                  status: 'Needs Correction',
+                  workflow_stage: 'compliance_documentation',
+                  returned_to: 'Compliance & Documentation',
+                  next_module: 'Compliance & Documentation'
+                }
+              });
+              return;
+            }
+
+            await sql.query(
+              `UPDATE billing_records
+               SET billing_status = 'needs_correction',
+                   workflow_stage = 'student_portal_billing',
+                   correction_reason = $2,
+                   correction_notes = $3,
+                   needs_correction = 1,
+                   updated_at = NOW(),
+                   action_at = NOW()
+               WHERE id = $1`,
+              [recordId, reason, remarks]
+            );
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                message: `Billing ${recordId} returned for correction.`,
+                status: 'Needs Correction',
+                workflow_stage: 'student_portal_billing',
+                returned_to: 'Student Portal & Billing',
+                next_module: 'Student Portal & Billing'
+              }
+            });
+            return;
+          }
+
+          if (isNotificationsSendRoute && (req.method || 'GET').toUpperCase() === 'POST') {
+            await ensureNotificationsTable(sql);
+            const body = await readJsonBody(req);
+            const billingId = Number(body.billingId || 0) || null;
+            const recipient = toSafeText(body.recipient) || 'Student';
+            const subject = toSafeText(body.subject) || 'Billing Status Update';
+            const message = toSafeText(body.message) || 'Billing status update.';
+            await sql.query(
+              `INSERT INTO notifications (recipient_role, recipient_name, channel, type, title, message, entity_type, entity_id, is_read, created_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,NOW())`,
+              ['student', recipient, 'in_app', 'billing_update', subject, message, 'billing', billingId]
+            );
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                billingId,
+                recipient,
+                subject,
+                message
+              }
+            });
+            return;
+          }
+
+          if (isNotificationsRoute && (req.method || 'GET').toUpperCase() === 'GET') {
+            await syncPmedReportRequestNotifications();
+            const filter = toSafeText(url.searchParams.get('filter')).toLowerCase();
+            const rows = (await sql.query(
+              `SELECT id, recipient_role, recipient_name, channel, type, title, message, entity_type, entity_id, is_read, read_at::text AS read_at, created_at::text AS created_at
+               FROM notifications
+               WHERE LOWER(recipient_role) IN ('cashier', 'admin')
+               ORDER BY created_at DESC
+               LIMIT 120`
+            )) as Array<{
+              id: number;
+              recipient_role: string;
+              recipient_name: string | null;
+              channel: string;
+              type: string;
+              title: string;
+              message: string;
+              entity_type: string | null;
+              entity_id: number | null;
+              is_read: boolean;
+              read_at: string | null;
+              created_at: string | null;
+            }>;
+            const filteredRows = rows.filter((row) => {
+              if (filter === 'pmed_requests') return String(row.type || '') === 'pmed_report_request';
+              if (filter === 'unread') return !row.is_read;
+              if (filter === 'new') {
+                const created = row.created_at ? new Date(row.created_at).getTime() : 0;
+                return !row.is_read && created >= Date.now() - (24 * 60 * 60 * 1000);
+              }
+              if (filter === 'other') return !String(row.type || '').includes('payment') && !String(row.type || '').includes('billing');
+              return true;
+            });
+            const unreadCount = rows.filter((row) => !row.is_read).length;
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                items: filteredRows.map((row) => ({
+                  id: Number(row.id),
+                  recipientRole: String(row.recipient_role || ''),
+                  recipientName: row.recipient_name ? String(row.recipient_name) : null,
+                  channel: String(row.channel || 'in_app'),
+                  type: String(row.type || 'general'),
+                  title: String(row.title || ''),
+                  message: String(row.message || ''),
+                  entityType: row.entity_type ? String(row.entity_type) : null,
+                  entityId: row.entity_id == null ? null : Number(row.entity_id),
+                  isRead: Boolean(row.is_read),
+                  createdAt: row.created_at ? String(row.created_at) : null,
+                  readAt: row.read_at ? String(row.read_at) : null,
+                  relativeTime: formatRelativeTime(row.created_at)
+                })),
+                meta: {
+                  page: 1,
+                  perPage: filteredRows.length,
+                  total: filteredRows.length,
+                  totalPages: 1,
+                  unreadCount,
+                  totalUnread: unreadCount
+                }
+              }
+            });
+            return;
+          }
+
+          if (isNotificationReadRoute && (req.method || 'GET').toUpperCase() === 'PATCH') {
+            await ensureNotificationsTable(sql);
+            const idMatch = url.pathname.match(/^\/api\/notifications\/(\d+)\/read$/);
+            const notificationId = Number(idMatch?.[1] || 0);
+            if (!notificationId) {
+              writeJson(res, 422, { ok: false, message: 'Invalid notification id.' });
+              return;
+            }
+            await sql.query(
+              `UPDATE notifications
+               SET is_read = TRUE, read_at = NOW()
+               WHERE id = $1`,
+              [notificationId]
+            );
+            const unreadRows = (await sql.query(
+              `SELECT COUNT(*)::int AS total
+               FROM notifications
+               WHERE LOWER(recipient_role) IN ('cashier', 'admin')
+                 AND is_read = FALSE`
+            )) as Array<{ total: number }>;
+            writeJson(res, 200, { ok: true, data: { unreadCount: Number(unreadRows[0]?.total || 0) } });
+            return;
+          }
+
+          if (isNotificationsReadAllRoute && (req.method || 'GET').toUpperCase() === 'PATCH') {
+            await ensureNotificationsTable(sql);
+            await sql.query(
+              `UPDATE notifications
+               SET is_read = TRUE, read_at = NOW()
+               WHERE LOWER(recipient_role) IN ('cashier', 'admin')
+                 AND is_read = FALSE`
+            );
+            writeJson(res, 200, { ok: true, data: { unreadCount: 0 } });
+            return;
+          }
+
           if (url.pathname === '/api/admin-auth' && (req.method || 'GET').toUpperCase() === 'GET') {
             const session = await resolveAdminSession();
+            try {
+              await syncPmedReportRequestNotifications();
+            } catch (error) {
+              console.warn('[cashier] Unable to refresh PMED notifications during auth hydrate:', error);
+            }
+            let unreadRows: Array<{ total: number }> = [];
+            if (session) {
+              try {
+                unreadRows = (await sql.query(
+                  `SELECT COUNT(*)::int AS total
+                   FROM notifications
+                   WHERE LOWER(recipient_role) IN ('cashier', 'admin')
+                     AND is_read = FALSE`
+                )) as Array<{ total: number }>;
+              } catch (error) {
+                console.warn('[cashier] Unable to count unread notifications during auth hydrate:', error);
+              }
+            }
             writeJson(res, 200, {
               ok: true,
               data: {
@@ -3739,7 +7251,8 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                       role: session.role,
                       department: session.department,
                       accessExemptions: Array.isArray(session.access_exemptions) ? session.access_exemptions : [],
-                      isSuperAdmin: Boolean(session.is_super_admin)
+                      isSuperAdmin: Boolean(session.is_super_admin),
+                      unreadNotifications: Number(unreadRows[0]?.total || 0)
                     }
                   : null
               }
@@ -4136,6 +7649,23 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 String(requestId)
               );
             };
+            const finalizeLaboratoryMutation = async (
+              requestId: number,
+              actionLabel: string,
+              details: string,
+              actor: string,
+              data: Record<string, unknown> | null
+            ): Promise<void> => {
+              await saveActivity(requestId, actionLabel, details, actor);
+              broadcastRealtimeEvent({
+                type: 'clinic_data_changed',
+                module: 'laboratory',
+                action: actionLabel,
+                detail: details,
+                entityKey: String(requestId)
+              });
+              writeJson(res, 200, { ok: true, data });
+            };
 
             if (action === 'create') {
               const patientName = toSafeText(body.patient_name);
@@ -4192,8 +7722,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 ]
               )) as Array<Record<string, unknown>>;
 
-              await saveActivity(nextId, 'Request Created', 'New lab request created from laboratory queue dashboard.', 'Lab Staff');
-              writeJson(res, 200, { ok: true, data: inserted[0] || null });
+              await finalizeLaboratoryMutation(nextId, 'Request Created', 'New lab request created from laboratory queue dashboard.', 'Lab Staff', inserted[0] || null);
               return;
             }
 
@@ -4235,8 +7764,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                   requestId
                 ]
               )) as Array<Record<string, unknown>>;
-              await saveActivity(requestId, 'Processing Started', 'Sample collected and processing started.', staff);
-              writeJson(res, 200, { ok: true, data: updated[0] || null });
+              await finalizeLaboratoryMutation(requestId, 'Processing Started', 'Sample collected and processing started.', staff, updated[0] || null);
               return;
             }
 
@@ -4268,8 +7796,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                   requestId
                 ]
               )) as Array<Record<string, unknown>>;
-              await saveActivity(requestId, finalize ? 'Result Finalized' : 'Draft Saved', summary, currentStaff);
-              writeJson(res, 200, { ok: true, data: updated[0] || null });
+              await finalizeLaboratoryMutation(requestId, finalize ? 'Result Finalized' : 'Draft Saved', summary, currentStaff, updated[0] || null);
               return;
             }
 
@@ -4287,8 +7814,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                  RETURNING *`,
                 [toSafeText(body.released_at) || null, requestId]
               )) as Array<Record<string, unknown>>;
-              await saveActivity(requestId, 'Report Released', 'Lab report released to doctor/check-up.', toSafeText(body.released_by) || 'Lab Staff');
-              writeJson(res, 200, { ok: true, data: updated[0] || null });
+              await finalizeLaboratoryMutation(requestId, 'Report Released', 'Lab report released to doctor/check-up.', toSafeText(body.released_by) || 'Lab Staff', updated[0] || null);
               return;
             }
 
@@ -4308,13 +7834,13 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                  RETURNING *`,
                 [reason, Boolean(body.resample_flag), requestId]
               )) as Array<Record<string, unknown>>;
-              await saveActivity(
+              await finalizeLaboratoryMutation(
                 requestId,
                 Boolean(body.resample_flag) ? 'Resample Requested' : 'Request Rejected',
                 reason,
-                toSafeText(body.actor) || 'Lab Staff'
+                toSafeText(body.actor) || 'Lab Staff',
+                updated[0] || null
               );
-              writeJson(res, 200, { ok: true, data: updated[0] || null });
               return;
             }
 
@@ -4412,6 +7938,24 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             const logWalkIn = async (actionLabel: string, detail: string, caseKey: string): Promise<void> => {
               await insertModuleActivity('walkin', actionLabel, detail, actor, 'walkin_case', caseKey);
             };
+            const finalizeWalkInMutation = async (
+              actionLabel: string,
+              detail: string,
+              caseKey: string,
+              data: Record<string, unknown> | null,
+              message = ''
+            ): Promise<void> => {
+              await logWalkIn(actionLabel, detail, caseKey);
+              await syncPatientMasterProfiles();
+              broadcastRealtimeEvent({
+                type: 'clinic_data_changed',
+                module: 'walkin',
+                action: actionLabel,
+                detail,
+                entityKey: caseKey
+              });
+              writeJson(res, 200, { ok: true, ...(message ? { message } : {}), data });
+            };
 
             if (action === 'create') {
               const patientName = String(body.patient_name || '').trim();
@@ -4463,8 +8007,13 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 ]
               );
               const created = (Array.isArray(createdRows) ? createdRows[0] : null) as Record<string, unknown> | null;
-              await logWalkIn('Walk-In Created', `Walk-in case ${caseId} created for ${patientName}.`, toSafeText(created?.case_id || caseId));
-              writeJson(res, 200, { ok: true, message: 'Walk-in created.', data: Array.isArray(createdRows) ? createdRows[0] : null });
+              await finalizeWalkInMutation(
+                'Walk-In Created',
+                `Walk-in case ${caseId} created for ${patientName}.`,
+                toSafeText(created?.case_id || caseId),
+                created,
+                'Walk-in created.'
+              );
               return;
             }
 
@@ -4498,8 +8047,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 [id]
               );
               const updated = (Array.isArray(rows) ? rows[0] : null) as Record<string, unknown> | null;
-              await logWalkIn('Patient Identified', 'Case moved to identified status.', toSafeText(updated?.case_id || id));
-              writeJson(res, 200, { ok: true, data: Array.isArray(rows) ? rows[0] : null });
+              await finalizeWalkInMutation('Patient Identified', 'Case moved to identified status.', toSafeText(updated?.case_id || id), updated);
               return;
             }
 
@@ -4515,8 +8063,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 [id]
               );
               const updated = (Array.isArray(rows) ? rows[0] : null) as Record<string, unknown> | null;
-              await logWalkIn('Queued To Triage', 'Case queued for triage.', toSafeText(updated?.case_id || id));
-              writeJson(res, 200, { ok: true, data: Array.isArray(rows) ? rows[0] : null });
+              await finalizeWalkInMutation('Queued To Triage', 'Case queued for triage.', toSafeText(updated?.case_id || id), updated);
               return;
             }
 
@@ -4533,8 +8080,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 [id]
               );
               const updated = (Array.isArray(rows) ? rows[0] : null) as Record<string, unknown> | null;
-              await logWalkIn('Triage Started', 'Case triage started.', toSafeText(updated?.case_id || id));
-              writeJson(res, 200, { ok: true, data: Array.isArray(rows) ? rows[0] : null });
+              await finalizeWalkInMutation('Triage Started', 'Case triage started.', toSafeText(updated?.case_id || id), updated);
               return;
             }
 
@@ -4556,8 +8102,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 [String(body.chief_complaint || '').trim() || null, severityValue, nextStatus, id]
               );
               const updated = (Array.isArray(rows) ? rows[0] : null) as Record<string, unknown> | null;
-              await logWalkIn('Triage Saved', `Triage saved with severity ${severityValue}.`, toSafeText(updated?.case_id || id));
-              writeJson(res, 200, { ok: true, data: Array.isArray(rows) ? rows[0] : null });
+              await finalizeWalkInMutation('Triage Saved', `Triage saved with severity ${severityValue}.`, toSafeText(updated?.case_id || id), updated);
               return;
             }
 
@@ -4576,8 +8121,12 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 [String(body.assigned_doctor || '').trim() || null, id]
               );
               const updated = (Array.isArray(rows) ? rows[0] : null) as Record<string, unknown> | null;
-              await logWalkIn('Doctor Assigned', `Doctor assigned: ${toSafeText(body.assigned_doctor) || 'Unchanged'}.`, toSafeText(updated?.case_id || id));
-              writeJson(res, 200, { ok: true, data: Array.isArray(rows) ? rows[0] : null });
+              await finalizeWalkInMutation(
+                'Doctor Assigned',
+                `Doctor assigned: ${toSafeText(body.assigned_doctor) || 'Unchanged'}.`,
+                toSafeText(updated?.case_id || id),
+                updated
+              );
               return;
             }
 
@@ -4593,8 +8142,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 [id]
               );
               const updated = (Array.isArray(rows) ? rows[0] : null) as Record<string, unknown> | null;
-              await logWalkIn('Case Completed', 'Walk-in case marked as completed.', toSafeText(updated?.case_id || id));
-              writeJson(res, 200, { ok: true, data: Array.isArray(rows) ? rows[0] : null });
+              await finalizeWalkInMutation('Case Completed', 'Walk-in case marked as completed.', toSafeText(updated?.case_id || id), updated);
               return;
             }
 
@@ -4611,8 +8159,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 [id]
               );
               const updated = (Array.isArray(rows) ? rows[0] : null) as Record<string, unknown> | null;
-              await logWalkIn('Emergency Escalated', 'Case escalated to emergency queue.', toSafeText(updated?.case_id || id));
-              writeJson(res, 200, { ok: true, data: Array.isArray(rows) ? rows[0] : null });
+              await finalizeWalkInMutation('Emergency Escalated', 'Case escalated to emergency queue.', toSafeText(updated?.case_id || id), updated);
               return;
             }
 
@@ -5185,6 +8732,14 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               toSafeText(updatedRow?.visit_id || id),
               { action, id }
             );
+            await syncPatientMasterProfiles();
+            broadcastRealtimeEvent({
+              type: 'clinic_data_changed',
+              module: 'checkup',
+              action: toActionLabel(action),
+              detail: `Check-up action ${toActionLabel(action)} applied to visit ${toSafeText(updatedRow?.visit_id || id)}.`,
+              entityKey: toSafeText(updatedRow?.visit_id || id)
+            });
             writeJson(res, 200, { ok: true, data: Array.isArray(updated) ? updated[0] : null });
             return;
           }
@@ -5696,6 +9251,14 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 toSafeText(created?.booking_id || bookingId),
                 { doctorName, departmentName, appointmentDate, preferredTime: preferredTime || null, status }
               );
+              await syncPatientMasterProfiles();
+              broadcastRealtimeEvent({
+                type: 'clinic_data_changed',
+                module: 'appointments',
+                action: 'Appointment Created',
+                detail: `Created appointment ${toSafeText(created?.booking_id || bookingId)} for ${patientName}.`,
+                entityKey: toSafeText(created?.booking_id || bookingId)
+              });
               return;
             }
 
@@ -5836,6 +9399,14 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 preferredTime: nextPreferredTime || null
               }
             );
+            await syncPatientMasterProfiles();
+            broadcastRealtimeEvent({
+              type: 'clinic_data_changed',
+              module: 'appointments',
+              action: 'Appointment Updated',
+              detail: `Updated appointment ${bookingId}.`,
+              entityKey: bookingId
+            });
             return;
           }
 

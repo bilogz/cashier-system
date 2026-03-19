@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { computed, useAttrs } from 'vue';
+
 withDefaults(
   defineProps<{
     label: string;
@@ -13,26 +15,42 @@ withDefaults(
     compact: false
   }
 );
+
+const attrs = useAttrs();
+const isDisabled = computed(() => {
+  const value = attrs.disabled;
+  return value === '' || value === true || value === 'true';
+});
 </script>
 
 <template>
-  <v-btn
-    :color="color"
-    :variant="variant"
-    :class="['cashier-action-btn', { 'cashier-action-btn--compact': compact }]"
-    rounded="xl"
-    v-bind="$attrs"
-  >
-    <span class="cashier-action-btn__content">
-      <span class="cashier-action-btn__icon-shell">
-        <v-icon :icon="icon" size="18" />
+  <div :class="['cashier-action-btn__wrap', { 'cashier-action-btn__wrap--disabled': isDisabled }]">
+    <v-btn
+      :color="color"
+      :variant="variant"
+      :class="['cashier-action-btn', { 'cashier-action-btn--compact': compact }]"
+      rounded="xl"
+      v-bind="$attrs"
+    >
+      <span class="cashier-action-btn__content">
+        <span class="cashier-action-btn__icon-shell">
+          <v-icon :icon="icon" size="18" />
+        </span>
+        <span class="cashier-action-btn__label">{{ label }}</span>
       </span>
-      <span class="cashier-action-btn__label">{{ label }}</span>
-    </span>
-  </v-btn>
+    </v-btn>
+  </div>
 </template>
 
 <style scoped>
+.cashier-action-btn__wrap {
+  width: 100%;
+}
+
+.cashier-action-btn__wrap--disabled {
+  cursor: not-allowed;
+}
+
 .cashier-action-btn {
   justify-content: flex-start;
   min-height: 46px;
@@ -89,5 +107,11 @@ withDefaults(
 
 .cashier-action-btn:deep(.v-icon) {
   opacity: 1;
+}
+
+.cashier-action-btn__wrap--disabled :deep(.v-btn),
+.cashier-action-btn__wrap--disabled :deep(.v-btn__overlay),
+.cashier-action-btn__wrap--disabled :deep(.v-btn__content) {
+  cursor: not-allowed !important;
 }
 </style>

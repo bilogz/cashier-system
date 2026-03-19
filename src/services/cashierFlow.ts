@@ -31,6 +31,9 @@ export type PaymentQueueItem = {
   channel: string;
   amount: string;
   billingCode: string;
+  sourceModule: string;
+  sourceDepartment: string;
+  sourceCategory: string;
   status: PaymentStatus;
   workflowStage: string;
   workflowStageLabel: string;
@@ -38,6 +41,34 @@ export type PaymentQueueItem = {
   allocations: FeeAllocationItem[];
   allocationSummary: string;
   totalAllocated: string;
+};
+
+export type PaymentIntakeFeeItem = {
+  id: number;
+  feeType: string;
+  feeCode: string;
+  category: string;
+  remainingAmount: number;
+  remainingAmountFormatted: string;
+};
+
+export type PaymentIntakeItem = {
+  id: number;
+  reference: string;
+  patientName: string;
+  amount: string;
+  rawAmount: number;
+  payment: string;
+  sync: string;
+  createdAt: string;
+  workflowStage: string;
+  workflowStageLabel: string;
+  isClinicOrigin: boolean;
+  sourceModule: string;
+  sourceDepartment: string;
+  sourceCategory: string;
+  note: string;
+  feeItems: PaymentIntakeFeeItem[];
 };
 
 export type ReceiptQueueItem = {
@@ -49,6 +80,9 @@ export type ReceiptQueueItem = {
   paymentStatus: PaymentStatus;
   amount: string;
   issuedFor: string;
+  sourceModule: string;
+  sourceDepartment: string;
+  sourceCategory: string;
   status: ReceiptStatus;
   workflowStage: string;
   workflowStageLabel: string;
@@ -65,6 +99,7 @@ export type ReceiptQueueItem = {
 
 export type PaymentSnapshot = {
   stats: CashierStatCard[];
+  upstreamItems: PaymentIntakeItem[];
   items: PaymentQueueItem[];
   historyItems: PaymentQueueItem[];
   activityFeed: BillingAlert[];

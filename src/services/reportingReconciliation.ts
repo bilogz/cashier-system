@@ -18,6 +18,9 @@ export type ReportingItem = {
   amount: string;
   billingCode: string;
   receiptNumber: string;
+  sourceModule: string;
+  sourceDepartment: string;
+  sourceCategory: string;
   paymentStatus: string;
   documentStatus: string;
   status: ReportingStatus;
@@ -54,6 +57,8 @@ export type CompletedTransactionsResponse = {
 export type ReportingFilters = {
   search?: string;
   status?: string;
+  department?: string;
+  category?: string;
   dateFrom?: string;
   dateTo?: string;
 };
@@ -73,6 +78,9 @@ type ReportingTransactionsApiRow = {
   amount?: number;
   billingCode: string;
   receiptNumber: string;
+  sourceModule: string;
+  sourceDepartment: string;
+  sourceCategory: string;
   paymentStatus: string;
   documentationStatus: string;
   reportingStatus: ReportingStatus;
@@ -117,6 +125,9 @@ function mapReportingItem(item: ReportingTransactionsApiRow): ReportingItem {
     amount: item.amountFormatted || '',
     billingCode: item.billingCode,
     receiptNumber: item.receiptNumber,
+    sourceModule: item.sourceModule,
+    sourceDepartment: item.sourceDepartment,
+    sourceCategory: item.sourceCategory,
     paymentStatus: item.paymentStatus,
     documentStatus: item.documentationStatus,
     status: item.reportingStatus,
@@ -136,6 +147,8 @@ function buildCompletedQuery(params: { page?: number; perPage?: number } & Repor
   if (params.perPage) query.set('per_page', String(params.perPage));
   if (params.search?.trim()) query.set('search', params.search.trim());
   if (params.status?.trim()) query.set('status', params.status.trim());
+  if (params.department?.trim()) query.set('department', params.department.trim());
+  if (params.category?.trim()) query.set('category', params.category.trim());
   if (params.dateFrom?.trim()) query.set('date_from', params.dateFrom.trim());
   if (params.dateTo?.trim()) query.set('date_to', params.dateTo.trim());
   return query.toString();

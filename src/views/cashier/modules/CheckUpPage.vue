@@ -326,7 +326,6 @@ onBeforeUnmount(() => {
           <v-card-title>Consultation Queue Board</v-card-title>
           <v-card-subtitle>Row click opens workspace. Primary action is workflow-contextual.</v-card-subtitle>
           <template #append>
-            <v-btn class="saas-hero-btn" size="small" variant="flat" :loading="workflowStore.loading" @click="refreshQueue">Refresh</v-btn>
           </template>
         </v-card-item>
         <v-card-text>

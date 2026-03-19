@@ -122,6 +122,25 @@ export type CreateLabRequestPayload = {
   assignedLabStaff?: string;
 };
 
+export type SyncLabBillingPayload = {
+  requestId: number;
+  visitId?: string;
+  patientId?: string;
+  patientName: string;
+  category: string;
+  tests: string[];
+  requestedByDoctor?: string;
+  billingReference?: string;
+};
+
+export type SyncLabBillingResult = {
+  message: string;
+  billingId: number;
+  billingCode: string;
+  studentNumber: string;
+  workflowStage: string;
+};
+
 type LabStore = {
   requests: LabRequestDetail[];
   logs: LabActivityLog[];
@@ -687,6 +706,30 @@ export async function fetchLabActivity(requestId: number): Promise<LabActivityLo
     const store = readStore();
     return store.logs.filter((item) => item.requestId === requestId).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }
+}
+
+export async function syncLabRequestToCashier(payload: SyncLabBillingPayload): Promise<SyncLabBillingResult> {
+  const data = await fetchApiData<SyncLabBillingResult>('/api/clinic-cashier/lab-billing', {
+    method: 'POST',
+    timeoutMs: 12_000,
+    body: {
+      request_id: payload.requestId,
+      visit_id: payload.visitId || '',
+      patient_id: payload.patientId || '',
+      patient_name: payload.patientName,
+      category: payload.category,
+      tests: payload.tests,
+      requested_by_doctor: payload.requestedByDoctor || '',
+      billing_reference: payload.billingReference || ''
+    }
+  });
+
+  invalidateApiCache('/api/laboratory');
+  invalidateApiCache('/api/student-billing');
+  invalidateApiCache('/api/module-activity');
+  invalidateApiCache('/api/dashboard');
+  emitRealtimeRefresh('laboratory_cashier_sync');
+  return data;
 }
 
 export async function startLabProcessing(payload: StartProcessingPayload): Promise<LabRequestDetail | null> {

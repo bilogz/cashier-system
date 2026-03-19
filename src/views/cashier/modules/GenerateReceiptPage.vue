@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
-import { mdiDeleteClockOutline, mdiDownloadOutline, mdiSendCheckOutline } from '@mdi/js';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { mdiDeleteClockOutline, mdiDownloadOutline, mdiMagnify, mdiSendCheckOutline } from '@mdi/js';
 import CashierAnalyticsCard from '@/components/shared/CashierAnalyticsCard.vue';
 import CashierActionButton from '@/components/shared/CashierActionButton.vue';
 import ModuleActivityLogs from '@/components/shared/ModuleActivityLogs.vue';
@@ -16,6 +16,7 @@ import {
 import { returnWorkflowRecordForCorrection } from '@/services/workflowCorrections';
 import { generateReceiptWorkflowRecord } from '@/services/workflowActions';
 import { completeComplianceDocumentation, verifyComplianceProof } from '@/services/workflowCrudActions';
+import { useRealtimeListSync } from '@/composables/useRealtimeListSync';
 
 const auth = useAuthStore();
 const stats = ref<ReceiptSnapshot['stats']>([]);
@@ -23,6 +24,9 @@ const receiptItems = ref<ReceiptQueueItem[]>([]);
 const receiptHistoryItems = ref<ReceiptQueueItem[]>([]);
 const alerts = ref<ReceiptSnapshot['activityFeed']>([]);
 const selectedReceipt = ref<ReceiptQueueItem | null>(null);
+const search = ref('');
+const departmentFilter = ref('All Departments');
+const categoryFilter = ref('All Categories');
 const itemsPerPage = ref(6);
 const currentPage = ref(1);
 const historyItemsPerPage = ref(6);
@@ -35,6 +39,15 @@ const snackbarMessage = ref('');
 const loading = ref(false);
 const actionLoading = ref(false);
 const errorMessage = ref('');
+const realtime = useRealtimeListSync();
+const departmentFilterOptions = computed(() => [
+  'All Departments',
+  ...new Set([...receiptItems.value, ...receiptHistoryItems.value].map((item) => item.sourceDepartment).filter(Boolean))
+]);
+const categoryFilterOptions = computed(() => [
+  'All Categories',
+  ...new Set([...receiptItems.value, ...receiptHistoryItems.value].map((item) => item.sourceCategory).filter(Boolean))
+]);
 
 function statusColor(status: ReceiptStatus) {
   if (status === 'Documentation Completed') return 'success';
@@ -114,8 +127,8 @@ function formatActionMessage(response: { message?: string; next_module?: string 
   return response.message || 'Documentation queue updated successfully.';
 }
 
-async function loadSnapshot() {
-  loading.value = true;
+async function loadSnapshot(options: { silent?: boolean } = {}) {
+  if (!options.silent) loading.value = true;
   errorMessage.value = '';
   try {
     const snapshot = await fetchReceiptSnapshot();
@@ -132,7 +145,7 @@ async function loadSnapshot() {
     }
     errorMessage.value = message;
   } finally {
-    loading.value = false;
+    if (!options.silent) loading.value = false;
   }
 }
 
@@ -179,6 +192,9 @@ const receiptContextFields = computed(() => {
     { label: 'Payment Method', value: selectedReceipt.value.paymentMethod },
     { label: 'Payment Status', value: selectedReceipt.value.paymentStatus },
     { label: 'Billing Code', value: selectedReceipt.value.issuedFor },
+    { label: 'Source Module', value: selectedReceipt.value.sourceModule },
+    { label: 'Connected Department', value: selectedReceipt.value.sourceDepartment },
+    { label: 'Category Type', value: selectedReceipt.value.sourceCategory },
     { label: 'Amount', value: selectedReceipt.value.amount },
     { label: 'Workflow Stage', value: selectedReceipt.value.workflowStageLabel }
   ];
@@ -224,27 +240,53 @@ const nextStepLabel = computed(() => {
   if (selectedReceipt.value.status === 'Proof Verified') return 'Complete Documentation to move this record into Reporting & Reconciliation.';
   return 'This documentation package is ready for the next reporting step.';
 });
-const totalPages = computed(() => Math.max(1, Math.ceil(receiptItems.value.length / itemsPerPage.value)));
-const historyTotalPages = computed(() => Math.max(1, Math.ceil(receiptHistoryItems.value.length / historyItemsPerPage.value)));
+const filteredReceiptItems = computed(() =>
+  receiptItems.value.filter((item) => {
+    if (departmentFilter.value !== 'All Departments' && item.sourceDepartment !== departmentFilter.value) return false;
+    if (categoryFilter.value !== 'All Categories' && item.sourceCategory !== categoryFilter.value) return false;
+    if (search.value.trim()) {
+      const needle = search.value.trim().toLowerCase();
+      const haystack =
+        `${item.receiptNo} ${item.studentName} ${item.paymentRef} ${item.paymentMethod} ${item.issuedFor} ${item.sourceDepartment} ${item.sourceCategory} ${item.status} ${item.workflowStageLabel}`.toLowerCase();
+      if (!haystack.includes(needle)) return false;
+    }
+    return true;
+  })
+);
+const filteredReceiptHistoryItems = computed(() =>
+  receiptHistoryItems.value.filter((item) => {
+    if (departmentFilter.value !== 'All Departments' && item.sourceDepartment !== departmentFilter.value) return false;
+    if (categoryFilter.value !== 'All Categories' && item.sourceCategory !== categoryFilter.value) return false;
+    if (search.value.trim()) {
+      const needle = search.value.trim().toLowerCase();
+      const haystack =
+        `${item.receiptNo} ${item.studentName} ${item.paymentRef} ${item.paymentMethod} ${item.issuedFor} ${item.sourceDepartment} ${item.sourceCategory} ${item.status} ${item.workflowStageLabel}`.toLowerCase();
+      if (!haystack.includes(needle)) return false;
+    }
+    return true;
+  })
+);
+const totalPages = computed(() => Math.max(1, Math.ceil(filteredReceiptItems.value.length / itemsPerPage.value)));
+const historyTotalPages = computed(() => Math.max(1, Math.ceil(filteredReceiptHistoryItems.value.length / historyItemsPerPage.value)));
 const paginatedReceiptItems = computed(() => {
   const start = (currentPage.value - 1) * itemsPerPage.value;
-  return receiptItems.value.slice(start, start + itemsPerPage.value);
+  return filteredReceiptItems.value.slice(start, start + itemsPerPage.value);
 });
 const paginatedReceiptHistoryItems = computed(() => {
   const start = (historyCurrentPage.value - 1) * historyItemsPerPage.value;
-  return receiptHistoryItems.value.slice(start, start + historyItemsPerPage.value);
+  return filteredReceiptHistoryItems.value.slice(start, start + historyItemsPerPage.value);
 });
 const activePageSummary = computed(() => {
-  if (!receiptItems.value.length) return 'No active compliance records.';
+  if (!filteredReceiptItems.value.length) return 'No active compliance records.';
   const first = (currentPage.value - 1) * itemsPerPage.value + 1;
-  const last = Math.min(currentPage.value * itemsPerPage.value, receiptItems.value.length);
-  return `Showing ${first}-${last} of ${receiptItems.value.length} active documentation record${receiptItems.value.length === 1 ? '' : 's'}`;
+  const last = Math.min(currentPage.value * itemsPerPage.value, filteredReceiptItems.value.length);
+  return `Showing ${first}-${last} of ${filteredReceiptItems.value.length} active documentation record${filteredReceiptItems.value.length === 1 ? '' : 's'}`;
 });
 const historyPageSummary = computed(() => {
-  if (!receiptHistoryItems.value.length) return 'No compliance history records.';
+  if (!filteredReceiptHistoryItems.value.length) return 'No compliance history records.';
   const first = (historyCurrentPage.value - 1) * historyItemsPerPage.value + 1;
-  const last = Math.min(historyCurrentPage.value * historyItemsPerPage.value, receiptHistoryItems.value.length);
-  return `Showing ${first}-${last} of ${receiptHistoryItems.value.length} moved documentation record${receiptHistoryItems.value.length === 1 ? '' : 's'}`;
+  const last = Math.min(historyCurrentPage.value * historyItemsPerPage.value, filteredReceiptHistoryItems.value.length);
+  return `Showing ${first}-${last} of ${filteredReceiptHistoryItems.value.length} moved documentation record${filteredReceiptHistoryItems.value.length === 1 ? '' : 's'}`;
 });
 
 watch(itemsPerPage, () => {
@@ -252,6 +294,11 @@ watch(itemsPerPage, () => {
 });
 
 watch(historyItemsPerPage, () => {
+  historyCurrentPage.value = 1;
+});
+
+watch([search, departmentFilter, categoryFilter], () => {
+  currentPage.value = 1;
   historyCurrentPage.value = 1;
 });
 
@@ -365,6 +412,14 @@ async function submitCompleteAction(formValues: Record<string, string | number>)
 
 onMounted(() => {
   void loadSnapshot();
+  realtime.startPolling(() => {
+    void loadSnapshot({ silent: true });
+  }, 0, { pauseWhenDialogOpen: false });
+});
+
+onUnmounted(() => {
+  realtime.stopPolling();
+  realtime.invalidatePending();
 });
 </script>
 
@@ -408,6 +463,43 @@ onMounted(() => {
             <div class="toolbar-row mb-4">
               <div class="text-body-2 text-medium-emphasis">{{ activePageSummary }}</div>
               <div class="toolbar-controls">
+                <v-text-field
+                  v-model="search"
+                  :prepend-inner-icon="mdiMagnify"
+                  label="Search receipt, payment, or department"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  class="toolbar-search"
+                />
+                <v-btn
+                  v-if="search || departmentFilter !== 'All Departments' || categoryFilter !== 'All Categories'"
+                  size="small"
+                  variant="text"
+                  color="primary"
+                  prepend-icon="mdi-filter-remove-outline"
+                  @click="search = ''; departmentFilter = 'All Departments'; categoryFilter = 'All Categories'"
+                >
+                  Clear Filters
+                </v-btn>
+                <v-select
+                  v-model="departmentFilter"
+                  :items="departmentFilterOptions"
+                  label="Connected department"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  class="toolbar-select"
+                />
+                <v-select
+                  v-model="categoryFilter"
+                  :items="categoryFilterOptions"
+                  label="Category type"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  class="toolbar-select"
+                />
                 <v-select
                   v-model="itemsPerPage"
                   :items="[6, 10]"
@@ -429,6 +521,7 @@ onMounted(() => {
                         <div class="text-subtitle-1 font-weight-bold">{{ item.studentName }}</div>
                         <v-chip size="small" :color="statusColor(item.status)" variant="tonal">{{ item.status }}</v-chip>
                         <v-chip size="small" color="primary" variant="outlined">{{ item.receiptNo }}</v-chip>
+                        <v-chip size="small" :color="item.sourceModule === 'Clinic' ? 'warning' : 'secondary'" variant="tonal">{{ item.sourceDepartment }}</v-chip>
                       </div>
                       <div class="entry-grid">
                         <div>
@@ -446,6 +539,10 @@ onMounted(() => {
                         <div>
                           <div class="metric-label">Issued For</div>
                           <div class="meta-value">{{ item.issuedFor }}</div>
+                        </div>
+                        <div>
+                          <div class="metric-label">Category Type</div>
+                          <div class="meta-value">{{ item.sourceCategory }}</div>
                         </div>
                         <div>
                           <div class="metric-label">Receipt Status</div>
@@ -473,11 +570,11 @@ onMounted(() => {
                 </v-card-text>
               </v-card>
             </v-col>
-            <v-col v-if="receiptItems.length === 0" cols="12">
+            <v-col v-if="filteredReceiptItems.length === 0" cols="12">
               <div class="text-body-2 text-medium-emphasis py-8 text-center">No receipt records are available yet.</div>
             </v-col>
             </v-row>
-            <div v-if="receiptItems.length" class="d-flex flex-column flex-sm-row justify-space-between align-start align-sm-center ga-3 mt-4">
+            <div v-if="filteredReceiptItems.length" class="d-flex flex-column flex-sm-row justify-space-between align-start align-sm-center ga-3 mt-4">
               <div class="text-body-2 text-medium-emphasis">{{ activePageSummary }}</div>
               <v-pagination v-model="currentPage" :length="totalPages" density="comfortable" total-visible="5" />
             </div>
@@ -491,7 +588,7 @@ onMounted(() => {
           <v-card-subtitle>{{ receiptHistoryItems.length }} record{{ receiptHistoryItems.length === 1 ? '' : 's' }} already moved out of compliance</v-card-subtitle>
         </v-card-item>
         <v-card-text>
-          <div v-if="receiptHistoryItems.length">
+          <div v-if="filteredReceiptHistoryItems.length">
             <div class="toolbar-row mb-4">
               <div class="text-body-2 text-medium-emphasis">{{ historyPageSummary }}</div>
               <div class="toolbar-controls">
@@ -511,6 +608,7 @@ onMounted(() => {
               <div>
                 <div class="font-weight-bold">{{ item.receiptNo }}</div>
                 <div class="text-body-2 text-medium-emphasis">{{ item.studentName }} | {{ item.paymentRef }} | {{ item.amount }}</div>
+                <div class="text-body-2 text-medium-emphasis">{{ item.sourceDepartment }} | {{ item.sourceCategory }}</div>
                 <div class="text-body-2 text-medium-emphasis">{{ item.status }} -> {{ item.workflowStageLabel }}</div>
               </div>
               <v-chip size="small" color="secondary" variant="tonal">{{ item.workflowStageLabel }}</v-chip>
@@ -546,6 +644,8 @@ onMounted(() => {
             <v-list-item title="Payment reference" :subtitle="selectedReceipt.paymentRef" />
             <v-list-item title="Payment status" :subtitle="selectedReceipt.paymentStatus" />
             <v-list-item title="Issued for" :subtitle="selectedReceipt.issuedFor" />
+            <v-list-item title="Connected department" :subtitle="selectedReceipt.sourceDepartment" />
+            <v-list-item title="Category type" :subtitle="selectedReceipt.sourceCategory" />
             <v-list-item title="Status" :subtitle="selectedReceipt.status" />
             <v-list-item title="Workflow stage" :subtitle="selectedReceipt.workflowStageLabel" />
           </v-list>
@@ -907,6 +1007,7 @@ onMounted(() => {
 .focus-column::-webkit-scrollbar-track { background: transparent; }
 .toolbar-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
 .toolbar-controls { display: flex; align-items: center; gap: 12px; }
+.toolbar-search { min-width: 260px; }
 .toolbar-select { max-width: 140px; min-width: 120px; }
 .focus-banner { padding: 18px; border-radius: 16px; color: #fff; background: linear-gradient(135deg, #1d4b96 0%, #3579c9 100%); }
 .focus-next-step { padding: 14px 16px; border-radius: 14px; background: #f6f9ff; border: 1px solid rgba(78,107,168,0.14); }
@@ -950,3 +1051,7 @@ onMounted(() => {
   .receipt-number-block { text-align: left; }
 }
 </style>
+
+
+
+

@@ -3,6 +3,9 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useCustomizerStore } from '../../../stores/customizer';
 import { useAuthStore } from '@/stores/auth';
 import { BellIcon, SettingsIcon, SearchIcon, Menu2Icon, CalendarStatsIcon } from 'vue-tabler-icons';
+import { fetchNotifications } from '@/services/notifications';
+import { useRealtimeListSync } from '@/composables/useRealtimeListSync';
+import { formatDateTimeWithTimezone } from '@/utils/dateTime';
 
 import NotificationDD from './NotificationDD.vue';
 import ProfileDD from './ProfileDD.vue';
@@ -12,7 +15,9 @@ const customizer = useCustomizerStore();
 const authStore = useAuthStore();
 const showSearch = ref(false);
 const dateText = ref('');
+const unreadNotifications = ref(0);
 let dateTimer: ReturnType<typeof setInterval> | null = null;
+const realtime = useRealtimeListSync();
 
 function searchbox() {
   showSearch.value = !showSearch.value;
@@ -28,22 +33,34 @@ const userInitials = computed(() => {
 });
 
 function updateDate(): void {
-  const now = new Date();
-  dateText.value = new Intl.DateTimeFormat(undefined, {
+  dateText.value = formatDateTimeWithTimezone(new Date(), {
     weekday: 'short',
-    month: 'short',
-    day: 'numeric',
     year: 'numeric'
-  }).format(now);
+  });
+}
+
+async function loadUnreadNotifications(forceRefresh = false): Promise<void> {
+  try {
+    const payload = await fetchNotifications('all', forceRefresh);
+    unreadNotifications.value = Number(payload.meta?.totalUnread || 0);
+  } catch {
+    unreadNotifications.value = 0;
+  }
 }
 
 onMounted(() => {
   updateDate();
   dateTimer = setInterval(updateDate, 60 * 1000);
+  void loadUnreadNotifications(true);
+  realtime.startPolling(() => {
+    void loadUnreadNotifications(true);
+  }, 0, { pauseWhenDialogOpen: false });
 });
 
 onBeforeUnmount(() => {
   if (dateTimer) clearInterval(dateTimer);
+  realtime.stopPolling();
+  realtime.invalidatePending();
 });
 </script>
 
@@ -107,9 +124,14 @@ onBeforeUnmount(() => {
 
     <v-menu :close-on-content-click="false">
       <template v-slot:activator="{ props }">
-        <v-btn icon class="text-secondary mx-3" color="lightsecondary" rounded="sm" size="small" variant="flat" v-bind="props">
-          <BellIcon stroke-width="1.5" size="22" />
-        </v-btn>
+        <div class="notification-trigger mx-3">
+          <v-btn icon class="text-secondary" color="lightsecondary" rounded="sm" size="small" variant="flat" v-bind="props">
+            <BellIcon stroke-width="1.5" size="22" />
+          </v-btn>
+          <v-chip v-if="unreadNotifications > 0" size="x-small" color="error" variant="flat" class="notification-badge">
+            {{ unreadNotifications > 99 ? '99+' : unreadNotifications }}
+          </v-chip>
+        </div>
       </template>
       <v-sheet rounded="md" width="330" elevation="12">
         <NotificationDD />
@@ -179,5 +201,20 @@ onBeforeUnmount(() => {
   font-size: 15px;
   font-weight: 800;
   line-height: 1.2;
+}
+
+.notification-trigger {
+  position: relative;
+}
+
+.notification-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 22px;
+  height: 22px;
+  padding-inline: 6px;
+  justify-content: center;
+  box-shadow: 0 8px 16px rgba(220, 38, 38, 0.24);
 }
 </style>

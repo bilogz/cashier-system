@@ -869,7 +869,6 @@ onBeforeUnmount(() => {
 
           <div class="d-flex flex-wrap ga-2">
             <v-btn variant="outlined" color="secondary" rounded="pill" class="saas-outline-btn" prepend-icon="mdi-filter-off-outline" @click="clearFilters">Clear Filters</v-btn>
-            <v-btn color="primary" rounded="pill" class="saas-primary-btn" prepend-icon="mdi-refresh" :loading="loading" @click="loadAppointments">Reload</v-btn>
           </div>
         </div>
 
@@ -953,7 +952,6 @@ onBeforeUnmount(() => {
         <v-card-subtitle>Configure weekly doctor schedules used by student and teacher booking validation.</v-card-subtitle>
         <template #append>
           <div class="d-flex ga-2">
-            <v-btn variant="outlined" rounded="pill" class="saas-outline-btn" :loading="availabilityLoading" prepend-icon="mdi-refresh" @click="loadAvailabilityRows">Refresh</v-btn>
             <v-btn variant="outlined" rounded="pill" class="saas-outline-btn" prepend-icon="mdi-account-plus-outline" :loading="doctorsLoading" @click="openDoctorDialog">Add Doctor</v-btn>
             <v-btn color="primary" rounded="pill" class="saas-primary-btn" prepend-icon="mdi-plus" @click="openAddAvailabilityDialog">Add Schedule</v-btn>
           </div>
