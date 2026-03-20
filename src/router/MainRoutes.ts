@@ -12,12 +12,12 @@ const MainRoutes = {
       component: () => import('@/views/dashboards/default/DefaultDashboard.vue')
     },
     {
-      name: 'Student Portal & Billing',
+      name: 'Registrar Enrollment Feed',
       path: '/modules/billing-verification',
       component: () => import('@/views/cashier/modules/StudentBillingPage.vue'),
       meta: {
-        pageTitle: 'Student Portal & Billing',
-        pageDescription: 'View student billing details, account statements, payment eligibility, and forward valid billings to Pay Bills.'
+        pageTitle: 'Registrar Enrollment Feed',
+        pageDescription: 'Review enrollment rows pushed to cashier from registrar, inspect batch payloads, and monitor downpayment-ready student records.'
       }
     },
     {

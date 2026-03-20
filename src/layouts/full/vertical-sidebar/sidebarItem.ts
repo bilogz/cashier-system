@@ -24,7 +24,7 @@ const sidebarItem: menu[] = [
   { divider: true },
   { header: 'Cashier Flow' },
   {
-    title: 'Student Portal & Billing',
+    title: 'Registrar Enrollment Feed',
     icon: 'mdi-account-search-outline',
     to: '/modules/billing-verification'
   },

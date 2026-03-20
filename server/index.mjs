@@ -917,6 +917,26 @@ async function ensureSchema() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS cashier_registrar_student_enrollment_feed (
+      id BIGSERIAL PRIMARY KEY,
+      batch_id TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'Registrar',
+      office TEXT NOT NULL DEFAULT 'Registrar',
+      student_no TEXT NOT NULL,
+      student_name TEXT NOT NULL,
+      class_code TEXT DEFAULT NULL,
+      subject TEXT DEFAULT NULL,
+      academic_year TEXT DEFAULT NULL,
+      semester TEXT DEFAULT NULL,
+      status TEXT NOT NULL DEFAULT 'Pending',
+      downpayment_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+      payload JSONB DEFAULT NULL,
+      sent_at TIMESTAMPTZ DEFAULT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS student_accounts (
       id SERIAL PRIMARY KEY,
       student_id INT NOT NULL UNIQUE,
@@ -1340,6 +1360,168 @@ async function ensureSchema() {
          ('2024-0003', 'Angela Dela Cruz', 'BS Information Technology', '2nd Year', 'angela@gmail.com', '09170000001', 'active'),
          ('2024-0004', 'Michael Santos', 'BS Business Administration', '3rd Year', 'michael@gmail.com', '09170000002', 'active')
       `
+    );
+  }
+
+  const [[enrollmentFeedCountRow]] = await pool.query('SELECT COUNT(*) AS total FROM cashier_registrar_student_enrollment_feed');
+  if (Number(enrollmentFeedCountRow?.total || 0) === 0) {
+    await pool.query(
+      `INSERT INTO cashier_registrar_student_enrollment_feed (
+        batch_id, source, office, student_no, student_name, class_code, subject, academic_year, semester, status, downpayment_amount, payload, sent_at, created_at
+      )
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW() - INTERVAL '6 hours', NOW() - INTERVAL '6 hours'),
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW() - INTERVAL '5 hours', NOW() - INTERVAL '5 hours'),
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW() - INTERVAL '4 hours', NOW() - INTERVAL '4 hours'),
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW() - INTERVAL '3 hours', NOW() - INTERVAL '3 hours'),
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '2 hours'),
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW() - INTERVAL '90 minutes', NOW() - INTERVAL '90 minutes'),
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW() - INTERVAL '50 minutes', NOW() - INTERVAL '50 minutes'),
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '25 minutes')`,
+      [
+        'REG-ENR-2026-001',
+        'Registrar',
+        'Main Registrar',
+        '2024-0001',
+        'Juan Dela Cruz',
+        'BSIT-3A',
+        'Information Management',
+        '2025-2026',
+        '2nd Semester',
+        'Sent to Cashier',
+        3500,
+        JSON.stringify({
+          course: 'BSIT',
+          year_level: '3rd Year',
+          units: 24,
+          assessment_type: 'Regular Enrollment',
+          fee_breakdown: {
+            tuition: 12000,
+            miscellaneous: 3500,
+            laboratory: 1800
+          }
+        }),
+        'REG-ENR-2026-001',
+        'Registrar',
+        'Main Registrar',
+        '2024-0002',
+        'Maria Santos',
+        'BSBA-2B',
+        'Financial Management',
+        '2025-2026',
+        '2nd Semester',
+        'Matched',
+        4000,
+        JSON.stringify({
+          course: 'BSBA',
+          year_level: '2nd Year',
+          units: 21,
+          assessment_type: 'Regular Enrollment',
+          contact_email: 'maria@gmail.com'
+        }),
+        'REG-ENR-2026-001',
+        'Registrar',
+        'Main Registrar',
+        '2024-0003',
+        'Angela Dela Cruz',
+        'BSIT-2C',
+        'Web Systems',
+        '2025-2026',
+        '2nd Semester',
+        'Pending',
+        3000,
+        JSON.stringify({
+          course: 'BS Information Technology',
+          year_level: '2nd Year',
+          units: 23,
+          scholarship_flag: false
+        }),
+        'REG-ENR-2026-001',
+        'Registrar',
+        'Main Registrar',
+        '2024-0004',
+        'Michael Santos',
+        'BSBA-3A',
+        'Operations Management',
+        '2025-2026',
+        '2nd Semester',
+        'Cleared',
+        5000,
+        JSON.stringify({
+          course: 'BS Business Administration',
+          year_level: '3rd Year',
+          units: 18,
+          cashier_clearance: 'Cleared'
+        }),
+        'REG-ENR-2026-002',
+        'Registrar',
+        'Satellite Registrar',
+        '2024-0005',
+        'Trisha Mendoza',
+        'BSA-4A',
+        'Auditing Theory',
+        '2025-2026',
+        'Summer',
+        'For Verification',
+        4500,
+        JSON.stringify({
+          course: 'BS Accountancy',
+          year_level: '4th Year',
+          units: 15,
+          assessment_type: 'Summer'
+        }),
+        'REG-ENR-2026-002',
+        'Registrar',
+        'Satellite Registrar',
+        '2024-0006',
+        'Carlo Reyes',
+        'BSCS-1A',
+        'Programming Logic',
+        '2025-2026',
+        '1st Semester',
+        'Pending',
+        2500,
+        JSON.stringify({
+          course: 'BS Computer Science',
+          year_level: '1st Year',
+          units: 27,
+          remarks: 'Freshman assessment created'
+        }),
+        'REG-ENR-2026-002',
+        'Registrar',
+        'Satellite Registrar',
+        '2024-0007',
+        'Liza Garcia',
+        'BSHM-2A',
+        'Food Service Operations',
+        '2025-2026',
+        '1st Semester',
+        'On Hold',
+        2750,
+        JSON.stringify({
+          course: 'BS Hospitality Management',
+          year_level: '2nd Year',
+          units: 20,
+          hold_reason: 'Pending registrar attachment'
+        }),
+        'REG-ENR-2026-003',
+        'Registrar',
+        'Main Registrar',
+        '2024-0008',
+        'Ethan Flores',
+        'BSOA-3B',
+        'Records Management',
+        '2025-2026',
+        '1st Semester',
+        'Sent to Cashier',
+        3200,
+        JSON.stringify({
+          course: 'BS Office Administration',
+          year_level: '3rd Year',
+          units: 19,
+          last_updated_by: 'Registrar Batch Sync'
+        })
+      ]
     );
   }
 
@@ -2786,6 +2968,128 @@ function mapReportingStatus(rawStatus) {
   if (status === 'reported') return 'Reported';
   if (status === 'reconciled') return 'Reconciled';
   return 'Logged';
+}
+
+async function buildCashierRegistrarEnrollmentFeedSnapshot(filters = {}) {
+  const [rows] = await pool.query(
+    `SELECT
+        id,
+        batch_id,
+        source,
+        office,
+        student_no,
+        student_name,
+        class_code,
+        subject,
+        academic_year,
+        semester,
+        status,
+        downpayment_amount,
+        payload,
+        sent_at,
+        created_at
+     FROM cashier_registrar_student_enrollment_feed
+     ORDER BY COALESCE(sent_at, created_at) DESC, id DESC`
+  );
+
+  const normalizedRows = (Array.isArray(rows) ? rows : []).map((row) => ({
+    id: Number(row.id),
+    batchId: cleanTextValue(row.batch_id),
+    source: cleanTextValue(row.source) || 'Registrar',
+    office: cleanTextValue(row.office) || 'Registrar',
+    studentNo: cleanTextValue(row.student_no),
+    studentName: cleanTextValue(row.student_name) || 'Unknown Student',
+    classCode: cleanTextValue(row.class_code),
+    subject: cleanTextValue(row.subject),
+    academicYear: cleanTextValue(row.academic_year),
+    semester: cleanTextValue(row.semester),
+    status: cleanTextValue(row.status) || 'Pending',
+    downpaymentAmount: Number(row.downpayment_amount || 0),
+    downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
+    payload: row.payload && typeof row.payload === 'object' ? row.payload : row.payload ? safeJsonParse(row.payload, null) : null,
+    sentAt: toIsoString(row.sent_at),
+    createdAt: toIsoString(row.created_at)
+  }));
+
+  const search = cleanTextValue(filters.search).toLowerCase();
+  const statusFilter = cleanTextValue(filters.status);
+  const semesterFilter = cleanTextValue(filters.semester);
+  const sourceFilter = cleanTextValue(filters.source);
+  const officeFilter = cleanTextValue(filters.office);
+  const page = Math.max(1, Number(filters.page || 1));
+  const perPage = Math.min(50, Math.max(1, Number(filters.perPage || 10)));
+
+  const filtered = normalizedRows.filter((row) => {
+    const matchesSearch =
+      !search ||
+      [
+        row.batchId,
+        row.source,
+        row.office,
+        row.studentNo,
+        row.studentName,
+        row.classCode,
+        row.subject,
+        row.academicYear,
+        row.semester,
+        row.status
+      ]
+        .join(' ')
+        .toLowerCase()
+        .includes(search);
+    const matchesStatus = !statusFilter || statusFilter === 'All Statuses' || row.status === statusFilter;
+    const matchesSemester = !semesterFilter || semesterFilter === 'All Semesters' || row.semester === semesterFilter;
+    const matchesSource = !sourceFilter || sourceFilter === 'All Sources' || row.source === sourceFilter;
+    const matchesOffice = !officeFilter || officeFilter === 'All Offices' || row.office === officeFilter;
+
+    return matchesSearch && matchesStatus && matchesSemester && matchesSource && matchesOffice;
+  });
+
+  const uniqueStudents = new Set(filtered.map((row) => row.studentNo || row.studentName).filter(Boolean));
+  const uniqueBatches = new Set(filtered.map((row) => row.batchId).filter(Boolean));
+  const totalDownpayment = filtered.reduce((sum, row) => sum + Number(row.downpaymentAmount || 0), 0);
+  const recentlySent = filtered.filter((row) => row.sentAt).length;
+
+  return {
+    stats: [
+      {
+        title: 'Feed Records',
+        value: String(filtered.length),
+        subtitle: 'Enrollment rows visible from registrar feed',
+        icon: 'mdi-table-account',
+        tone: 'blue'
+      },
+      {
+        title: 'Students',
+        value: String(uniqueStudents.size),
+        subtitle: 'Distinct students represented in the feed',
+        icon: 'mdi-account-cash-outline',
+        tone: 'green'
+      },
+      {
+        title: 'Batches',
+        value: String(uniqueBatches.size),
+        subtitle: 'Batch groups currently available to cashier',
+        icon: 'mdi-calendar-week-outline',
+        tone: 'orange'
+      },
+      {
+        title: 'Downpayment',
+        value: formatCurrency(totalDownpayment),
+        subtitle: `${recentlySent} record(s) already sent from registrar`,
+        icon: 'mdi-currency-php',
+        tone: 'purple'
+      }
+    ],
+    items: paginateRows(filtered, page, perPage),
+    meta: buildPaginationMeta(filtered.length, page, perPage),
+    filters: {
+      statuses: Array.from(new Set(normalizedRows.map((row) => row.status).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+      semesters: Array.from(new Set(normalizedRows.map((row) => row.semester).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+      sources: Array.from(new Set(normalizedRows.map((row) => row.source).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+      offices: Array.from(new Set(normalizedRows.map((row) => row.office).filter(Boolean))).sort((left, right) => left.localeCompare(right))
+    }
+  };
 }
 
 function resolveReportingBoardStatus(reconciliationStatus, reportingStatus) {
@@ -8062,6 +8366,23 @@ app.get('/api/student-billing', requireAuth, async (req, res) => {
     sendOk(res, payload);
   } catch (error) {
     sendError(res, 500, error instanceof Error ? error.message : 'Unable to load billing records.');
+  }
+});
+
+app.get('/api/cashier-registrar-student-enrollment-feed', requireAuth, async (req, res) => {
+  try {
+    const payload = await buildCashierRegistrarEnrollmentFeedSnapshot({
+      search: req.query?.search,
+      status: req.query?.status,
+      semester: req.query?.semester,
+      source: req.query?.source,
+      office: req.query?.office,
+      page: req.query?.page,
+      perPage: req.query?.per_page
+    });
+    sendOk(res, payload);
+  } catch (error) {
+    sendError(res, 500, error instanceof Error ? error.message : 'Unable to load cashier registrar enrollment feed.');
   }
 });
 
