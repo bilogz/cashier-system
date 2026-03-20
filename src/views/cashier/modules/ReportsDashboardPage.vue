@@ -16,6 +16,10 @@ import {
   type ReportingSnapshot,
   type ReportingStatus
 } from '@/services/reportingReconciliation';
+import {
+  fetchCashierDepartmentHandoffs,
+  type DepartmentServiceMatrixItem
+} from '@/services/cashierDepartmentHandoffs';
 import { returnWorkflowRecordForCorrection } from '@/services/workflowCorrections';
 import { reconcileWorkflowRecord } from '@/services/workflowActions';
 import {
@@ -36,6 +40,7 @@ const completedMeta = ref<ReportingPaginationMeta>({
   totalPages: 1
 });
 const alerts = ref<ReportingSnapshot['activityFeed']>([]);
+const departmentMatrix = ref<DepartmentServiceMatrixItem[]>([]);
 const selectedReport = ref<ReportingItem | null>(null);
 const activeSearch = ref('');
 const departmentFilter = ref('All Departments');
@@ -57,9 +62,20 @@ const loading = ref(false);
 const actionLoading = ref(false);
 const errorMessage = ref('');
 const realtime = useRealtimeListSync();
+const connectedDepartmentNames = computed(() =>
+  Array.from(
+    new Set(
+      [
+        ...departmentMatrix.value.map((item) => item.department),
+        ...reportRows.value.flatMap((item) => [item.sourceDepartment, item.targetDepartment, item.operationalTargetDepartment]),
+        ...completedRows.value.flatMap((item) => [item.sourceDepartment, item.targetDepartment, item.operationalTargetDepartment])
+      ].filter(Boolean)
+    )
+  )
+);
 const departmentFilterOptions = computed(() => [
   'All Departments',
-  ...new Set([...reportRows.value, ...completedRows.value].map((item) => item.sourceDepartment).filter(Boolean))
+  ...connectedDepartmentNames.value
 ]);
 const categoryFilterOptions = computed(() => [
   'All Categories',
@@ -78,12 +94,53 @@ function canReconcile(row: ReportingItem) {
   return row.status === 'Logged' || row.status === 'With Discrepancy';
 }
 
-function canSendToPmed(row: ReportingItem) {
+function canSendToDepartment(row: ReportingItem) {
   return row.status === 'Reconciled';
 }
 
 function canArchive(row: ReportingItem) {
   return row.status === 'Reported' || row.status === 'Archived';
+}
+
+function resolvedTargetDepartment(row: ReportingItem | null) {
+  return row?.targetDepartment || 'Connected Department';
+}
+
+function formatDepartmentFlow(row: ReportingItem | null) {
+  if (!row) return 'Origin Department -> Cashier -> Connected Department';
+  return row.departmentFlow || `${row.sourceDepartment || 'Origin Department'} -> Cashier -> ${resolvedTargetDepartment(row)}`;
+}
+
+function matchesDepartmentFilter(row: ReportingItem) {
+  if (departmentFilter.value === 'All Departments') return true;
+  return [row.sourceDepartment, row.targetDepartment, row.operationalTargetDepartment]
+    .filter(Boolean)
+    .includes(departmentFilter.value);
+}
+
+function operationalHandoffLabel(row: ReportingItem | null) {
+  if (!row) return '--';
+  if (row.operationalHandoffStatus) return row.operationalHandoffStatus;
+  const originTarget = row.operationalTargetDepartment || row.sourceDepartment || 'Origin Department';
+  if (row.paymentStatus === 'Paid') return `Confirmed to ${originTarget}`;
+  if (row.paymentStatus === 'Authorized') return `Awaiting paid confirmation for ${originTarget}`;
+  return `Waiting for ${originTarget} payment confirmation`;
+}
+
+function reportingHandoffLabel(row: ReportingItem | null) {
+  if (!row) return '--';
+  const target = resolvedTargetDepartment(row);
+  const normalized = String(row.handoffStatus || '').trim().toLowerCase();
+  if (normalized === 'archived' || row.status === 'Archived') return `Archived after ${target} handoff`;
+  if (normalized === 'sent' || row.status === 'Reported') return row.handoffReference ? `Sent to ${target} as ${row.handoffReference}` : `Sent to ${target}`;
+  if (normalized === 'ready' || row.status === 'Reconciled') return `Ready for ${target}`;
+  if (row.status === 'With Discrepancy') return `On hold before ${target} handoff`;
+  return `Waiting for ${target} reconciliation`;
+}
+
+function reportActionLabel(row: ReportingItem | null) {
+  const target = resolvedTargetDepartment(row);
+  return target === 'PMED Department' ? 'Send to PMED' : `Send to ${target}`;
 }
 
 function openDialog(mode: 'reconcile' | 'report' | 'archive' | 'discrepancy', row: ReportingItem) {
@@ -99,7 +156,7 @@ function openCorrectionDialog(row: ReportingItem) {
 
 function dialogTitle() {
   if (dialogMode.value === 'reconcile') return 'Reconcile and Archive';
-  if (dialogMode.value === 'report') return 'Send Financial Report to PMED';
+  if (dialogMode.value === 'report') return `Send Cashier Handoff to ${resolvedTargetDepartment(selectedReport.value)}`;
   if (dialogMode.value === 'archive') return 'Archive Record';
   return '';
 }
@@ -107,7 +164,7 @@ function dialogTitle() {
 function dialogMessage() {
   if (!selectedReport.value) return '';
   if (dialogMode.value === 'reconcile') return `Match ${selectedReport.value.reference} with its payment and documentation records, then move it to archive?`;
-  if (dialogMode.value === 'report') return `Send ${selectedReport.value.reference} to PMED as a cashier financial report package?`;
+  if (dialogMode.value === 'report') return `Send ${selectedReport.value.reference} to ${resolvedTargetDepartment(selectedReport.value)} as the cashier department handoff package?`;
   if (dialogMode.value === 'archive') return `Archive ${selectedReport.value.reference} from the active reconciliation board?`;
   return '';
 }
@@ -121,7 +178,7 @@ async function loadSnapshot(options: { silent?: boolean } = {}) {
   if (!options.silent) loading.value = true;
   errorMessage.value = '';
   try {
-    const [snapshot, completed] = await Promise.all([
+    const [snapshot, completed, handoffs] = await Promise.all([
       fetchReportingSnapshot(),
       fetchCompletedTransactions({
         page: historyCurrentPage.value,
@@ -132,13 +189,20 @@ async function loadSnapshot(options: { silent?: boolean } = {}) {
         category: categoryFilter.value !== 'All Categories' ? categoryFilter.value : '',
         dateFrom: completedDateFrom.value,
         dateTo: completedDateTo.value
-      })
+      }),
+      fetchCashierDepartmentHandoffs().catch(() => ({
+        stats: [],
+        matrix: [],
+        items: [],
+        latestItems: []
+      }))
     ]);
     stats.value = snapshot.stats;
     reportRows.value = snapshot.items;
     completedRows.value = completed.items;
     completedMeta.value = completed.meta;
     alerts.value = snapshot.activityFeed;
+    departmentMatrix.value = handoffs.matrix;
     selectedReport.value =
       snapshot.items.find((item) => item.id === selectedReport.value?.id) ||
       completed.items.find((item) => item.id === selectedReport.value?.id) ||
@@ -236,6 +300,9 @@ const reportContextFields = computed(() => {
     { label: 'Receipt Number', value: selectedReport.value.receiptNumber },
     { label: 'Connected Department', value: selectedReport.value.sourceDepartment },
     { label: 'Category Type', value: selectedReport.value.sourceCategory },
+    { label: 'Department Flow', value: formatDepartmentFlow(selectedReport.value) },
+    { label: 'Origin Handoff', value: operationalHandoffLabel(selectedReport.value) },
+    { label: 'Reporting Target', value: resolvedTargetDepartment(selectedReport.value) },
     { label: 'Amount', value: selectedReport.value.amount },
     { label: 'Workflow Stage', value: selectedReport.value.workflowStageLabel }
   ];
@@ -246,7 +313,7 @@ const reconcileInitialValues = computed(() => ({
 }));
 
 const reportInitialValues = computed(() => ({
-  remarks: 'Cashier financial report package sent to PMED.'
+  remarks: `Cashier handoff sent to ${resolvedTargetDepartment(selectedReport.value)}.`
 }));
 
 const archiveInitialValues = computed(() => ({
@@ -261,19 +328,29 @@ const discrepancyInitialValues = computed(() => ({
 const nextStepLabel = computed(() => {
   if (!selectedReport.value) return 'Select a reporting record to review its final cashier outcome.';
   if (selectedReport.value.status === 'Logged') return 'Reconcile the billing, payment, and receipt records before final reporting.';
-  if (selectedReport.value.status === 'Reconciled') return 'Send this reconciled cashier financial report package to PMED Department.';
-  if (selectedReport.value.status === 'Reported') return 'PMED already received this cashier report package. Archive it to move the record into completed history.';
+  if (selectedReport.value.status === 'Reconciled') return `Send this reconciled cashier handoff package to ${resolvedTargetDepartment(selectedReport.value)}.`;
+  if (selectedReport.value.status === 'Reported') return `${resolvedTargetDepartment(selectedReport.value)} already received this cashier handoff. Archive it to move the record into completed history.`;
   if (selectedReport.value.status === 'With Discrepancy') return 'Resolve the discrepancy or return the record to Compliance & Documentation.';
   return 'This record already completed the reporting workflow.';
 });
+const connectedFlowHeadline = computed(() =>
+  connectedDepartmentNames.value.length
+    ? connectedDepartmentNames.value.join(' -> ')
+    : 'Connected departments and systems are syncing'
+);
+const connectedFlowSummary = computed(() => {
+  const totalRecords = reportRows.value.length + completedRows.value.length;
+  if (!connectedDepartmentNames.value.length) return 'Waiting for department and system connections to load.';
+  return `${connectedDepartmentNames.value.length} connected departments/systems across ${totalRecords} cashier completion record${totalRecords === 1 ? '' : 's'}.`;
+});
 const filteredReportRows = computed(() =>
   reportRows.value.filter((item) => {
-    if (departmentFilter.value !== 'All Departments' && item.sourceDepartment !== departmentFilter.value) return false;
+    if (!matchesDepartmentFilter(item)) return false;
     if (categoryFilter.value !== 'All Categories' && item.sourceCategory !== categoryFilter.value) return false;
     if (activeSearch.value.trim()) {
       const needle = activeSearch.value.trim().toLowerCase();
       const haystack =
-        `${item.reference} ${item.studentName} ${item.billingCode} ${item.receiptNumber} ${item.sourceDepartment} ${item.sourceCategory} ${item.paymentStatus} ${item.documentStatus} ${item.status} ${item.workflowStageLabel}`.toLowerCase();
+        `${item.reference} ${item.studentName} ${item.billingCode} ${item.receiptNumber} ${item.sourceDepartment} ${item.targetDepartment || ''} ${item.operationalTargetDepartment || ''} ${item.sourceCategory} ${item.paymentStatus} ${item.documentStatus} ${item.status} ${item.workflowStageLabel}`.toLowerCase();
       if (!haystack.includes(needle)) return false;
     }
     return true;
@@ -378,7 +455,8 @@ async function submitReportAction(formValues: Record<string, string | number>) {
   try {
     const response = await reportReconciliationRecord({
       paymentId: selectedReport.value.id,
-      remarks: String(formValues.remarks || '')
+      remarks: String(formValues.remarks || ''),
+      targetDepartment: resolvedTargetDepartment(selectedReport.value)
     });
     snackbarMessage.value = formatActionMessage(response);
     snackbar.value = true;
@@ -474,24 +552,28 @@ onUnmounted(() => {
               <div class="hero-kicker">Completed Transactions</div>
               <h1 class="text-h4 font-weight-black mb-2">Completed Transactions</h1>
               <p class="hero-subtitle mb-0">
-                Review finalized cashier records, archive completed transactions, and keep discrepancy or send-back handling available when needed.
+                Review finalized cashier records, track connected department and system handoffs, and send reconciled cashier outputs into the right reporting destination.
               </p>
             </div>
             <div class="hero-side-panel">
-            <div class="hero-side-label">Completion Flow</div>
-            <div class="text-h6 font-weight-bold">Compliance -> Completed -> Archive</div>
-            <div class="text-body-2">{{ reportRows.length }} active completion record{{ reportRows.length === 1 ? '' : 's' }} available</div>
+              <div class="hero-side-label">Department Flow</div>
+              <div class="text-h6 font-weight-bold">{{ connectedFlowHeadline }}</div>
+              <div class="text-body-2">{{ connectedFlowSummary }}</div>
+            </div>
           </div>
-        </div>
-      </v-card-text>
+        </v-card-text>
       </v-card>
     </v-col>
+  </v-row>
 
-    <v-col v-for="card in stats" :key="card.title" cols="12" sm="6" lg="3">
+  <div class="stats-grid mb-6">
+    <div v-for="card in stats" :key="card.title" class="stats-grid__item">
       <CashierAnalyticsCard :title="card.title" :value="card.value" :subtitle="card.subtitle" :icon="card.icon" :tone="card.tone" />
-    </v-col>
+    </div>
+  </div>
 
-    <v-col cols="12" lg="8">
+  <v-row>
+    <v-col cols="12" md="8">
       <v-card class="panel-card" variant="outlined">
         <v-card-item>
           <v-card-title>Completed & Exception Board</v-card-title>
@@ -560,14 +642,16 @@ onUnmounted(() => {
                 <div class="font-weight-bold">{{ row.reference }}</div>
                 <div class="text-body-2 text-medium-emphasis">{{ row.studentName }} | {{ row.billingCode }} | {{ row.amount }}</div>
                 <div class="text-body-2 text-medium-emphasis">{{ row.sourceDepartment }} | {{ row.sourceCategory }}</div>
+                <div class="text-body-2 text-medium-emphasis">{{ formatDepartmentFlow(row) }}</div>
                 <div class="text-body-2 text-medium-emphasis">{{ row.paymentStatus }} | {{ row.documentStatus }} | {{ row.postedAt }}</div>
+                <div class="text-body-2 text-medium-emphasis">{{ operationalHandoffLabel(row) }} | {{ reportingHandoffLabel(row) }}</div>
                 <div v-if="row.allocationSummary" class="text-body-2 text-medium-emphasis mt-1">{{ row.allocationSummary }}</div>
               </div>
               <div class="report-side">
                 <v-chip size="small" :color="statusColor(row.status)" variant="tonal">{{ row.status }}</v-chip>
                 <div class="report-actions">
                   <CashierActionButton :icon="mdiCheckDecagramOutline" label="Reconcile" color="primary" variant="text" compact :disabled="!canReconcile(row)" @click.stop="openDialog('reconcile', row)" />
-                  <CashierActionButton :icon="mdiFileChartOutline" label="Send to PMED" color="secondary" variant="text" compact :disabled="!canSendToPmed(row)" @click.stop="openDialog('report', row)" />
+                  <CashierActionButton :icon="mdiFileChartOutline" :label="reportActionLabel(row)" color="secondary" variant="text" compact :disabled="!canSendToDepartment(row)" @click.stop="openDialog('report', row)" />
                   <CashierActionButton :icon="mdiFileChartOutline" label="Discrepancy" color="warning" variant="text" compact @click.stop="openDialog('discrepancy', row)" />
                   <CashierActionButton :icon="mdiArchiveOutline" label="Correction" color="error" variant="text" compact @click.stop="openCorrectionDialog(row)" />
                   <CashierActionButton :icon="mdiArchiveOutline" label="Archive" color="warning" variant="text" compact :disabled="!canArchive(row)" @click.stop="openDialog('archive', row)" />
@@ -678,8 +762,11 @@ onUnmounted(() => {
                     <th>Reference</th>
                     <th>Student</th>
                     <th>Billing Code</th>
-                    <th>Department</th>
+                    <th>Origin Dept.</th>
                     <th>Category</th>
+                    <th>Flow</th>
+                    <th>Origin Handoff</th>
+                    <th>Reporting Handoff</th>
                     <th>Receipt No.</th>
                     <th>Amount</th>
                     <th>Payment</th>
@@ -696,6 +783,9 @@ onUnmounted(() => {
                     <td>{{ row.billingCode }}</td>
                     <td>{{ row.sourceDepartment }}</td>
                     <td>{{ row.sourceCategory }}</td>
+                    <td>{{ formatDepartmentFlow(row) }}</td>
+                    <td>{{ operationalHandoffLabel(row) }}</td>
+                    <td>{{ reportingHandoffLabel(row) }}</td>
                     <td>{{ row.receiptNumber || 'Pending Receipt' }}</td>
                     <td>{{ row.amount }}</td>
                     <td>{{ row.paymentStatus }}</td>
@@ -721,11 +811,35 @@ onUnmounted(() => {
       </v-card>
     </v-col>
 
-    <v-col cols="12" lg="4" class="focus-column">
+    <v-col cols="12" md="4" class="focus-column">
+      <v-card class="panel-card mb-6" variant="outlined">
+        <v-card-item>
+          <v-card-title>Connected Departments & Systems</v-card-title>
+          <v-card-subtitle>Cashier routes and recipients linked to the reporting board</v-card-subtitle>
+        </v-card-item>
+        <v-card-text>
+          <div v-if="departmentMatrix.length" class="connection-stack">
+            <div v-for="item in departmentMatrix" :key="item.department" class="connection-card">
+              <div class="font-weight-bold">{{ item.department }}</div>
+              <div class="text-body-2 text-medium-emphasis mt-1">{{ item.usage }}</div>
+              <div class="connection-line mt-3">
+                <div class="metric-label">Into Cashier</div>
+                <div class="text-body-2">{{ item.incomingToCashier.join(' | ') }}</div>
+              </div>
+              <div class="connection-line mt-3">
+                <div class="metric-label">From Cashier</div>
+                <div class="text-body-2">{{ item.outgoingFromCashier.join(' | ') }}</div>
+              </div>
+            </div>
+          </div>
+          <div v-else class="text-body-2 text-medium-emphasis">Connected departments and systems are still loading.</div>
+        </v-card-text>
+      </v-card>
+
       <v-card class="panel-card mb-6" variant="outlined">
         <v-card-item>
           <v-card-title>Completion Focus</v-card-title>
-          <v-card-subtitle>Selected final-stage cashier record</v-card-subtitle>
+          <v-card-subtitle>Selected final-stage cashier record and connected destination</v-card-subtitle>
         </v-card-item>
         <v-card-text v-if="selectedReport">
           <div class="focus-banner mb-4">
@@ -740,6 +854,11 @@ onUnmounted(() => {
           <v-list density="comfortable" class="py-0">
             <v-list-item title="Connected department" :subtitle="selectedReport.sourceDepartment" />
             <v-list-item title="Category type" :subtitle="selectedReport.sourceCategory" />
+            <v-list-item title="Department flow" :subtitle="formatDepartmentFlow(selectedReport)" />
+            <v-list-item title="Origin handoff" :subtitle="operationalHandoffLabel(selectedReport)" />
+            <v-list-item title="Reporting target" :subtitle="resolvedTargetDepartment(selectedReport)" />
+            <v-list-item title="Reporting handoff" :subtitle="reportingHandoffLabel(selectedReport)" />
+            <v-list-item title="Handoff reference" :subtitle="selectedReport.handoffReference || '--'" />
             <v-list-item title="Billing code" :subtitle="selectedReport.billingCode" />
             <v-list-item title="Receipt number" :subtitle="selectedReport.receiptNumber" />
             <v-list-item title="Payment status" :subtitle="selectedReport.paymentStatus" />
@@ -757,7 +876,7 @@ onUnmounted(() => {
       <v-card class="panel-card" variant="outlined">
         <v-card-item>
           <v-card-title>Completion Alerts</v-card-title>
-          <v-card-subtitle>PMED report requests, archive updates, discrepancy flags, and send-back notifications</v-card-subtitle>
+          <v-card-subtitle>Department confirmations, system handoffs, archive updates, discrepancy flags, and send-back notifications</v-card-subtitle>
         </v-card-item>
         <v-card-text>
           <div v-for="item in alerts" :key="item.title + item.time" class="alert-card">
@@ -767,7 +886,7 @@ onUnmounted(() => {
             </div>
             <div class="text-body-2 text-medium-emphasis">{{ item.detail }}</div>
           </div>
-          <div v-if="!alerts.length" class="text-body-2 text-medium-emphasis">No PMED report requests or reporting alerts yet.</div>
+          <div v-if="!alerts.length" class="text-body-2 text-medium-emphasis">No department reporting alerts or handoff updates yet.</div>
         </v-card-text>
       </v-card>
     </v-col>
@@ -806,21 +925,21 @@ onUnmounted(() => {
       v-else-if="dialogMode === 'report'"
       :model-value="true"
       :loading="actionLoading"
-      title="Send Cashier Financial Report to PMED"
-      subtitle="Create a structured cashier financial report package and deliver it to PMED as an inbound department report."
-      chip-label="Send to PMED"
+      :title="dialogTitle()"
+      :subtitle="`Create the final cashier handoff package and deliver it to ${resolvedTargetDepartment(selectedReport)}.`"
+      :chip-label="reportActionLabel(selectedReport)"
       chip-color="secondary"
-      confirm-label="Send to PMED"
+      :confirm-label="reportActionLabel(selectedReport)"
       confirm-color="secondary"
       :context-fields="reportContextFields"
       :fields="[
         {
           key: 'remarks',
-          label: 'PMED Handoff Remarks',
+          label: 'Department Handoff Remarks',
           type: 'textarea',
           required: true,
           rows: 3,
-          placeholder: 'Add PMED-facing notes for this financial report package.'
+          placeholder: 'Add department-facing notes for this cashier handoff package.'
         }
       ]"
       :initial-values="reportInitialValues"
@@ -966,6 +1085,20 @@ onUnmounted(() => {
   box-shadow: 0 14px 28px rgba(15, 23, 42, 0.05);
 }
 
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 16px;
+}
+
+.stats-grid__item {
+  min-width: 0;
+}
+
+.stats-grid__item :deep(.analytics-card) {
+  height: 100%;
+}
+
 .metric-icon {
   width: 48px;
   height: 48px;
@@ -987,6 +1120,8 @@ onUnmounted(() => {
 .toolbar-controls {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 12px;
 }
 
@@ -1017,6 +1152,23 @@ onUnmounted(() => {
   min-width: 120px;
 }
 
+.connection-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.connection-card {
+  padding: 14px;
+  border-radius: 14px;
+  background: #f8fbff;
+  border: 1px solid rgba(78, 107, 168, 0.14);
+}
+
+.connection-line {
+  display: grid;
+  gap: 4px;
+}
+
 .report-list {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -1033,7 +1185,7 @@ onUnmounted(() => {
 .completed-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 920px;
+  min-width: 1360px;
 }
 
 .completed-table th,
@@ -1084,28 +1236,7 @@ onUnmounted(() => {
 }
 
 .focus-column {
-  position: sticky;
-  top: 88px;
   align-self: start;
-  max-height: calc(100vh - 112px);
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding-right: 6px;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(33, 80, 166, 0.28) transparent;
-}
-
-.focus-column::-webkit-scrollbar {
-  width: 8px;
-}
-
-.focus-column::-webkit-scrollbar-thumb {
-  border-radius: 999px;
-  background: rgba(33, 80, 166, 0.22);
-}
-
-.focus-column::-webkit-scrollbar-track {
-  background: transparent;
 }
 
 .focus-banner {
@@ -1166,9 +1297,6 @@ onUnmounted(() => {
 
   .focus-column {
     position: static;
-    max-height: none;
-    overflow: visible;
-    padding-right: 0;
   }
 }
 </style>

@@ -71,7 +71,7 @@ const MainRoutes = {
       component: () => import('@/views/cashier/modules/ReportsDashboardPage.vue'),
       meta: {
         pageTitle: 'Completed Transactions',
-        pageDescription: 'Review finalized cashier records, archive completed transactions, and handle remaining discrepancies if records are sent back.'
+        pageDescription: 'Review finalized cashier records, track department handoffs, archive completed transactions, and handle remaining discrepancies if records are sent back.'
       }
     },
     {

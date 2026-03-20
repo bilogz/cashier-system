@@ -770,6 +770,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           url.pathname !== '/api/realtime-stream' &&
           url.pathname !== '/api/clinic-sync/status' &&
           url.pathname !== '/api/report-center' &&
+          url.pathname !== '/api/cashier/department-handoffs' &&
           url.pathname !== '/api/appointments' &&
           url.pathname !== '/api/admin-auth' &&
           url.pathname !== '/api/admin-profile' &&
@@ -936,49 +937,20 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
 
         const integratedFlow = {
           nodes: [
-            'Registrar',
             'Cashier',
             'Clinic',
-            'Guidance Office',
-            'Prefect Office',
-            'Computer Laboratory',
-            'CRAD Department',
             'HR Department',
-            'PMED Department',
-            'School Administration'
+            'PMED Department'
           ],
           edges: [
-            { from: 'Registrar', to: 'Cashier', artifact: 'Student enrollment data' },
-            { from: 'Registrar', to: 'Clinic', artifact: 'Student personal information' },
-            { from: 'Registrar', to: 'Guidance Office', artifact: 'Student personal information' },
-            { from: 'Registrar', to: 'Prefect Office', artifact: 'Student personal information' },
-            { from: 'Registrar', to: 'Guidance Office', artifact: 'Student academic records' },
-            { from: 'Registrar', to: 'Computer Laboratory', artifact: 'Student list' },
-            { from: 'Registrar', to: 'CRAD Department', artifact: 'Student list' },
-            { from: 'Registrar', to: 'PMED Department', artifact: 'Enrollment statistics' },
-            { from: 'Cashier', to: 'Registrar', artifact: 'Payment confirmation' },
-            { from: 'Cashier', to: 'PMED Department', artifact: 'Financial reports' },
-            { from: 'Clinic', to: 'Registrar', artifact: 'Medical clearance' },
-            { from: 'Clinic', to: 'Guidance Office', artifact: 'Health reports' },
-            { from: 'Clinic', to: 'PMED Department', artifact: 'Health service reports' },
-            { from: 'Guidance Office', to: 'Registrar', artifact: 'Counseling reports' },
-            { from: 'Guidance Office', to: 'PMED Department', artifact: 'Counseling reports' },
-            { from: 'Guidance Office', to: 'Clinic', artifact: 'Health concerns' },
-            { from: 'Guidance Office', to: 'Prefect Office', artifact: 'Discipline reports' },
-            { from: 'Guidance Office', to: 'CRAD Department', artifact: 'Student recommendations' },
-            { from: 'Prefect Office', to: 'Registrar', artifact: 'Discipline records' },
-            { from: 'Prefect Office', to: 'Guidance Office', artifact: 'Discipline reports' },
-            { from: 'Prefect Office', to: 'Clinic', artifact: 'Incident reports' },
-            { from: 'Prefect Office', to: 'PMED Department', artifact: 'Discipline statistics' },
-            { from: 'Computer Laboratory', to: 'PMED Department', artifact: 'Laboratory usage reports' },
-            { from: 'CRAD Department', to: 'Registrar', artifact: 'Activity participation records' },
-            { from: 'CRAD Department', to: 'PMED Department', artifact: 'Program activity reports' },
             { from: 'HR Department', to: 'Cashier', artifact: 'Payroll data' },
-            { from: 'HR Department', to: 'Registrar', artifact: 'Staff list' },
-            { from: 'HR Department', to: 'Computer Laboratory', artifact: 'Staff list' },
-            { from: 'HR Department', to: 'PMED Department', artifact: 'Employee performance records' },
-            { from: 'PMED Department', to: 'School Administration', artifact: 'Evaluation reports' },
-            { from: 'PMED Department', to: 'HR Department', artifact: 'Staff evaluation feedback' }
+            { from: 'Cashier', to: 'HR Department', artifact: 'Financial summaries' },
+            { from: 'Clinic', to: 'Cashier', artifact: 'Medical fee assessment' },
+            { from: 'Clinic', to: 'Cashier', artifact: 'Service charges' },
+            { from: 'Cashier', to: 'Clinic', artifact: 'Payment confirmation (medical fees)' },
+            { from: 'PMED Department', to: 'Cashier', artifact: 'Financial report requests' },
+            { from: 'Cashier', to: 'PMED Department', artifact: 'Payment status' },
+            { from: 'Cashier', to: 'PMED Department', artifact: 'Financial reports' }
           ],
           functions: {
             getIncomingByDepartment: (department: string) =>
@@ -1011,6 +983,220 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               JSON.stringify(metadata || {})
             ]
           );
+        }
+
+        async function ensureCashierWorkflowDemoData(): Promise<void> {
+          await ensureModuleActivityLogsTable(sql);
+
+          const demoStudents = [
+            {
+              studentNo: '2026-CT-1001',
+              fullName: 'Mira Castillo',
+              course: 'BS Accountancy',
+              yearLevel: '3rd Year',
+              email: 'mira.castillo@example.com',
+              phone: '09171111001'
+            },
+            {
+              studentNo: 'CLINIC-PHR-DEMO-2001',
+              fullName: 'Emma Tan',
+              course: 'Clinic Services',
+              yearLevel: 'Clinic',
+              email: 'emma.tan@clinic.local',
+              phone: '09172222001'
+            }
+          ];
+
+          for (const student of demoStudents) {
+            await sql.query(
+              `INSERT INTO students (student_no, full_name, course, year_level, email, phone, status)
+               VALUES ($1, $2, $3, $4, $5, $6, 'active')
+               ON CONFLICT (student_no) DO UPDATE
+               SET full_name = EXCLUDED.full_name,
+                   course = EXCLUDED.course,
+                   year_level = EXCLUDED.year_level,
+                   email = EXCLUDED.email,
+                   phone = EXCLUDED.phone,
+                   status = 'active'`,
+              [student.studentNo, student.fullName, student.course, student.yearLevel, student.email, student.phone]
+            );
+          }
+
+          const completedSeeds = [
+            {
+              studentNo: '2026-CT-1001',
+              billingCode: 'BILL-COMP-2001',
+              totalAmount: 8750,
+              paidAmount: 8750,
+              billingStatus: 'paid',
+              paymentReference: 'PAY-COMP-2026-2001',
+              paymentMethod: 'Cash',
+              paymentRemarks: 'Completed cashier seed for archived reporting.',
+              receiptNumber: 'OR-COMP-2026-2001',
+              receiptStatus: 'released',
+              feeItems: [
+                { code: 'TUITION', name: 'Tuition Fee', category: 'Tuition', amount: 7000 },
+                { code: 'MISC', name: 'Miscellaneous Fee', category: 'Assessment', amount: 1750 }
+              ]
+            },
+            {
+              studentNo: 'CLINIC-PHR-DEMO-2001',
+              billingCode: 'DSP-2026-0902',
+              totalAmount: 1470,
+              paidAmount: 1470,
+              billingStatus: 'paid',
+              paymentReference: 'PAY-COMP-2026-2002',
+              paymentMethod: 'Cash',
+              paymentRemarks: 'Clinic-origin completed cashier seed for archived reporting.',
+              receiptNumber: 'OR-COMP-2026-2002',
+              receiptStatus: 'released',
+              feeItems: [
+                { code: 'DSP-MED', name: 'Dispense Request', category: 'Pharmacy & Inventory', amount: 1250 },
+                { code: 'DSP-SVC', name: 'Dispensing Service Fee', category: 'Clinic', amount: 220 }
+              ]
+            }
+          ];
+
+          for (const seed of completedSeeds) {
+            const billingRows = (await sql.query(
+              `INSERT INTO billing_records (
+                 student_id, billing_code, semester, school_year, total_amount, paid_amount, balance_amount, billing_status, workflow_stage, remarks, created_at, updated_at
+               )
+               SELECT id, $2, '2nd Semester', '2025-2026', $3, $4, 0, $5, 'completed', $6, NOW() - INTERVAL '3 day', NOW() - INTERVAL '1 day'
+               FROM students
+               WHERE student_no = $1
+               ON CONFLICT (billing_code) DO UPDATE
+               SET total_amount = EXCLUDED.total_amount,
+                   paid_amount = EXCLUDED.paid_amount,
+                   balance_amount = EXCLUDED.balance_amount,
+                   billing_status = EXCLUDED.billing_status,
+                   workflow_stage = EXCLUDED.workflow_stage,
+                   remarks = EXCLUDED.remarks,
+                   updated_at = EXCLUDED.updated_at
+               RETURNING id`,
+              [seed.studentNo, seed.billingCode, seed.totalAmount, seed.paidAmount, seed.billingStatus, seed.paymentRemarks]
+            )) as Array<{ id: number }>;
+
+            const billingId = Number(billingRows[0]?.id || 0);
+            if (!billingId) continue;
+
+            const billingItemRows = (await sql.query(
+              `SELECT COUNT(*)::int AS total FROM billing_items WHERE billing_id = $1`,
+              [billingId]
+            )) as Array<{ total: number }>;
+            if (!Number(billingItemRows[0]?.total || 0)) {
+              for (const [index, fee] of seed.feeItems.entries()) {
+                await sql.query(
+                  `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, NOW() - INTERVAL '3 day')`,
+                  [billingId, fee.code, fee.name, fee.category, fee.amount, index + 1]
+                );
+              }
+            }
+
+            await sql.query(
+              `INSERT INTO payment_transactions (
+                 billing_id, reference_number, amount_paid, payment_method, payment_status, reporting_status, workflow_stage,
+                 payment_date, processed_by, remarks, created_at
+               )
+               VALUES ($1, $2, $3, $4, 'posted', 'archived', 'completed', NOW() - INTERVAL '2 day', NULL, $5, NOW() - INTERVAL '2 day')
+               ON CONFLICT (reference_number) DO UPDATE
+               SET amount_paid = EXCLUDED.amount_paid,
+                   payment_method = EXCLUDED.payment_method,
+                   payment_status = EXCLUDED.payment_status,
+                   reporting_status = EXCLUDED.reporting_status,
+                   workflow_stage = EXCLUDED.workflow_stage,
+                   payment_date = EXCLUDED.payment_date,
+                   remarks = EXCLUDED.remarks`,
+              [billingId, seed.paymentReference, seed.paidAmount, seed.paymentMethod, seed.paymentRemarks]
+            );
+
+            const paymentRows = (await sql.query(
+              `SELECT id FROM payment_transactions WHERE reference_number = $1 LIMIT 1`,
+              [seed.paymentReference]
+            )) as Array<{ id: number }>;
+            const paymentId = Number(paymentRows[0]?.id || 0);
+            if (!paymentId) continue;
+
+            const receiptRows = (await sql.query(
+              `SELECT id FROM receipt_records WHERE payment_id = $1 LIMIT 1`,
+              [paymentId]
+            )) as Array<{ id: number }>;
+
+            if (receiptRows[0]?.id) {
+              await sql.query(
+                `UPDATE receipt_records
+                 SET receipt_number = $2,
+                     issued_date = NOW() - INTERVAL '2 day',
+                     receipt_status = $3,
+                     workflow_stage = 'completed',
+                     remarks = 'Completed transaction seed receipt.'
+                 WHERE id = $1`,
+                [receiptRows[0].id, seed.receiptNumber, seed.receiptStatus]
+              );
+            } else {
+              await sql.query(
+                `INSERT INTO receipt_records (
+                   payment_id, receipt_number, issued_date, receipt_status, workflow_stage, remarks, created_at
+                 )
+                 VALUES ($1, $2, NOW() - INTERVAL '2 day', $3, 'completed', 'Completed transaction seed receipt.', NOW() - INTERVAL '2 day')`,
+                [paymentId, seed.receiptNumber, seed.receiptStatus]
+              );
+            }
+          }
+
+          const demoLogs = [
+            {
+              module: 'process_payment',
+              action: 'Gateway Validation Passed',
+              detail: 'PAY-773942380343-440 was validated and prepared for authorization in Payment Processing & Gateway.',
+              actor: 'Cashier Gateway Officer',
+              entityType: 'payment',
+              entityKey: 'PAY-773942380343-440'
+            },
+            {
+              module: 'process_payment',
+              action: 'Paid Confirmation Routed',
+              detail: 'PAY-COMP-2026-2002 was confirmed as paid and moved to Compliance & Documentation.',
+              actor: 'Cashier Gateway Officer',
+              entityType: 'payment',
+              entityKey: 'PAY-COMP-2026-2002'
+            },
+            {
+              module: 'reports',
+              action: 'Completed Transaction Archived',
+              detail: 'PAY-COMP-2026-2001 was archived into completed transaction history for final reporting.',
+              actor: 'Cashier Reports Analyst',
+              entityType: 'payment',
+              entityKey: 'PAY-COMP-2026-2001'
+            },
+            {
+              module: 'reports',
+              action: 'Official Receipt Released',
+              detail: 'OR-COMP-2026-2002 is available as the official receipt for the archived completed transaction.',
+              actor: 'Compliance Documentation Officer',
+              entityType: 'receipt',
+              entityKey: 'OR-COMP-2026-2002'
+            }
+          ];
+
+          for (const log of demoLogs) {
+            const existing = (await sql.query(
+              `SELECT id
+               FROM module_activity_logs
+               WHERE LOWER(module) = LOWER($1)
+                 AND LOWER(action) = LOWER($2)
+                 AND COALESCE(entity_key, '') = $3
+               LIMIT 1`,
+              [log.module, log.action, log.entityKey]
+            )) as Array<{ id: number }>;
+
+            if (existing.length) continue;
+
+            await insertModuleActivity(log.module, log.action, log.detail, log.actor, log.entityType, log.entityKey, {
+              seeded: true
+            });
+          }
         }
 
         function formatRelativeTime(value: string | Date | null | undefined): string {
@@ -3989,6 +4175,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           }
 
           if (url.pathname === '/api/module-activity' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await ensureCashierWorkflowDemoData();
             await ensureModuleActivityLogsTable(sql);
 
             const moduleFilter = toSafeText(url.searchParams.get('module')).toLowerCase();
@@ -4545,6 +4732,96 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               sourceModule: 'Clinic',
               sourceDepartment: 'Clinic',
               sourceCategory: 'Clinic Booking'
+            };
+          };
+
+          const buildDepartmentServiceMatrix = () => [
+            {
+              department: 'Registrar',
+              incomingToCashier: ['Student and billing info'],
+              outgoingFromCashier: ['Payment status', 'Official receipt records', 'Cleared / Not Cleared status'],
+              usage: 'Enrollment validation and student clearance release'
+            },
+            {
+              department: 'PMED Department',
+              incomingToCashier: ['Financial report requests'],
+              outgoingFromCashier: ['Payment status', 'Official receipt records', 'Cleared / Not Cleared status', 'Financial reports'],
+              usage: 'Financial monitoring, planning, and evaluation'
+            },
+            {
+              department: 'HR Department',
+              incomingToCashier: ['Payroll data'],
+              outgoingFromCashier: ['Payment status', 'Official receipt records', 'Cleared / Not Cleared status'],
+              usage: 'Payroll validation and employee settlement tracking'
+            },
+            {
+              department: 'Admin Reports',
+              incomingToCashier: ['Completed transaction report requests'],
+              outgoingFromCashier: ['Official receipt records', 'Cleared / Not Cleared status', 'Completed transaction reports'],
+              usage: 'Audit, executive dashboards, and institutional reporting'
+            }
+          ];
+
+          const resolveCashierDepartmentTargets = (connectionMeta: {
+            sourceDepartment: string;
+            sourceCategory: string;
+          }) => {
+            const department = String(connectionMeta.sourceDepartment || '').toLowerCase();
+            const category = String(connectionMeta.sourceCategory || '').toLowerCase();
+
+            if (department.includes('clinic')) {
+              return {
+                operationalTargetDepartment: 'Clinic',
+                reportingDepartment: 'PMED Department',
+                reportingArtifact: 'Financial reports'
+              };
+            }
+
+            if (category.includes('payroll') || department.includes('hr')) {
+              return {
+                operationalTargetDepartment: 'HR Department',
+                reportingDepartment: 'Admin Reports',
+                reportingArtifact: 'Payroll financial reports'
+              };
+            }
+
+            return {
+              operationalTargetDepartment: 'Registrar',
+              reportingDepartment: 'Admin Reports',
+              reportingArtifact: 'Completed transaction reports'
+            };
+          };
+
+          const deriveCashierClearance = (paymentStatus: string, receiptStatus: string) => {
+            const normalizedPayment = String(paymentStatus || '').toLowerCase();
+            const normalizedReceipt = String(receiptStatus || '').toLowerCase();
+            const hasSuccessfulPayment = ['paid', 'posted'].includes(normalizedPayment);
+            const hasOfficialReceipt = ['generated', 'verified', 'completed', 'released'].includes(normalizedReceipt);
+
+            if (hasSuccessfulPayment && hasOfficialReceipt) {
+              return {
+                status: 'Cleared',
+                note: 'Payment is settled and an official receipt record is available.'
+              };
+            }
+
+            if (hasSuccessfulPayment) {
+              return {
+                status: 'Not Cleared',
+                note: 'Payment is posted, but the official receipt record is still pending.'
+              };
+            }
+
+            if (['failed', 'cancelled'].includes(normalizedPayment)) {
+              return {
+                status: 'Not Cleared',
+                note: 'The cashier payment did not complete successfully.'
+              };
+            }
+
+            return {
+              status: 'Not Cleared',
+              note: 'Cashier is still processing the payment status for this record.'
             };
           };
 
@@ -5195,6 +5472,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           }
 
           if (url.pathname === '/api/process-payment' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await ensureCashierWorkflowDemoData();
             await ensureClinicBookingsSyncedToCashier();
             const upstreamRows = (await sql.query(
               `SELECT
@@ -5433,6 +5711,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           }
 
           if (url.pathname === '/api/reporting-reconciliation' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await ensureCashierWorkflowDemoData();
             const rows = (await sql.query(
               `SELECT p.id, p.reference_number, p.amount_paid, p.payment_status, p.reporting_status, p.workflow_stage, p.payment_date::text AS payment_date,
                       b.billing_code, COALESCE(s.full_name, 'Unknown Student') AS full_name, COALESCE(s.student_no, '') AS student_no,
@@ -5462,6 +5741,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             }>;
             const mapped = rows.map((row) => {
               const connectionMeta = deriveBillingConnectionMeta(row);
+              const departmentTargets = resolveCashierDepartmentTargets(connectionMeta);
               return {
                 id: Number(row.id),
                 reference: String(row.reference_number || `PAY-${row.id}`),
@@ -5472,6 +5752,8 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 sourceModule: connectionMeta.sourceModule,
                 sourceDepartment: connectionMeta.sourceDepartment,
                 sourceCategory: connectionMeta.sourceCategory,
+                targetDepartment: departmentTargets.reportingDepartment,
+                operationalTargetDepartment: departmentTargets.operationalTargetDepartment,
                 paymentStatus: mapPaymentStatus(String(row.payment_status || '')),
                 documentStatus: mapReceiptStatus(String(row.receipt_status || '')),
                 status: mapReportingStatus(String(row.reporting_status || '')),
@@ -5516,6 +5798,154 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 items,
                 historyItems,
                 activityFeed: pmedRequestAlerts
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/cashier/department-handoffs' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await ensureCashierWorkflowDemoData();
+            const rows = (await sql.query(
+              `SELECT p.id, p.billing_id, p.reference_number, p.amount_paid, p.payment_status, p.reporting_status, p.workflow_stage,
+                      p.payment_date::text AS payment_date, b.billing_code,
+                      COALESCE(s.full_name, 'Unknown Student') AS full_name,
+                      COALESCE(s.student_no, '') AS student_no,
+                      COALESCE(s.email, '') AS student_email,
+                      COALESCE(s.course, '') AS course,
+                      COALESCE(r.receipt_number, '--') AS receipt_number,
+                      COALESCE(r.receipt_status, '') AS receipt_status,
+                      r.issued_date::text AS issued_date
+               FROM payment_transactions p
+               LEFT JOIN billing_records b ON b.id = p.billing_id
+               LEFT JOIN students s ON s.id = b.student_id
+               LEFT JOIN receipt_records r ON r.payment_id = p.id
+               ORDER BY p.payment_date DESC NULLS LAST, p.created_at DESC, p.id DESC
+               LIMIT 120`
+            )) as Array<{
+              id: number;
+              billing_id: number | null;
+              reference_number: string;
+              amount_paid: number;
+              payment_status: string;
+              reporting_status: string;
+              workflow_stage: string;
+              payment_date: string | null;
+              billing_code: string | null;
+              full_name: string;
+              student_no: string;
+              student_email: string;
+              course: string;
+              receipt_number: string;
+              receipt_status: string;
+              issued_date: string | null;
+            }>;
+
+            const items = rows.flatMap((row) => {
+              const connectionMeta = deriveBillingConnectionMeta(row);
+              const departmentTargets = resolveCashierDepartmentTargets(connectionMeta);
+              const paymentStatus = mapPaymentStatus(String(row.payment_status || ''));
+              const receiptStatus = mapReceiptStatus(String(row.receipt_status || ''));
+              const clearance = deriveCashierClearance(String(row.payment_status || ''), String(row.receipt_status || ''));
+              const amountFormatted = formatCurrency(row.amount_paid);
+              const workflowStage = String(row.workflow_stage || 'reporting_reconciliation');
+              const lastUpdatedAt = String(row.issued_date || row.payment_date || '');
+
+              return [
+                {
+                  id: `operational-${row.id}`,
+                  paymentId: Number(row.id),
+                  billingId: Number(row.billing_id || 0),
+                  consumerDepartment: departmentTargets.operationalTargetDepartment,
+                  consumerRole: String(departmentTargets.operationalTargetDepartment || '').toLowerCase().includes('clinic')
+                    ? 'clinic'
+                    : String(departmentTargets.operationalTargetDepartment || '').toLowerCase().includes('hr')
+                      ? 'hr'
+                      : 'registrar',
+                  channelType: 'Operational',
+                  sourceDepartment: connectionMeta.sourceDepartment,
+                  sourceModule: connectionMeta.sourceModule,
+                  sourceCategory: connectionMeta.sourceCategory,
+                  studentName: String(row.full_name || 'Unknown Student'),
+                  studentNumber: String(row.student_no || ''),
+                  billingCode: String(row.billing_code || ''),
+                  paymentReference: String(row.reference_number || `PAY-${row.id}`),
+                  amount: Number(row.amount_paid || 0),
+                  amountFormatted,
+                  paymentStatus,
+                  receiptNumber: String(row.receipt_number || 'Pending Receipt'),
+                  receiptStatus,
+                  clearanceStatus: clearance.status,
+                  clearanceNote: clearance.note,
+                  handoffStatus: clearance.status === 'Cleared' ? 'ready' : 'pending',
+                  handoffReference: '',
+                  requestReference: '',
+                  outputs: ['Payment status', 'Official receipt records', 'Cleared / Not Cleared status'],
+                  workflowStage,
+                  workflowStageLabel: workflowLabel(workflowStage),
+                  integrationSummary: `${connectionMeta.sourceDepartment} sends cashier records to ${departmentTargets.operationalTargetDepartment}.`,
+                  lastUpdatedAt,
+                  lastUpdatedLabel: lastUpdatedAt ? formatDateTimeLabel(lastUpdatedAt) : '--'
+                },
+                {
+                  id: `reporting-${row.id}`,
+                  paymentId: Number(row.id),
+                  billingId: Number(row.billing_id || 0),
+                  consumerDepartment: departmentTargets.reportingDepartment,
+                  consumerRole: String(departmentTargets.reportingDepartment || '').toLowerCase().includes('pmed')
+                    ? 'pmed'
+                    : String(departmentTargets.reportingDepartment || '').toLowerCase().includes('admin')
+                      ? 'admin'
+                      : 'cashier',
+                  channelType: 'Reporting',
+                  sourceDepartment: connectionMeta.sourceDepartment,
+                  sourceModule: connectionMeta.sourceModule,
+                  sourceCategory: connectionMeta.sourceCategory,
+                  studentName: String(row.full_name || 'Unknown Student'),
+                  studentNumber: String(row.student_no || ''),
+                  billingCode: String(row.billing_code || ''),
+                  paymentReference: String(row.reference_number || `PAY-${row.id}`),
+                  amount: Number(row.amount_paid || 0),
+                  amountFormatted,
+                  paymentStatus,
+                  receiptNumber: String(row.receipt_number || 'Pending Receipt'),
+                  receiptStatus,
+                  clearanceStatus: clearance.status,
+                  clearanceNote: clearance.note,
+                  handoffStatus:
+                    String(row.reporting_status || '').toLowerCase() === 'reported'
+                      ? 'sent'
+                      : String(row.reporting_status || '').toLowerCase() === 'reconciled'
+                        ? 'ready'
+                        : 'pending',
+                  handoffReference: '',
+                  requestReference: '',
+                  outputs: ['Payment status', 'Official receipt records', 'Cleared / Not Cleared status', departmentTargets.reportingArtifact],
+                  workflowStage,
+                  workflowStageLabel: workflowLabel(workflowStage),
+                  integrationSummary: `${connectionMeta.sourceDepartment} cashier reporting is routed to ${departmentTargets.reportingDepartment}.`,
+                  lastUpdatedAt,
+                  lastUpdatedLabel: lastUpdatedAt ? formatDateTimeLabel(lastUpdatedAt) : '--'
+                }
+              ];
+            });
+
+            const latestItems = items
+              .slice()
+              .sort((left, right) => new Date(String(right.lastUpdatedAt || '')).getTime() - new Date(String(left.lastUpdatedAt || '')).getTime())
+              .slice(0, 8);
+
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                stats: [
+                  { title: 'Registrar Linked', value: String(items.filter((item) => item.consumerDepartment === 'Registrar').length), subtitle: 'Cashier records ready for registrar visibility', icon: 'mdi-school-outline', tone: 'blue' },
+                  { title: 'PMED / Admin', value: String(items.filter((item) => ['PMED Department', 'Admin Reports'].includes(String(item.consumerDepartment || ''))).length), subtitle: 'Reporting-facing records for PMED and admin reports', icon: 'mdi-domain', tone: 'purple' },
+                  { title: 'Cleared', value: String(items.filter((item) => item.channelType === 'Operational' && item.clearanceStatus === 'Cleared').length), subtitle: 'Payment and official receipt already complete', icon: 'mdi-check-decagram-outline', tone: 'green' },
+                  { title: 'Not Cleared', value: String(items.filter((item) => item.channelType === 'Operational' && item.clearanceStatus !== 'Cleared').length), subtitle: 'Records still waiting on payment or receipt completion', icon: 'mdi-alert-circle-outline', tone: 'orange' }
+                ],
+                matrix: buildDepartmentServiceMatrix(),
+                items,
+                latestItems
               }
             });
             return;
@@ -5894,6 +6324,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           }
 
           if (url.pathname === '/api/reports/transactions' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await ensureCashierWorkflowDemoData();
             const search = String(url.searchParams.get('search') || '').trim().toLowerCase();
             const statusFilter = String(url.searchParams.get('status') || '').trim().toLowerCase();
             const departmentFilter = String(url.searchParams.get('department') || '').trim().toLowerCase();
@@ -5935,6 +6366,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
 
             const mapped = items.map((row) => {
               const connectionMeta = deriveBillingConnectionMeta(row);
+              const departmentTargets = resolveCashierDepartmentTargets(connectionMeta);
               return {
                 id: Number(row.id),
                 referenceNumber: String(row.reference_number || `PAY-${row.id}`),
@@ -5944,6 +6376,8 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 sourceModule: connectionMeta.sourceModule,
                 sourceDepartment: connectionMeta.sourceDepartment,
                 sourceCategory: connectionMeta.sourceCategory,
+                targetDepartment: departmentTargets.reportingDepartment,
+                operationalTargetDepartment: departmentTargets.operationalTargetDepartment,
                 amount: Number(row.amount_paid || 0),
                 amountFormatted: formatCurrency(row.amount_paid),
                 paymentMethod: String(row.payment_method || 'Online'),
@@ -5961,7 +6395,12 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
 
             const filtered = completedOnly.filter((item) => {
               if (statusFilter && String(item.reportingStatus || '').toLowerCase() !== statusFilter) return false;
-              if (departmentFilter && String(item.sourceDepartment || '').toLowerCase() !== departmentFilter) return false;
+              if (
+                departmentFilter &&
+                ![item.sourceDepartment, item.targetDepartment, item.operationalTargetDepartment]
+                  .filter(Boolean)
+                  .some((value) => String(value).toLowerCase() === departmentFilter)
+              ) return false;
               if (categoryFilter && String(item.sourceCategory || '').toLowerCase() !== categoryFilter) return false;
               if (paymentMethodFilter && !String(item.paymentMethod || '').toLowerCase().includes(paymentMethodFilter)) return false;
               if (workflowStageFilter && String(item.workflowStage || '').toLowerCase() !== workflowStageFilter) return false;
@@ -5969,7 +6408,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               if (dateTo && String(item.createdAt || '').slice(0, 10) > dateTo) return false;
               if (search) {
                 const haystack =
-                  `${item.referenceNumber} ${item.studentName} ${item.billingCode} ${item.receiptNumber} ${item.paymentStatus} ${item.reportingStatus} ${item.sourceDepartment} ${item.sourceCategory}`.toLowerCase();
+                  `${item.referenceNumber} ${item.studentName} ${item.billingCode} ${item.receiptNumber} ${item.paymentStatus} ${item.reportingStatus} ${item.sourceDepartment} ${item.targetDepartment || ''} ${item.operationalTargetDepartment || ''} ${item.sourceCategory}`.toLowerCase();
                 if (!haystack.includes(search)) return false;
               }
               return true;

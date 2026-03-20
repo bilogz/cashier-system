@@ -27,6 +27,18 @@ export type ReportingItem = {
   workflowStage: string;
   workflowStageLabel: string;
   postedAt: string;
+  targetDepartment?: string;
+  operationalTargetDepartment?: string;
+  incomingArtifact?: string;
+  handoffArtifact?: string;
+  reportingArtifact?: string;
+  departmentFlow?: string;
+  operationalFlow?: string;
+  integrationSummary?: string;
+  operationalHandoffStatus?: string;
+  handoffStatus?: string;
+  handoffReference?: string;
+  requestReference?: string;
   allocationSummary?: string;
   allocations?: Array<{
     feeType: string;
@@ -87,6 +99,18 @@ type ReportingTransactionsApiRow = {
   workflowStage: string;
   workflowStageLabel: string;
   createdAt: string;
+  targetDepartment?: string;
+  operationalTargetDepartment?: string;
+  incomingArtifact?: string;
+  handoffArtifact?: string;
+  reportingArtifact?: string;
+  departmentFlow?: string;
+  operationalFlow?: string;
+  integrationSummary?: string;
+  operationalHandoffStatus?: string;
+  handoffStatus?: string;
+  handoffReference?: string;
+  requestReference?: string;
   allocationSummary?: string;
   allocations?: Array<{
     feeType: string;
@@ -134,6 +158,18 @@ function mapReportingItem(item: ReportingTransactionsApiRow): ReportingItem {
     workflowStage: item.workflowStage,
     workflowStageLabel: item.workflowStageLabel,
     postedAt: item.createdAt,
+    targetDepartment: item.targetDepartment,
+    operationalTargetDepartment: item.operationalTargetDepartment,
+    incomingArtifact: item.incomingArtifact,
+    handoffArtifact: item.handoffArtifact,
+    reportingArtifact: item.reportingArtifact,
+    departmentFlow: item.departmentFlow,
+    operationalFlow: item.operationalFlow,
+    integrationSummary: item.integrationSummary,
+    operationalHandoffStatus: item.operationalHandoffStatus,
+    handoffStatus: item.handoffStatus,
+    handoffReference: item.handoffReference,
+    requestReference: item.requestReference,
     allocationSummary: item.allocationSummary,
     allocations: item.allocations
   };

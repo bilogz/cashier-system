@@ -204,12 +204,14 @@ export async function reportReconciliationRecord(payload: {
   paymentId: number;
   remarks: string;
   requestReference?: string;
+  targetDepartment?: string;
 }): Promise<CrudWorkflowResponse> {
   return await postAction<CrudWorkflowResponse>('reporting-reconciliation', {
     paymentId: payload.paymentId,
     action: 'report',
     remarks: payload.remarks,
-    requestReference: payload.requestReference
+    requestReference: payload.requestReference,
+    targetDepartment: payload.targetDepartment
   });
 }
 

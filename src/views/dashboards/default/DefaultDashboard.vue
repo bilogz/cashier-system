@@ -27,6 +27,11 @@ import {
   type DashboardAlertItem,
   type DashboardChartsSnapshot
 } from '@/services/bpaDashboard';
+import {
+  fetchCashierDepartmentHandoffs,
+  type CashierDepartmentHandoffItem,
+  type CashierDepartmentHandoffSnapshot
+} from '@/services/cashierDepartmentHandoffs';
 
 const router = useRouter();
 const summaryCards = ref<BpaDashboardSnapshot['summaryCards']>([]);
@@ -38,6 +43,9 @@ const chartData = ref<DashboardChartsSnapshot>({
   dailyCollection: [],
   paymentStatusBreakdown: []
 });
+const departmentStats = ref<CashierDepartmentHandoffSnapshot['stats']>([]);
+const departmentMatrix = ref<CashierDepartmentHandoffSnapshot['matrix']>([]);
+const departmentLatestItems = ref<CashierDepartmentHandoffItem[]>([]);
 
 const dashboardIconMap: Record<string, string> = {
   'mdi-arrow-right-thick': mdiArrowRightThick,
@@ -99,12 +107,30 @@ function alertColor(severity: string): string {
   return 'primary';
 }
 
+function clearanceColor(status: string): string {
+  return status === 'Cleared' ? 'success' : 'warning';
+}
+
+function handoffColor(status: string): string {
+  const normalized = status.toLowerCase();
+  if (normalized === 'sent') return 'success';
+  if (normalized === 'ready') return 'info';
+  return 'secondary';
+}
+
+function handoffLabel(status: string): string {
+  const normalized = status.trim().toLowerCase();
+  if (!normalized) return 'Pending';
+  return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
 async function loadSnapshot() {
-  const [snapshot, activities, alerts, charts] = await Promise.all([
+  const [snapshot, activities, alerts, charts, handoffs] = await Promise.all([
     fetchBpaDashboardSnapshot(),
     fetchDashboardRecentActivities(),
     fetchDashboardAlerts(),
-    fetchDashboardCharts()
+    fetchDashboardCharts(),
+    fetchCashierDepartmentHandoffs()
   ]);
   summaryCards.value = snapshot.summaryCards;
   moduleCards.value = snapshot.moduleCards;
@@ -112,6 +138,9 @@ async function loadSnapshot() {
   recentActivities.value = activities.items || [];
   dashboardAlerts.value = alerts.items || [];
   chartData.value = charts;
+  departmentStats.value = handoffs.stats;
+  departmentMatrix.value = handoffs.matrix;
+  departmentLatestItems.value = handoffs.latestItems;
 }
 
 const collectionChartSeries = computed(() => [
@@ -303,6 +332,73 @@ onMounted(() => {
           <v-btn class="mt-4" color="primary" variant="tonal" size="small" @click="router.push(module.actionTo)">
             {{ module.actionLabel }}
           </v-btn>
+        </v-card-text>
+      </v-card>
+    </v-col>
+
+    <v-col cols="12" lg="5">
+      <v-card variant="outlined" class="h-100">
+        <v-card-item>
+          <v-card-title>Department Handoff Matrix</v-card-title>
+          <v-card-subtitle>Cashier intake and delivery contract for Registrar, PMED, HR, and Admin Reports</v-card-subtitle>
+        </v-card-item>
+        <v-card-text class="pt-2">
+          <div class="department-matrix-grid">
+            <div v-for="item in departmentMatrix" :key="item.department" class="department-matrix-card">
+              <div class="font-weight-bold">{{ item.department }}</div>
+              <div class="text-body-2 text-medium-emphasis mt-1">{{ item.usage }}</div>
+              <div class="department-flow-line mt-3">
+                <div class="department-flow-label">Into Cashier</div>
+                <div class="department-flow-copy">{{ item.incomingToCashier.join(' | ') }}</div>
+              </div>
+              <div class="department-flow-line mt-3">
+                <div class="department-flow-label">From Cashier</div>
+                <div class="department-flow-copy">{{ item.outgoingFromCashier.join(' | ') }}</div>
+              </div>
+            </div>
+          </div>
+        </v-card-text>
+      </v-card>
+    </v-col>
+
+    <v-col cols="12" lg="7">
+      <v-card variant="outlined" class="h-100">
+        <v-card-item>
+          <v-card-title>Live Department-Ready Records</v-card-title>
+          <v-card-subtitle>Real cashier outputs built from payment status, official receipts, and clearance state</v-card-subtitle>
+        </v-card-item>
+        <v-card-text class="pt-2">
+          <v-row class="mb-1">
+            <v-col v-for="card in departmentStats" :key="card.title" cols="12" sm="6">
+              <CashierAnalyticsCard :title="card.title" :value="card.value" :subtitle="card.subtitle" :icon="card.icon" :tone="card.tone" />
+            </v-col>
+          </v-row>
+
+          <div v-if="departmentLatestItems.length" class="department-live-grid mt-2">
+            <div v-for="item in departmentLatestItems" :key="item.id" class="department-live-card">
+              <div class="d-flex flex-wrap align-center justify-space-between ga-3">
+                <div>
+                  <div class="font-weight-bold">{{ item.consumerDepartment }} · {{ item.channelType }}</div>
+                  <div class="text-body-2 text-medium-emphasis">
+                    {{ item.paymentReference }} | {{ item.studentName }} | {{ item.billingCode }}
+                  </div>
+                </div>
+                <v-chip size="small" :color="clearanceColor(item.clearanceStatus)" variant="tonal">{{ item.clearanceStatus }}</v-chip>
+              </div>
+              <div class="department-live-meta mt-3">
+                <div>{{ item.paymentStatus }} | {{ item.receiptNumber }} | {{ item.receiptStatus }}</div>
+                <div>{{ item.amountFormatted }} | {{ item.workflowStageLabel }}</div>
+              </div>
+              <div class="department-live-meta text-medium-emphasis mt-2">{{ item.clearanceNote }}</div>
+              <div class="d-flex flex-wrap align-center ga-2 mt-3">
+                <v-chip size="x-small" :color="handoffColor(item.handoffStatus)" variant="tonal">{{ handoffLabel(item.handoffStatus) }}</v-chip>
+                <v-chip v-for="output in item.outputs" :key="`${item.id}-${output}`" size="x-small" color="primary" variant="outlined">
+                  {{ output }}
+                </v-chip>
+              </div>
+            </div>
+          </div>
+          <div v-else class="text-body-2 text-medium-emphasis py-8 text-center">No department-ready cashier records yet.</div>
         </v-card-text>
       </v-card>
     </v-col>
@@ -540,7 +636,9 @@ onMounted(() => {
 }
 
 .integration-grid,
-.database-grid {
+.database-grid,
+.department-matrix-grid,
+.department-live-grid {
   display: grid;
   gap: 14px;
 }
@@ -564,8 +662,15 @@ onMounted(() => {
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
 }
 
+.department-matrix-grid,
+.department-live-grid {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
 .integration-card,
-.database-card {
+.database-card,
+.department-matrix-card,
+.department-live-card {
   border-radius: 16px;
   padding: 16px;
   background: #fbf7f1;
@@ -578,6 +683,25 @@ onMounted(() => {
   min-height: 64px;
   font-weight: 600;
   color: #3f3326;
+}
+
+.department-flow-line {
+  display: grid;
+  gap: 4px;
+}
+
+.department-flow-label {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #73809b;
+  font-weight: 700;
+}
+
+.department-flow-copy,
+.department-live-meta {
+  font-size: 13px;
+  color: rgba(44, 62, 80, 0.78);
 }
 
 .database-code {

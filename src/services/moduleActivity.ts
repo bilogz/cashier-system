@@ -26,9 +26,13 @@ function trimTrailingSlashes(value: string): string {
   return value.replace(/\/+$/, '');
 }
 
-function resolveApiUrl(): string {
+function resolveConfiguredApiUrl(): string {
   const configured = import.meta.env.VITE_BACKEND_API_BASE_URL?.trim();
   if (configured) return `${trimTrailingSlashes(configured)}/module-activity`;
+  return '/api/module-activity';
+}
+
+function resolveLocalApiUrl(): string {
   return '/api/module-activity';
 }
 
@@ -46,6 +50,23 @@ export async function fetchModuleActivity(query: {
   if (query.page && query.page > 0) params.set('page', String(query.page));
   if (query.perPage && query.perPage > 0) params.set('per_page', String(query.perPage));
 
-  const url = `${resolveApiUrl()}${params.toString() ? `?${params.toString()}` : ''}`;
-  return await fetchApiData<ModuleActivityPayload>(url, { ttlMs: 8_000 });
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const configuredUrl = `${resolveConfiguredApiUrl()}${suffix}`;
+
+  try {
+    return await fetchApiData<ModuleActivityPayload>(configuredUrl, { ttlMs: 8_000 });
+  } catch (error) {
+    const configured = import.meta.env.VITE_BACKEND_API_BASE_URL?.trim();
+    const message = error instanceof Error ? error.message : String(error);
+    const shouldRetryLocally =
+      Boolean(configured) &&
+      /authentication required|admin authentication required|html instead of json/i.test(message);
+
+    if (!shouldRetryLocally) throw error;
+
+    return await fetchApiData<ModuleActivityPayload>(`${resolveLocalApiUrl()}${suffix}`, {
+      ttlMs: 8_000,
+      forceRefresh: true
+    });
+  }
 }

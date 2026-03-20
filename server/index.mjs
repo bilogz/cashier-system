@@ -377,6 +377,306 @@ const WORKFLOW_STAGE_LABELS = {
   [WORKFLOW_STAGES.CANCELLED]: 'Cancelled'
 };
 
+const CASHIER_INTEGRATION_PROFILES = {
+  registrar_enrollment: {
+    key: 'registrar_enrollment',
+    sourceModule: 'Registrar',
+    sourceDepartment: 'Registrar',
+    sourceCategory: 'Enrollment & Payment',
+    originArtifacts: ['Student and billing info'],
+    operationalArtifact: 'Payment status, official receipt records, and cleared / not cleared status',
+    operationalTargetDepartment: 'Registrar',
+    reportingDepartment: 'PMED Department',
+    reportingArtifact: 'Financial reports and cashier summaries',
+    recipientRole: 'registrar',
+    outcome: 'Enrollment validation'
+  },
+  hr_payroll: {
+    key: 'hr_payroll',
+    sourceModule: 'HR',
+    sourceDepartment: 'HR Department',
+    sourceCategory: 'Payroll',
+    originArtifacts: ['Payroll data'],
+    operationalArtifact: 'Payment status, official receipt records, and cleared / not cleared status',
+    operationalTargetDepartment: 'HR Department',
+    reportingDepartment: 'Admin Reports',
+    reportingArtifact: 'Payroll financial reports',
+    recipientRole: 'hr',
+    outcome: 'Employee salary processing'
+  },
+  clinic_medical: {
+    key: 'clinic_medical',
+    sourceModule: 'Clinic',
+    sourceDepartment: 'Clinic',
+    sourceCategory: 'Medical Fees',
+    originArtifacts: ['Medical fee assessment', 'Service charges'],
+    operationalArtifact: 'Payment confirmation (medical fees)',
+    operationalTargetDepartment: 'Clinic',
+    reportingDepartment: 'PMED Department',
+    reportingArtifact: 'Financial reports',
+    recipientRole: 'clinic',
+    outcome: 'Medical clearance release'
+  },
+  pmed_reporting: {
+    key: 'pmed_reporting',
+    sourceModule: 'PMED',
+    sourceDepartment: 'PMED Department',
+    sourceCategory: 'Financial Reporting',
+    originArtifacts: ['Financial report requests'],
+    operationalArtifact: 'Financial reports',
+    operationalTargetDepartment: 'PMED Department',
+    reportingDepartment: 'PMED Department',
+    reportingArtifact: 'Financial reports',
+    recipientRole: 'pmed',
+    outcome: 'Planning, evaluation, and reporting'
+  },
+  admin_reporting: {
+    key: 'admin_reporting',
+    sourceModule: 'Admin Reports',
+    sourceDepartment: 'Admin Reports',
+    sourceCategory: 'Institutional Reporting',
+    originArtifacts: ['Completed transaction report requests'],
+    operationalArtifact: 'Official receipt records and cleared / not cleared status',
+    operationalTargetDepartment: 'Admin Reports',
+    reportingDepartment: 'Admin Reports',
+    reportingArtifact: 'Completed transaction reports',
+    recipientRole: 'admin',
+    outcome: 'Audit, compliance, and executive reporting'
+  },
+  crad_activity: {
+    key: 'crad_activity',
+    sourceModule: 'CRAD',
+    sourceDepartment: 'CRAD Department',
+    sourceCategory: 'Activity Fees',
+    originArtifacts: ['Activity fee list'],
+    operationalArtifact: 'Payment confirmation',
+    operationalTargetDepartment: 'CRAD Department',
+    reportingDepartment: 'PMED Department',
+    reportingArtifact: 'Financial reports',
+    recipientRole: 'crad',
+    outcome: 'Activity fee clearance'
+  },
+  computer_lab: {
+    key: 'computer_lab',
+    sourceModule: 'Computer Laboratory',
+    sourceDepartment: 'Computer Laboratory',
+    sourceCategory: 'Laboratory Usage Fees',
+    originArtifacts: ['Lab usage fees'],
+    operationalArtifact: 'Payment confirmation',
+    operationalTargetDepartment: 'Computer Laboratory',
+    reportingDepartment: 'PMED Department',
+    reportingArtifact: 'Financial reports',
+    recipientRole: 'computer_lab',
+    outcome: 'Laboratory usage release'
+  },
+  prefect_fines: {
+    key: 'prefect_fines',
+    sourceModule: 'Prefect',
+    sourceDepartment: 'Prefect Office',
+    sourceCategory: 'Penalties & Fines',
+    originArtifacts: ['Violation fines'],
+    operationalArtifact: 'Payment confirmation',
+    operationalTargetDepartment: 'Prefect Office',
+    reportingDepartment: 'PMED Department',
+    reportingArtifact: 'Financial reports',
+    recipientRole: 'prefect',
+    outcome: 'Fine settlement release'
+  }
+};
+
+function cleanTextValue(value) {
+  return String(value || '').trim();
+}
+
+function compactIntegrationText(parts = []) {
+  return parts
+    .flat()
+    .map((value) => cleanTextValue(value))
+    .filter(Boolean)
+    .join(' | ')
+    .toLowerCase();
+}
+
+function resolveCashierIntegrationProfile(input = {}) {
+  const billingCode = cleanTextValue(input.billingCode);
+  const feeItems = Array.isArray(input.feeItems) ? input.feeItems : [];
+  const explicitKey = cleanTextValue(input.integrationProfile);
+  let profileKey = Object.prototype.hasOwnProperty.call(CASHIER_INTEGRATION_PROFILES, explicitKey)
+    ? explicitKey
+    : 'registrar_enrollment';
+
+  if (!Object.prototype.hasOwnProperty.call(CASHIER_INTEGRATION_PROFILES, explicitKey)) {
+    const text = compactIntegrationText([
+      input.sourceModule,
+      input.sourceDepartment,
+      input.sourceCategory,
+      input.targetDepartment,
+      billingCode,
+      feeItems.map((item) => [item.category, item.feeType, item.feeName, item.item_name, item.item_code, item.feeCode])
+    ]);
+
+    if (/(^|\W)(pmed|planning|evaluation|financial report|report request)(\W|$)/i.test(text)) profileKey = 'pmed_reporting';
+    else if (/(^|\W)(admin report|admin reports|audit report|executive report|institutional report)(\W|$)/i.test(text)) profileKey = 'admin_reporting';
+    else if (/(^|\W)(hr|human resource|payroll|salary|allowance|wage|disbursement)(\W|$)/i.test(text)) profileKey = 'hr_payroll';
+    else if (/(^|\W)(clinic|medical|checkup|consult|clearance|service charge|laboratory service|health)(\W|$)/i.test(text)) profileKey = 'clinic_medical';
+    else if (/(^|\W)(crad|activity|program fee|event fee)(\W|$)/i.test(text)) profileKey = 'crad_activity';
+    else if (/(^|\W)(computer lab|computer laboratory|lab usage|laboratory usage)(\W|$)/i.test(text)) profileKey = 'computer_lab';
+    else if (/(^|\W)(prefect|fine|penalty|violation|discipline)(\W|$)/i.test(text)) profileKey = 'prefect_fines';
+    else profileKey = 'registrar_enrollment';
+  }
+
+  const profile = CASHIER_INTEGRATION_PROFILES[profileKey] || CASHIER_INTEGRATION_PROFILES.registrar_enrollment;
+  const sourceModule = cleanTextValue(input.sourceModule) || profile.sourceModule;
+  const sourceDepartment = cleanTextValue(input.sourceDepartment) || profile.sourceDepartment;
+  const sourceCategory = cleanTextValue(input.sourceCategory) || profile.sourceCategory;
+  const operationalTargetDepartment = cleanTextValue(input.targetDepartment) || profile.operationalTargetDepartment;
+  const incomingArtifact = profile.originArtifacts.join(' + ');
+  const operationalFlow = `${sourceDepartment} -> Cashier -> ${operationalTargetDepartment}`;
+  const departmentFlow = `${sourceDepartment} -> Cashier -> ${profile.reportingDepartment}`;
+
+  return {
+    integrationProfile: profile.key,
+    sourceModule,
+    sourceDepartment,
+    sourceCategory,
+    operationalTargetDepartment,
+    reportingDepartment: profile.reportingDepartment,
+    incomingArtifact,
+    operationalArtifact: profile.operationalArtifact,
+    reportingArtifact: profile.reportingArtifact,
+    operationalFlow,
+    departmentFlow,
+    integrationSummary: `${incomingArtifact} enters Cashier, ${profile.operationalArtifact.toLowerCase()} goes to ${operationalTargetDepartment}, and ${profile.reportingArtifact.toLowerCase()} goes to ${profile.reportingDepartment}.`,
+    recipientRole: profile.recipientRole,
+    outcome: profile.outcome
+  };
+}
+
+function departmentShortCode(value) {
+  const normalized = cleanTextValue(value).toLowerCase();
+  if (normalized.includes('pmed')) return 'PMED';
+  if (normalized.includes('registrar')) return 'REG';
+  if (normalized.includes('hr')) return 'HR';
+  if (normalized.includes('admin')) return 'ADMN';
+  if (normalized.includes('clinic')) return 'CLIN';
+  if (normalized.includes('crad')) return 'CRAD';
+  if (normalized.includes('computer')) return 'LAB';
+  if (normalized.includes('prefect')) return 'PREF';
+  if (normalized.includes('cashier')) return 'CASH';
+  return cleanTextValue(value).replace(/[^A-Za-z0-9]/g, '').slice(0, 4).toUpperCase() || 'DEPT';
+}
+
+function resolveDepartmentRecipientRole(value) {
+  const normalized = cleanTextValue(value).toLowerCase();
+  if (normalized.includes('pmed')) return 'pmed';
+  if (normalized.includes('registrar')) return 'registrar';
+  if (normalized.includes('hr')) return 'hr';
+  if (normalized.includes('admin')) return 'admin';
+  if (normalized.includes('clinic')) return 'clinic';
+  if (normalized.includes('crad')) return 'crad';
+  if (normalized.includes('computer')) return 'computer_lab';
+  if (normalized.includes('prefect')) return 'prefect';
+  if (normalized.includes('cashier')) return 'cashier';
+  return resolveCashierIntegrationProfile({ sourceDepartment: value }).recipientRole;
+}
+
+function nextDepartmentHandoffReference(targetDepartment, paymentId) {
+  return `${departmentShortCode(targetDepartment)}-${new Date().getFullYear()}-${String(paymentId).padStart(5, '0')}`;
+}
+
+function buildDepartmentFlowGraph() {
+  const edges = [
+    { from: 'Registrar', to: 'Cashier', artifact: 'Student and billing info' },
+    { from: 'Cashier', to: 'Registrar', artifact: 'Payment status' },
+    { from: 'Cashier', to: 'Registrar', artifact: 'Official receipt records' },
+    { from: 'Cashier', to: 'Registrar', artifact: 'Cleared / Not Cleared status' },
+    { from: 'HR Department', to: 'Cashier', artifact: 'Payroll data' },
+    { from: 'Cashier', to: 'HR Department', artifact: 'Payment status' },
+    { from: 'Cashier', to: 'HR Department', artifact: 'Official receipt records' },
+    { from: 'Cashier', to: 'HR Department', artifact: 'Cleared / Not Cleared status' },
+    { from: 'Clinic', to: 'Cashier', artifact: 'Medical fee assessment' },
+    { from: 'Clinic', to: 'Cashier', artifact: 'Service charges' },
+    { from: 'Cashier', to: 'Clinic', artifact: 'Payment confirmation (medical fees)' },
+    { from: 'PMED Department', to: 'Cashier', artifact: 'Financial report requests' },
+    { from: 'Cashier', to: 'PMED Department', artifact: 'Payment status' },
+    { from: 'Cashier', to: 'PMED Department', artifact: 'Official receipt records' },
+    { from: 'Cashier', to: 'PMED Department', artifact: 'Cleared / Not Cleared status' },
+    { from: 'Cashier', to: 'PMED Department', artifact: 'Financial reports' },
+    { from: 'Computer Laboratory', to: 'Cashier', artifact: 'Lab fee assessment' },
+    { from: 'Cashier', to: 'Computer Laboratory', artifact: 'Payment confirmation' },
+    { from: 'Cashier', to: 'Admin Reports', artifact: 'Official receipt records' },
+    { from: 'Cashier', to: 'Admin Reports', artifact: 'Cleared / Not Cleared status' },
+    { from: 'Cashier', to: 'Admin Reports', artifact: 'Completed transaction reports' }
+  ];
+
+  return {
+    nodes: Array.from(new Set(edges.flatMap((edge) => [edge.from, edge.to]))),
+    edges
+  };
+}
+
+function buildDepartmentServiceMatrix() {
+  return [
+    {
+      department: 'Registrar',
+      incomingToCashier: ['Student and billing info'],
+      outgoingFromCashier: ['Payment status', 'Official receipt records', 'Cleared / Not Cleared status'],
+      usage: 'Enrollment validation and student clearance release'
+    },
+    {
+      department: 'PMED Department',
+      incomingToCashier: ['Financial report requests'],
+      outgoingFromCashier: ['Payment status', 'Official receipt records', 'Cleared / Not Cleared status', 'Financial reports'],
+      usage: 'Financial monitoring, planning, and evaluation'
+    },
+    {
+      department: 'HR Department',
+      incomingToCashier: ['Payroll data'],
+      outgoingFromCashier: ['Payment status', 'Official receipt records', 'Cleared / Not Cleared status'],
+      usage: 'Payroll validation and employee settlement tracking'
+    },
+    {
+      department: 'Admin Reports',
+      incomingToCashier: ['Completed transaction report requests'],
+      outgoingFromCashier: ['Official receipt records', 'Cleared / Not Cleared status', 'Completed transaction reports'],
+      usage: 'Audit, executive dashboards, and institutional reporting'
+    }
+  ];
+}
+
+function deriveCashierClearance(paymentStatus, receiptStatus) {
+  const normalizedPayment = String(paymentStatus || '').toLowerCase();
+  const normalizedReceipt = String(receiptStatus || '').toLowerCase();
+  const hasSuccessfulPayment = ['paid', 'posted'].includes(normalizedPayment);
+  const hasOfficialReceipt = ['generated', 'verified', 'completed', 'released'].includes(normalizedReceipt);
+
+  if (hasSuccessfulPayment && hasOfficialReceipt) {
+    return {
+      status: 'Cleared',
+      note: 'Payment is settled and an official receipt record is available.'
+    };
+  }
+
+  if (hasSuccessfulPayment) {
+    return {
+      status: 'Not Cleared',
+      note: 'Payment is posted, but the official receipt record is still pending.'
+    };
+  }
+
+  if (['failed', 'cancelled'].includes(normalizedPayment)) {
+    return {
+      status: 'Not Cleared',
+      note: 'The cashier payment did not complete successfully.'
+    };
+  }
+
+  return {
+    status: 'Not Cleared',
+    note: 'Cashier is still processing the payment status for this record.'
+  };
+}
+
 function normalizeWorkflowStage(value, fallback = WORKFLOW_STAGES.STUDENT_PORTAL_BILLING) {
   const raw = String(value || '').trim().toLowerCase();
   if (WORKFLOW_STAGE_LABELS[raw]) return raw;
@@ -632,6 +932,11 @@ async function ensureSchema() {
       id SERIAL PRIMARY KEY,
       student_id INT NOT NULL,
       billing_code VARCHAR(50) NOT NULL UNIQUE,
+      source_module VARCHAR(120) DEFAULT 'Registrar',
+      source_department VARCHAR(120) DEFAULT 'Registrar',
+      source_category VARCHAR(120) DEFAULT 'Enrollment & Payment',
+      integration_profile VARCHAR(120) DEFAULT 'registrar_enrollment',
+      target_department VARCHAR(120) DEFAULT 'Registrar',
       semester VARCHAR(50) NOT NULL,
       school_year VARCHAR(20) NOT NULL,
       total_amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
@@ -777,6 +1082,12 @@ async function ensureSchema() {
       status VARCHAR(30) NOT NULL DEFAULT 'pending_review',
       workflow_stage VARCHAR(60) NOT NULL DEFAULT 'reporting_reconciliation',
       discrepancy_note TEXT DEFAULT NULL,
+      handoff_department VARCHAR(120) DEFAULT NULL,
+      handoff_artifact VARCHAR(190) DEFAULT NULL,
+      handoff_reference VARCHAR(120) DEFAULT NULL,
+      handoff_status VARCHAR(40) NOT NULL DEFAULT 'pending',
+      request_reference VARCHAR(120) DEFAULT NULL,
+      handoff_notes TEXT DEFAULT NULL,
       reconciled_by INT DEFAULT NULL,
       reconciled_at TIMESTAMP DEFAULT NULL,
       reported_at TIMESTAMP DEFAULT NULL,
@@ -855,6 +1166,11 @@ async function ensureSchema() {
 
   await pool.query(`ALTER TABLE receipt_records ADD COLUMN IF NOT EXISTS receipt_status VARCHAR(30) NOT NULL DEFAULT 'queued'`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(60) NOT NULL DEFAULT 'student_portal_billing'`);
+  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS source_module VARCHAR(120) DEFAULT 'Registrar'`);
+  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS source_department VARCHAR(120) DEFAULT 'Registrar'`);
+  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS source_category VARCHAR(120) DEFAULT 'Enrollment & Payment'`);
+  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS integration_profile VARCHAR(120) DEFAULT 'registrar_enrollment'`);
+  await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS target_department VARCHAR(120) DEFAULT 'Registrar'`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS correction_reason VARCHAR(190) NULL`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS correction_notes TEXT NULL`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS previous_workflow_stage VARCHAR(60) NULL`);
@@ -905,6 +1221,12 @@ async function ensureSchema() {
   await pool.query(
     `ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(60) NOT NULL DEFAULT 'reporting_reconciliation'`
   );
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS handoff_department VARCHAR(120) NULL`);
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS handoff_artifact VARCHAR(190) NULL`);
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS handoff_reference VARCHAR(120) NULL`);
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS handoff_status VARCHAR(40) NOT NULL DEFAULT 'pending'`);
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS request_reference VARCHAR(120) NULL`);
+  await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS handoff_notes TEXT NULL`);
   await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS correction_reason VARCHAR(190) NULL`);
   await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS correction_notes TEXT NULL`);
   await pool.query(`ALTER TABLE reconciliations ADD COLUMN IF NOT EXISTS previous_workflow_stage VARCHAR(60) NULL`);
@@ -1439,6 +1761,11 @@ async function fetchBillingRows() {
         b.id,
         b.student_id,
         b.billing_code,
+        b.source_module,
+        b.source_department,
+        b.source_category,
+        b.integration_profile,
+        b.target_department,
         b.semester,
         b.school_year,
         b.total_amount,
@@ -1832,6 +2159,12 @@ async function fetchReconciliationRows() {
         r.receipt_id,
         r.status,
         r.discrepancy_note,
+        r.handoff_department,
+        r.handoff_artifact,
+        r.handoff_reference,
+        r.handoff_status,
+        r.request_reference,
+        r.handoff_notes,
         r.reconciled_at,
         r.reported_at,
         r.archived_at,
@@ -1846,6 +2179,11 @@ async function fetchReconciliationRows() {
         p.workflow_stage,
         p.payment_date,
         b.billing_code,
+        b.source_module,
+        b.source_department,
+        b.source_category,
+        b.integration_profile,
+        b.target_department,
         s.full_name,
         s.student_no,
         COALESCE(rr.receipt_number, '--') AS receipt_number,
@@ -1902,6 +2240,11 @@ async function fetchPaymentRows() {
         p.id AS payment_id,
         b.id AS billing_id,
         b.billing_code,
+        b.source_module,
+        b.source_department,
+        b.source_category,
+        b.integration_profile,
+        b.target_department,
         b.total_amount,
         b.paid_amount,
         b.balance_amount,
@@ -1934,6 +2277,11 @@ async function fetchReceiptRows() {
         p.payment_status,
         p.payment_date,
         b.billing_code,
+        b.source_module,
+        b.source_department,
+        b.source_category,
+        b.integration_profile,
+        b.target_department,
         s.full_name,
         COALESCE(r.id, 0) AS receipt_id,
         COALESCE(r.receipt_number, CONCAT('OR-', to_char(CURRENT_DATE, 'YYYY'), '-', LPAD(p.id::text, 4, '0'))) AS receipt_number,
@@ -2202,6 +2550,9 @@ async function buildStudentBillingSnapshot(view) {
         studentName: row.studentName,
         semester: `${row.semester} ${row.schoolYear}`,
         category: `${row.program || 'General'}${row.yearLevel ? ` | ${row.yearLevel}` : ''}`,
+        sourceModule: row.sourceModule,
+        sourceDepartment: row.sourceDepartment,
+        sourceCategory: row.sourceCategory,
         total: row.totalAmountFormatted,
         balance: row.balanceAmountFormatted,
         status: mapManagementStatus(row.rawStatus),
@@ -2229,6 +2580,9 @@ async function buildStudentBillingSnapshot(view) {
       studentName: row.studentName,
       studentNumber: row.studentNumber,
       program: row.program || 'General Program',
+      sourceModule: row.sourceModule,
+      sourceDepartment: row.sourceDepartment,
+      sourceCategory: row.sourceCategory,
       amount: row.balanceAmountFormatted,
       totalPaid: row.paidAmountFormatted,
       dueDate: row.dueDateFormatted,
@@ -2296,6 +2650,9 @@ async function buildPaymentSnapshot() {
     payment_method: item.paymentMethod,
     amount_paid: item.amount,
     billing_code: item.billingCode,
+    sourceModule: item.sourceModule,
+    sourceDepartment: item.sourceDepartment,
+    sourceCategory: item.sourceCategory,
     payment_status: item.rawStatus,
     reporting_status: item.rawReportingStatus,
     workflow_stage: item.workflowStage,
@@ -2316,6 +2673,9 @@ async function buildPaymentSnapshot() {
     channel: row.payment_method,
     amount: row.amountFormatted,
     billingCode: row.billing_code,
+    sourceModule: row.sourceModule,
+    sourceDepartment: row.sourceDepartment,
+    sourceCategory: row.sourceCategory,
     status: row.status,
     workflowStage: row.workflow_stage,
     workflowStageLabel: row.workflowStageLabel,
@@ -2349,6 +2709,9 @@ async function buildReceiptSnapshot() {
     payment_status: item.paymentStatus,
     amount_paid: item.amount,
     billing_code: item.billingCode,
+    sourceModule: item.sourceModule,
+    sourceDepartment: item.sourceDepartment,
+    sourceCategory: item.sourceCategory,
     receipt_status: item.rawStatus,
     workflow_stage: item.workflowStage,
     remarks: item.remarks,
@@ -2370,6 +2733,9 @@ async function buildReceiptSnapshot() {
     paymentStatus: row.payment_status,
     amount: row.amountFormatted,
     issuedFor: row.billing_code,
+    sourceModule: row.sourceModule,
+    sourceDepartment: row.sourceDepartment,
+    sourceCategory: row.sourceCategory,
     status: row.status,
     workflowStage: normalizeWorkflowStage(row.workflow_stage, resolveReceiptWorkflowStage(row.receipt_status)),
     workflowStageLabel: row.workflowStageLabel,
@@ -2422,25 +2788,31 @@ function mapReportingStatus(rawStatus) {
   return 'Logged';
 }
 
+function resolveReportingBoardStatus(reconciliationStatus, reportingStatus) {
+  return mapReconciliationStatus(reconciliationStatus) === 'With Discrepancy'
+    ? 'With Discrepancy'
+    : mapReportingStatus(reportingStatus);
+}
+
 function buildReportingStats(activeRows, allRows = activeRows) {
   return [
     {
       title: 'Logged',
-      value: String(activeRows.filter((row) => mapReconciliationStatus(row.status) === 'Pending Review').length),
+      value: String(activeRows.filter((row) => resolveReportingBoardStatus(row.status, row.reporting_status) === 'Logged').length),
       subtitle: 'Paid transactions already visible in reporting',
       icon: 'mdi-clipboard-list-outline',
       tone: 'green'
     },
     {
       title: 'Reconciled',
-      value: String(activeRows.filter((row) => mapReconciliationStatus(row.status) === 'Reconciled').length),
+      value: String(activeRows.filter((row) => resolveReportingBoardStatus(row.status, row.reporting_status) === 'Reconciled').length),
       subtitle: 'Payments matched with documentation',
       icon: 'mdi-check-decagram-outline',
       tone: 'blue'
     },
     {
       title: 'With Discrepancy',
-      value: String(activeRows.filter((row) => mapReconciliationStatus(row.status) === 'With Discrepancy').length),
+      value: String(activeRows.filter((row) => resolveReportingBoardStatus(row.status, row.reporting_status) === 'With Discrepancy').length),
       subtitle: 'Records that still need discrepancy review',
       icon: 'mdi-chart-box-outline',
       tone: 'orange'
@@ -2471,20 +2843,49 @@ async function buildReportingSnapshot() {
     (row) => normalizeWorkflowStage(row.workflow_stage, resolveReconciliationWorkflowStage(row.status)) !== WORKFLOW_STAGES.REPORTING_RECONCILIATION
   );
 
-  const mapRow = (row) => ({
-    id: Number(row.payment_id),
-    reference: row.reference_number,
-    studentName: row.full_name,
-    amount: formatCurrency(row.amount_paid),
-    billingCode: row.billing_code,
-    receiptNumber: row.receipt_number,
-    paymentStatus: mapPaymentStatus(row.payment_status),
-    documentStatus: mapReceiptStatus(row.receipt_status),
-    status: mapReconciliationStatus(row.status),
-    workflowStage: normalizeWorkflowStage(row.workflow_stage, resolveReconciliationWorkflowStage(row.status)),
-    workflowStageLabel: workflowStageLabel(row.workflow_stage || resolveReconciliationWorkflowStage(row.status)),
-    postedAt: formatShortDate(row.payment_date)
-  });
+  const mapRow = (row) => {
+    const integration = resolveCashierIntegrationProfile({
+      billingCode: row.billing_code,
+      sourceModule: row.source_module,
+      sourceDepartment: row.source_department,
+      sourceCategory: row.source_category,
+      integrationProfile: row.integration_profile,
+      targetDepartment: row.target_department
+    });
+
+    return {
+      id: Number(row.payment_id),
+      reference: row.reference_number,
+      studentName: row.full_name,
+      amount: formatCurrency(row.amount_paid),
+      billingCode: row.billing_code,
+      receiptNumber: row.receipt_number,
+      sourceModule: integration.sourceModule,
+      sourceDepartment: integration.sourceDepartment,
+      sourceCategory: integration.sourceCategory,
+      targetDepartment: row.handoff_department || integration.reportingDepartment,
+      operationalTargetDepartment: integration.operationalTargetDepartment,
+      incomingArtifact: integration.incomingArtifact,
+      handoffArtifact: row.handoff_artifact || integration.reportingArtifact,
+      reportingArtifact: integration.reportingArtifact,
+      departmentFlow: integration.departmentFlow,
+      operationalFlow: integration.operationalFlow,
+      integrationSummary: integration.integrationSummary,
+      operationalHandoffStatus:
+        mapPaymentStatus(row.payment_status) === 'Paid'
+          ? `Confirmed to ${integration.operationalTargetDepartment}`
+          : `Waiting for ${integration.operationalTargetDepartment} payment confirmation`,
+      handoffStatus: cleanTextValue(row.handoff_status) || 'pending',
+      handoffReference: cleanTextValue(row.handoff_reference) || '',
+      requestReference: cleanTextValue(row.request_reference) || '',
+      paymentStatus: mapPaymentStatus(row.payment_status),
+      documentStatus: mapReceiptStatus(row.receipt_status),
+      status: resolveReportingBoardStatus(row.status, row.reporting_status),
+      workflowStage: normalizeWorkflowStage(row.workflow_stage, resolveReconciliationWorkflowStage(row.status)),
+      workflowStageLabel: workflowStageLabel(row.workflow_stage || resolveReconciliationWorkflowStage(row.status)),
+      postedAt: formatShortDate(row.payment_date)
+    };
+  };
 
   return {
     stats: buildReportingStats(activeRows, rows),
@@ -2495,6 +2896,214 @@ async function buildReportingSnapshot() {
       detail: row.description,
       time: formatRelativeMinutes(row.created_at)
     }))
+  };
+}
+
+async function buildReportTransactionItems() {
+  const payments = await serializePaymentTransactions();
+  const receipts = await serializeReceipts();
+  const receiptMap = new Map(receipts.map((item) => [item.paymentId, item]));
+  const reconciliationRows = await fetchReconciliationRows();
+  const reconciliationMap = new Map(reconciliationRows.map((row) => [Number(row.payment_id), row]));
+
+  return payments.map((payment) => {
+    const receipt = receiptMap.get(payment.id) || null;
+    const reconciliation = reconciliationMap.get(payment.id) || null;
+    const targetDepartment = cleanTextValue(reconciliation?.handoff_department) || payment.reportingDepartment || 'PMED Department';
+    const reportingStatus = resolveReportingBoardStatus(reconciliation?.status, payment.rawReportingStatus);
+    const handoffStatus =
+      cleanTextValue(reconciliation?.handoff_status) ||
+      (reportingStatus === 'Reported' ? 'sent' : reportingStatus === 'Reconciled' ? 'ready' : reportingStatus === 'With Discrepancy' ? 'on_hold' : 'pending');
+
+    return {
+      id: payment.id,
+      referenceNumber: payment.referenceNumber,
+      studentName: payment.studentName,
+      amount: Number(payment.amount || 0),
+      amountFormatted: payment.amountFormatted,
+      billingCode: payment.billingCode,
+      receiptNumber: receipt?.receiptNumber || '--',
+      sourceModule: payment.sourceModule,
+      sourceDepartment: payment.sourceDepartment,
+      sourceCategory: payment.sourceCategory,
+      paymentMethod: payment.paymentMethod,
+      paymentStatus: payment.status,
+      documentationStatus: receipt?.status || 'Receipt Pending',
+      reportingStatus,
+      workflowStage: payment.workflowStage,
+      workflowStageLabel: payment.workflowStageLabel,
+      createdAt: payment.paymentDate,
+      allocationSummary: payment.allocationSummary,
+      allocations: payment.allocations,
+      targetDepartment,
+      operationalTargetDepartment: payment.targetDepartment,
+      incomingArtifact: payment.incomingArtifact,
+      handoffArtifact: cleanTextValue(reconciliation?.handoff_artifact) || payment.reportingArtifact,
+      reportingArtifact: payment.reportingArtifact,
+      integrationSummary: payment.integrationSummary,
+      departmentFlow: payment.departmentFlow,
+      operationalFlow: payment.operationalFlow,
+      operationalHandoffStatus:
+        payment.status === 'Paid'
+          ? `Confirmed to ${payment.targetDepartment}`
+          : `Waiting for ${payment.targetDepartment} payment confirmation`,
+      handoffStatus,
+      handoffReference: cleanTextValue(reconciliation?.handoff_reference),
+      requestReference: cleanTextValue(reconciliation?.request_reference)
+    };
+  });
+}
+
+async function buildDepartmentHandoffSnapshot() {
+  const payments = await serializePaymentTransactions();
+  const receipts = await serializeReceipts();
+  const receiptMap = new Map(receipts.map((item) => [item.paymentId, item]));
+  const reconciliationRows = await fetchReconciliationRows();
+  const reconciliationMap = new Map(reconciliationRows.map((row) => [Number(row.payment_id), row]));
+  const matrix = buildDepartmentServiceMatrix();
+  const items = [];
+
+  for (const payment of payments) {
+    const receipt = receiptMap.get(payment.id) || null;
+    const reconciliation = reconciliationMap.get(payment.id) || null;
+    const clearance = deriveCashierClearance(payment.rawStatus, receipt?.rawStatus || '');
+    const receiptNumber = cleanTextValue(receipt?.receiptNumber) || 'Pending Receipt';
+    const receiptStatus = receipt?.status || 'Receipt Pending';
+    const operationalOutputs = ['Payment status', 'Official receipt records', 'Cleared / Not Cleared status'];
+    const reportingDepartment =
+      cleanTextValue(reconciliation?.handoff_department) || cleanTextValue(payment.reportingDepartment) || 'PMED Department';
+    const reportingOutputs = Array.from(
+      new Set([
+        'Payment status',
+        'Official receipt records',
+        'Cleared / Not Cleared status',
+        cleanTextValue(payment.reportingArtifact) || 'Financial reports'
+      ].filter(Boolean))
+    );
+
+    items.push({
+      id: `operational-${payment.id}`,
+      paymentId: payment.id,
+      billingId: payment.billingId,
+      consumerDepartment: payment.targetDepartment,
+      consumerRole: resolveDepartmentRecipientRole(payment.targetDepartment),
+      channelType: 'Operational',
+      sourceDepartment: payment.sourceDepartment,
+      sourceModule: payment.sourceModule,
+      sourceCategory: payment.sourceCategory,
+      studentName: payment.studentName,
+      studentNumber: payment.studentNumber,
+      billingCode: payment.billingCode,
+      paymentReference: payment.referenceNumber,
+      amount: payment.amount,
+      amountFormatted: payment.amountFormatted,
+      paymentStatus: payment.status,
+      receiptNumber,
+      receiptStatus,
+      clearanceStatus: clearance.status,
+      clearanceNote: clearance.note,
+      handoffStatus: clearance.status === 'Cleared' ? 'ready' : 'pending',
+      handoffReference: cleanTextValue(reconciliation?.handoff_reference),
+      requestReference: cleanTextValue(reconciliation?.request_reference),
+      outputs: operationalOutputs,
+      workflowStage: payment.workflowStage,
+      workflowStageLabel: payment.workflowStageLabel,
+      integrationSummary: payment.integrationSummary,
+      lastUpdatedAt: receipt?.issuedDate || payment.paymentDate || toIsoString(reconciliation?.updated_at)
+    });
+
+    items.push({
+      id: `reporting-${payment.id}`,
+      paymentId: payment.id,
+      billingId: payment.billingId,
+      consumerDepartment: reportingDepartment,
+      consumerRole: resolveDepartmentRecipientRole(reportingDepartment),
+      channelType: 'Reporting',
+      sourceDepartment: payment.sourceDepartment,
+      sourceModule: payment.sourceModule,
+      sourceCategory: payment.sourceCategory,
+      studentName: payment.studentName,
+      studentNumber: payment.studentNumber,
+      billingCode: payment.billingCode,
+      paymentReference: payment.referenceNumber,
+      amount: payment.amount,
+      amountFormatted: payment.amountFormatted,
+      paymentStatus: payment.status,
+      receiptNumber,
+      receiptStatus,
+      clearanceStatus: clearance.status,
+      clearanceNote: clearance.note,
+      handoffStatus:
+        cleanTextValue(reconciliation?.handoff_status) ||
+        (String(payment.rawReportingStatus || '').toLowerCase() === 'reported'
+          ? 'sent'
+          : String(payment.rawReportingStatus || '').toLowerCase() === 'reconciled'
+            ? 'ready'
+            : 'pending'),
+      handoffReference: cleanTextValue(reconciliation?.handoff_reference),
+      requestReference: cleanTextValue(reconciliation?.request_reference),
+      outputs: reportingOutputs,
+      workflowStage: payment.workflowStage,
+      workflowStageLabel: payment.workflowStageLabel,
+      integrationSummary: payment.integrationSummary,
+      lastUpdatedAt:
+        toIsoString(reconciliation?.reported_at) ||
+        toIsoString(reconciliation?.updated_at) ||
+        receipt?.issuedDate ||
+        payment.paymentDate
+    });
+  }
+
+  const registrarCount = items.filter((item) => item.consumerDepartment === 'Registrar').length;
+  const pmedAndAdminCount = items.filter((item) =>
+    ['PMED Department', 'Admin Reports'].includes(String(item.consumerDepartment || ''))
+  ).length;
+  const clearedCount = items.filter((item) => item.channelType === 'Operational' && item.clearanceStatus === 'Cleared').length;
+  const unclearedCount = items.filter((item) => item.channelType === 'Operational' && item.clearanceStatus !== 'Cleared').length;
+
+  const latestItems = items
+    .slice()
+    .sort((left, right) => new Date(right.lastUpdatedAt || 0).getTime() - new Date(left.lastUpdatedAt || 0).getTime())
+    .slice(0, 8)
+    .map((item) => ({
+      ...item,
+      lastUpdatedLabel: item.lastUpdatedAt ? formatShortDate(item.lastUpdatedAt) : '--'
+    }));
+
+  return {
+    stats: [
+      {
+        title: 'Registrar Linked',
+        value: String(registrarCount),
+        subtitle: 'Cashier records ready for registrar-facing status visibility',
+        icon: 'mdi-school-outline',
+        tone: 'blue'
+      },
+      {
+        title: 'PMED / Admin',
+        value: String(pmedAndAdminCount),
+        subtitle: 'Reporting-facing records visible to PMED and admin reporting desks',
+        icon: 'mdi-domain',
+        tone: 'purple'
+      },
+      {
+        title: 'Cleared',
+        value: String(clearedCount),
+        subtitle: 'Operational records with successful payment and official receipt support',
+        icon: 'mdi-check-decagram-outline',
+        tone: 'green'
+      },
+      {
+        title: 'Not Cleared',
+        value: String(unclearedCount),
+        subtitle: 'Records still waiting on payment or receipt completion',
+        icon: 'mdi-alert-circle-outline',
+        tone: 'orange'
+      }
+    ],
+    matrix,
+    items,
+    latestItems
   };
 }
 
@@ -2807,22 +3416,29 @@ async function ensureProofDocument(paymentId, receiptId, actorUserId = null) {
 async function upsertReconciliationRecord(paymentId, receiptId = null, status = 'pending_review', fields = {}) {
   await pool.query(
     `INSERT INTO reconciliations (
-      payment_id, receipt_id, status, workflow_stage, discrepancy_note, previous_workflow_stage, action_by, action_at, audit_reference, is_completed, reconciled_by, reconciled_at, reported_at, archived_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      payment_id, receipt_id, status, workflow_stage, discrepancy_note, handoff_department, handoff_artifact, handoff_reference, handoff_status, request_reference, handoff_notes,
+      previous_workflow_stage, action_by, action_at, audit_reference, is_completed, reconciled_by, reconciled_at, reported_at, archived_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (payment_id) DO UPDATE SET
-      receipt_id = EXCLUDED.receipt_id,
+      receipt_id = COALESCE(EXCLUDED.receipt_id, reconciliations.receipt_id),
       status = EXCLUDED.status,
       workflow_stage = EXCLUDED.workflow_stage,
-      discrepancy_note = EXCLUDED.discrepancy_note,
-      previous_workflow_stage = EXCLUDED.previous_workflow_stage,
-      action_by = EXCLUDED.action_by,
-      action_at = EXCLUDED.action_at,
-      audit_reference = EXCLUDED.audit_reference,
-      is_completed = EXCLUDED.is_completed,
-      reconciled_by = EXCLUDED.reconciled_by,
-      reconciled_at = EXCLUDED.reconciled_at,
-      reported_at = EXCLUDED.reported_at,
-      archived_at = EXCLUDED.archived_at,
+      discrepancy_note = COALESCE(EXCLUDED.discrepancy_note, reconciliations.discrepancy_note),
+      handoff_department = COALESCE(EXCLUDED.handoff_department, reconciliations.handoff_department),
+      handoff_artifact = COALESCE(EXCLUDED.handoff_artifact, reconciliations.handoff_artifact),
+      handoff_reference = COALESCE(EXCLUDED.handoff_reference, reconciliations.handoff_reference),
+      handoff_status = COALESCE(EXCLUDED.handoff_status, reconciliations.handoff_status),
+      request_reference = COALESCE(EXCLUDED.request_reference, reconciliations.request_reference),
+      handoff_notes = COALESCE(EXCLUDED.handoff_notes, reconciliations.handoff_notes),
+      previous_workflow_stage = COALESCE(EXCLUDED.previous_workflow_stage, reconciliations.previous_workflow_stage),
+      action_by = COALESCE(EXCLUDED.action_by, reconciliations.action_by),
+      action_at = COALESCE(EXCLUDED.action_at, reconciliations.action_at),
+      audit_reference = COALESCE(EXCLUDED.audit_reference, reconciliations.audit_reference),
+      is_completed = CASE WHEN EXCLUDED.is_completed = 1 THEN 1 ELSE reconciliations.is_completed END,
+      reconciled_by = COALESCE(EXCLUDED.reconciled_by, reconciliations.reconciled_by),
+      reconciled_at = COALESCE(EXCLUDED.reconciled_at, reconciliations.reconciled_at),
+      reported_at = COALESCE(EXCLUDED.reported_at, reconciliations.reported_at),
+      archived_at = COALESCE(EXCLUDED.archived_at, reconciliations.archived_at),
       updated_at = EXCLUDED.updated_at`,
     [
       paymentId,
@@ -2830,6 +3446,12 @@ async function upsertReconciliationRecord(paymentId, receiptId = null, status = 
       status,
       fields.workflowStage || resolveReconciliationWorkflowStage(status),
       fields.discrepancyNote || null,
+      fields.handoffDepartment || null,
+      fields.handoffArtifact || null,
+      fields.handoffReference || null,
+      fields.handoffStatus || null,
+      fields.requestReference || null,
+      fields.handoffNotes || null,
       fields.previousWorkflowStage || null,
       fields.actionBy || null,
       fields.actionAt || null,
@@ -2851,8 +3473,9 @@ async function serializeBillingList() {
   const allocationRows = await fetchPaymentAllocationRows();
   const feeBreakdownMap = buildBillingFeeBreakdown(itemRows, allocationRows);
 
-  return rows.map((row) => ({
-    ...(feeBreakdownMap.get(Number(row.id)) || {
+  return rows.map((row) => {
+    const feeBreakdown =
+      feeBreakdownMap.get(Number(row.id)) || {
       items: [],
       summary: {
         totalFees: 0,
@@ -2867,41 +3490,63 @@ async function serializeBillingList() {
         remainingAmountFormatted: formatCurrency(row.balance_amount),
         label: '0 Paid | 0 Partial | 0 Unpaid'
       }
-    }),
-    id: Number(row.id),
-    studentId: Number(row.student_id || 0),
-    studentName: row.full_name,
-    studentNumber: row.student_no,
-    billingCode: row.billing_code,
-    invoiceNumber: row.billing_code,
-    semester: row.semester,
-    schoolYear: row.school_year,
-    term: `${row.semester} ${row.school_year}`,
-    program: row.course || 'General Program',
-    yearLevel: row.year_level || '--',
-    totalAmount: Number(row.total_amount || 0),
-    totalAmountFormatted: formatCurrency(row.total_amount),
-    paidAmount: Number((feeBreakdownMap.get(Number(row.id))?.summary.committedAmount ?? row.paid_amount) || 0),
-    paidAmountFormatted: formatCurrency(feeBreakdownMap.get(Number(row.id))?.summary.committedAmount ?? row.paid_amount),
-    balanceAmount: Number((feeBreakdownMap.get(Number(row.id))?.summary.remainingAmount ?? row.balance_amount) || 0),
-    balanceAmountFormatted: formatCurrency(feeBreakdownMap.get(Number(row.id))?.summary.remainingAmount ?? row.balance_amount),
-    workflowStage: normalizeWorkflowStage(row.workflow_stage, resolveBillingWorkflowStage(row.billing_status, row.balance_amount)),
-    workflowStageLabel: workflowStageLabel(row.workflow_stage || resolveBillingWorkflowStage(row.billing_status, row.balance_amount)),
-    status: mapBillingWorkflowStatus(
-      row.billing_status,
-      feeBreakdownMap.get(Number(row.id))?.summary.remainingAmount ?? row.balance_amount
-    ),
-    rawStatus: String(row.billing_status || ''),
-    paymentEligible: ['Active Billing', 'Pending Payment', 'Partially Paid'].includes(
-      mapBillingWorkflowStatus(row.billing_status, feeBreakdownMap.get(Number(row.id))?.summary.remainingAmount ?? row.balance_amount)
-    ),
-    dueDate: toIsoString(row.updated_at || row.created_at),
-    dueDateFormatted: formatShortDate(row.updated_at || row.created_at),
-    createdAt: toIsoString(row.created_at),
-    updatedAt: toIsoString(row.updated_at),
-    items: feeBreakdownMap.get(Number(row.id))?.items || [],
-    feeSummary: feeBreakdownMap.get(Number(row.id))?.summary || null
-  }));
+      };
+    const integration = resolveCashierIntegrationProfile({
+      billingCode: row.billing_code,
+      sourceModule: row.source_module,
+      sourceDepartment: row.source_department,
+      sourceCategory: row.source_category,
+      integrationProfile: row.integration_profile,
+      targetDepartment: row.target_department,
+      feeItems: feeBreakdown.items || []
+    });
+
+    return {
+      ...feeBreakdown,
+      id: Number(row.id),
+      studentId: Number(row.student_id || 0),
+      studentName: row.full_name,
+      studentNumber: row.student_no,
+      billingCode: row.billing_code,
+      invoiceNumber: row.billing_code,
+      sourceModule: integration.sourceModule,
+      sourceDepartment: integration.sourceDepartment,
+      sourceCategory: integration.sourceCategory,
+      integrationProfile: integration.integrationProfile,
+      targetDepartment: integration.operationalTargetDepartment,
+      reportingDepartment: integration.reportingDepartment,
+      incomingArtifact: integration.incomingArtifact,
+      handoffArtifact: integration.operationalArtifact,
+      reportingArtifact: integration.reportingArtifact,
+      departmentFlow: integration.departmentFlow,
+      operationalFlow: integration.operationalFlow,
+      integrationSummary: integration.integrationSummary,
+      semester: row.semester,
+      schoolYear: row.school_year,
+      term: `${row.semester} ${row.school_year}`,
+      program: row.course || 'General Program',
+      yearLevel: row.year_level || '--',
+      totalAmount: Number(row.total_amount || 0),
+      totalAmountFormatted: formatCurrency(row.total_amount),
+      paidAmount: Number((feeBreakdown.summary.committedAmount ?? row.paid_amount) || 0),
+      paidAmountFormatted: formatCurrency(feeBreakdown.summary.committedAmount ?? row.paid_amount),
+      balanceAmount: Number((feeBreakdown.summary.remainingAmount ?? row.balance_amount) || 0),
+      balanceAmountFormatted: formatCurrency(feeBreakdown.summary.remainingAmount ?? row.balance_amount),
+      workflowStage: normalizeWorkflowStage(row.workflow_stage, resolveBillingWorkflowStage(row.billing_status, row.balance_amount)),
+      workflowStageLabel: workflowStageLabel(row.workflow_stage || resolveBillingWorkflowStage(row.billing_status, row.balance_amount)),
+      status: mapBillingWorkflowStatus(row.billing_status, feeBreakdown.summary.remainingAmount ?? row.balance_amount),
+      rawStatus: String(row.billing_status || ''),
+      paymentEligible: ['Active Billing', 'Pending Payment', 'Partially Paid'].includes(
+        mapBillingWorkflowStatus(row.billing_status, feeBreakdown.summary.remainingAmount ?? row.balance_amount)
+      ),
+      dueDate: toIsoString(row.updated_at || row.created_at),
+      dueDateFormatted: formatShortDate(row.updated_at || row.created_at),
+      createdAt: toIsoString(row.created_at),
+      updatedAt: toIsoString(row.updated_at),
+      items: feeBreakdown.items || [],
+      feeSummary: feeBreakdown.summary || null
+    };
+  });
 }
 
 async function serializePaymentTransactions() {
@@ -2927,33 +3572,57 @@ async function serializePaymentTransactions() {
     });
   }
 
-  return rows.map((row) => ({
-    id: Number(row.payment_id),
-    billingId: Number(row.billing_id),
-    referenceNumber: row.reference_number,
-    studentName: row.full_name,
-    studentNumber: row.student_no,
-    billingCode: row.billing_code,
-    amount: Number(row.amount_paid || 0),
-    amountFormatted: formatCurrency(row.amount_paid),
-    paymentMethod: row.payment_method,
-    status: mapPaymentStatus(row.payment_status),
-    rawStatus: String(row.payment_status || ''),
-    workflowStage: normalizeWorkflowStage(row.workflow_stage, resolvePaymentWorkflowStage(row.payment_status, null, row.reporting_status)),
-    workflowStageLabel: workflowStageLabel(row.workflow_stage || resolvePaymentWorkflowStage(row.payment_status, null, row.reporting_status)),
-    reportingStatus: mapReportingStatus(row.reporting_status),
-    rawReportingStatus: String(row.reporting_status || ''),
-    paymentDate: toIsoString(row.payment_date),
-    paymentDateFormatted: formatShortDate(row.payment_date),
-    balanceAmount: Number(row.balance_amount || 0),
-    balanceAmountFormatted: formatCurrency(row.balance_amount),
-    attempts: attemptMap.get(Number(row.payment_id)) || []
-      ,
-    allocations: allocationMap.get(Number(row.payment_id))?.items || [],
-    allocationSummary: allocationMap.get(Number(row.payment_id))?.summary || 'No fee allocations yet.',
-    totalAllocated: allocationMap.get(Number(row.payment_id))?.totalAllocated || 0,
-    totalAllocatedFormatted: allocationMap.get(Number(row.payment_id))?.totalAllocatedFormatted || formatCurrency(0)
-  }));
+  return rows.map((row) => {
+    const allocations = allocationMap.get(Number(row.payment_id))?.items || [];
+    const integration = resolveCashierIntegrationProfile({
+      billingCode: row.billing_code,
+      sourceModule: row.source_module,
+      sourceDepartment: row.source_department,
+      sourceCategory: row.source_category,
+      integrationProfile: row.integration_profile,
+      targetDepartment: row.target_department,
+      feeItems: allocations
+    });
+
+    return {
+      id: Number(row.payment_id),
+      billingId: Number(row.billing_id),
+      referenceNumber: row.reference_number,
+      studentName: row.full_name,
+      studentNumber: row.student_no,
+      billingCode: row.billing_code,
+      sourceModule: integration.sourceModule,
+      sourceDepartment: integration.sourceDepartment,
+      sourceCategory: integration.sourceCategory,
+      integrationProfile: integration.integrationProfile,
+      targetDepartment: integration.operationalTargetDepartment,
+      reportingDepartment: integration.reportingDepartment,
+      incomingArtifact: integration.incomingArtifact,
+      handoffArtifact: integration.operationalArtifact,
+      reportingArtifact: integration.reportingArtifact,
+      departmentFlow: integration.departmentFlow,
+      operationalFlow: integration.operationalFlow,
+      integrationSummary: integration.integrationSummary,
+      amount: Number(row.amount_paid || 0),
+      amountFormatted: formatCurrency(row.amount_paid),
+      paymentMethod: row.payment_method,
+      status: mapPaymentStatus(row.payment_status),
+      rawStatus: String(row.payment_status || ''),
+      workflowStage: normalizeWorkflowStage(row.workflow_stage, resolvePaymentWorkflowStage(row.payment_status, null, row.reporting_status)),
+      workflowStageLabel: workflowStageLabel(row.workflow_stage || resolvePaymentWorkflowStage(row.payment_status, null, row.reporting_status)),
+      reportingStatus: mapReportingStatus(row.reporting_status),
+      rawReportingStatus: String(row.reporting_status || ''),
+      paymentDate: toIsoString(row.payment_date),
+      paymentDateFormatted: formatShortDate(row.payment_date),
+      balanceAmount: Number(row.balance_amount || 0),
+      balanceAmountFormatted: formatCurrency(row.balance_amount),
+      attempts: attemptMap.get(Number(row.payment_id)) || [],
+      allocations,
+      allocationSummary: allocationMap.get(Number(row.payment_id))?.summary || 'No fee allocations yet.',
+      totalAllocated: allocationMap.get(Number(row.payment_id))?.totalAllocated || 0,
+      totalAllocatedFormatted: allocationMap.get(Number(row.payment_id))?.totalAllocatedFormatted || formatCurrency(0)
+    };
+  });
 }
 
 async function serializeReceipts() {
@@ -2994,30 +3663,56 @@ async function serializeReceipts() {
     });
   }
 
-  return rows.map((row) => ({
-    id: Number(row.receipt_id || 0),
-    paymentId: Number(row.payment_id),
-    receiptNumber: row.receipt_number,
-    studentName: row.full_name,
-    paymentReference: row.reference_number,
-    billingCode: row.billing_code,
-    paymentMethod: row.payment_method,
-    amount: Number(row.amount_paid || 0),
-    amountFormatted: formatCurrency(row.amount_paid),
-    status: mapReceiptStatus(row.receipt_status),
-    rawStatus: String(row.receipt_status || ''),
-    workflowStage: normalizeWorkflowStage(row.workflow_stage, resolveReceiptWorkflowStage(row.receipt_status)),
-    workflowStageLabel: workflowStageLabel(row.workflow_stage || resolveReceiptWorkflowStage(row.receipt_status)),
-    issuedDate: toIsoString(row.issued_date),
-    issuedDateFormatted: formatShortDate(row.issued_date),
-    remarks: row.remarks,
-    proofDocuments: proofMap.get(Number(row.receipt_id || 0)) || [],
-    receiptItems: receiptItemMap.get(Number(row.receipt_id || 0)) || paymentAllocationMap.get(Number(row.payment_id))?.items || [],
-    allocationSummary:
-      (receiptItemMap.get(Number(row.receipt_id || 0)) || [])
-        .map((item) => `${item.feeType}: ${item.allocatedAmountFormatted}`)
-        .join(' | ') || paymentAllocationMap.get(Number(row.payment_id))?.summary || 'No fee allocations yet.'
-  }));
+  return rows.map((row) => {
+    const receiptItems = receiptItemMap.get(Number(row.receipt_id || 0)) || paymentAllocationMap.get(Number(row.payment_id))?.items || [];
+    const integration = resolveCashierIntegrationProfile({
+      billingCode: row.billing_code,
+      sourceModule: row.source_module,
+      sourceDepartment: row.source_department,
+      sourceCategory: row.source_category,
+      integrationProfile: row.integration_profile,
+      targetDepartment: row.target_department,
+      feeItems: receiptItems
+    });
+
+    return {
+      id: Number(row.receipt_id || 0),
+      paymentId: Number(row.payment_id),
+      receiptNumber: row.receipt_number,
+      studentName: row.full_name,
+      paymentReference: row.reference_number,
+      billingCode: row.billing_code,
+      sourceModule: integration.sourceModule,
+      sourceDepartment: integration.sourceDepartment,
+      sourceCategory: integration.sourceCategory,
+      integrationProfile: integration.integrationProfile,
+      targetDepartment: integration.operationalTargetDepartment,
+      reportingDepartment: integration.reportingDepartment,
+      incomingArtifact: integration.incomingArtifact,
+      handoffArtifact: integration.operationalArtifact,
+      reportingArtifact: integration.reportingArtifact,
+      departmentFlow: integration.departmentFlow,
+      operationalFlow: integration.operationalFlow,
+      integrationSummary: integration.integrationSummary,
+      paymentMethod: row.payment_method,
+      paymentStatus: mapPaymentStatus(row.payment_status),
+      amount: Number(row.amount_paid || 0),
+      amountFormatted: formatCurrency(row.amount_paid),
+      status: mapReceiptStatus(row.receipt_status),
+      rawStatus: String(row.receipt_status || ''),
+      workflowStage: normalizeWorkflowStage(row.workflow_stage, resolveReceiptWorkflowStage(row.receipt_status)),
+      workflowStageLabel: workflowStageLabel(row.workflow_stage || resolveReceiptWorkflowStage(row.receipt_status)),
+      issuedDate: toIsoString(row.issued_date),
+      issuedDateFormatted: formatShortDate(row.issued_date),
+      remarks: row.remarks,
+      proofDocuments: proofMap.get(Number(row.receipt_id || 0)) || [],
+      receiptItems,
+      allocationSummary:
+        receiptItems.map((item) => `${item.feeType}: ${item.allocatedAmountFormatted}`).join(' | ') ||
+        paymentAllocationMap.get(Number(row.payment_id))?.summary ||
+        'No fee allocations yet.'
+    };
+  });
 }
 
 function studentActorFromSession(student) {
@@ -3270,6 +3965,11 @@ async function executeGatewayAction({ paymentId, action, actorUser, ipAddress = 
         p.reporting_status,
         p.workflow_stage,
         b.billing_code,
+        b.source_module,
+        b.source_department,
+        b.source_category,
+        b.integration_profile,
+        b.target_department,
         b.total_amount,
         b.paid_amount,
         b.balance_amount,
@@ -3350,6 +4050,14 @@ async function executeGatewayAction({ paymentId, action, actorUser, ipAddress = 
   }
 
   if (action === 'confirm' || action === 'capture') {
+    const integration = resolveCashierIntegrationProfile({
+      billingCode: paymentRow.billing_code,
+      sourceModule: paymentRow.source_module,
+      sourceDepartment: paymentRow.source_department,
+      sourceCategory: paymentRow.source_category,
+      integrationProfile: paymentRow.integration_profile,
+      targetDepartment: paymentRow.target_department
+    });
     const [allocationRows] = await pool.query(
       `SELECT COUNT(*) AS total
        FROM payment_allocations
@@ -3434,6 +4142,15 @@ async function executeGatewayAction({ paymentId, action, actorUser, ipAddress = 
         title: 'Payment successful',
         message: `${paymentRow.reference_number} succeeded and is ready for receipt generation.`
       }
+    });
+    await insertSystemNotification({
+      recipientRole: integration.recipientRole,
+      recipientName: integration.operationalTargetDepartment,
+      type: 'department_payment_confirmation',
+      title: `${integration.sourceDepartment} payment confirmed`,
+      message: `${paymentRow.reference_number} for ${paymentRow.billing_code} is paid. Cashier sent ${integration.operationalArtifact.toLowerCase()} to ${integration.operationalTargetDepartment}.`,
+      entityType: 'payment',
+      entityId: paymentId
     });
     return buildWorkflowActionPayload(
       `${paymentRow.reference_number} is now paid and moved to Compliance & Documentation.`,
@@ -4470,21 +5187,6 @@ app.post('/api/billings', requireAuth, requireRole('admin', 'cashier'), async (r
     const billingCode = String(req.body?.billingCode || req.body?.billing_code || `BILL-${Date.now().toString().slice(-6)}`).trim();
     const initialStatus = ['draft', 'unpaid', 'correction'].includes(requestedStatus) ? requestedStatus : 'draft';
     const initialStage = resolveBillingWorkflowStage(initialStatus, billingTotal);
-
-    const [rows] = await pool.query(
-      `INSERT INTO billing_records (
-        student_id, billing_code, semester, school_year, total_amount, paid_amount, balance_amount, billing_status, workflow_stage, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
-      RETURNING id`,
-      [studentId, billingCode, semester, schoolYear, billingTotal, billingTotal, initialStatus, initialStage, nowSql(), nowSql()]
-    );
-
-    const billingId = Number(rows[0]?.id);
-    if (!billingId) {
-      sendError(res, 500, 'Unable to create billing record.');
-      return;
-    }
-
     const normalizedItems =
       items.length > 0
         ? items
@@ -4498,6 +5200,46 @@ app.post('/api/billings', requireAuth, requireRole('admin', 'cashier'), async (r
               amount: Number((billingTotal - Number((billingTotal * 0.7).toFixed(2)) - Number((billingTotal * 0.2).toFixed(2))).toFixed(2))
             }
           ];
+    const integration = resolveCashierIntegrationProfile({
+      billingCode,
+      sourceModule: req.body?.sourceModule || req.body?.source_module,
+      sourceDepartment: req.body?.sourceDepartment || req.body?.source_department,
+      sourceCategory: req.body?.sourceCategory || req.body?.source_category,
+      integrationProfile: req.body?.integrationProfile || req.body?.integration_profile,
+      targetDepartment: req.body?.targetDepartment || req.body?.target_department,
+      feeItems: normalizedItems
+    });
+
+    const [rows] = await pool.query(
+      `INSERT INTO billing_records (
+        student_id, billing_code, source_module, source_department, source_category, integration_profile, target_department,
+        semester, school_year, total_amount, paid_amount, balance_amount, billing_status, workflow_stage, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+      RETURNING id`,
+      [
+        studentId,
+        billingCode,
+        integration.sourceModule,
+        integration.sourceDepartment,
+        integration.sourceCategory,
+        integration.integrationProfile,
+        integration.operationalTargetDepartment,
+        semester,
+        schoolYear,
+        billingTotal,
+        billingTotal,
+        initialStatus,
+        initialStage,
+        nowSql(),
+        nowSql()
+      ]
+    );
+
+    const billingId = Number(rows[0]?.id);
+    if (!billingId) {
+      sendError(res, 500, 'Unable to create billing record.');
+      return;
+    }
 
     for (const [index, item] of normalizedItems.entries()) {
       await pool.query(
@@ -7029,7 +7771,8 @@ app.post('/api/reconciliation/:id/archive', requireAuth, requireRole('admin', 'c
     const [reconciliationRows] = await pool.query(`SELECT receipt_id FROM reconciliations WHERE payment_id = ? LIMIT 1`, [paymentId]);
     await upsertReconciliationRecord(paymentId, reconciliationRows[0]?.receipt_id || null, 'archived', {
       archivedAt: nowSql(),
-      workflowStage: WORKFLOW_STAGES.COMPLETED
+      workflowStage: WORKFLOW_STAGES.COMPLETED,
+      handoffStatus: 'archived'
     });
     await recordWorkflowEvent({
       actorUser: req.currentUser,
@@ -7063,6 +7806,8 @@ app.get('/api/reports/transactions', requireAuth, requireRole('admin', 'cashier'
   try {
     const search = String(req.query?.search || '').trim().toLowerCase();
     const statusFilter = String(req.query?.status || '').trim().toLowerCase();
+    const departmentFilter = String(req.query?.department || '').trim().toLowerCase();
+    const categoryFilter = String(req.query?.category || '').trim().toLowerCase();
     const paymentMethodFilter = String(req.query?.payment_method || '').trim().toLowerCase();
     const workflowStageFilter = normalizeWorkflowStage(String(req.query?.workflow_stage || '').trim(), '');
     const dateFrom = String(req.query?.date_from || '').trim();
@@ -7070,33 +7815,16 @@ app.get('/api/reports/transactions', requireAuth, requireRole('admin', 'cashier'
     const page = Math.max(1, Number(req.query?.page || 1));
     const perPage = Math.min(100, Math.max(1, Number(req.query?.per_page || 20)));
 
-    const payments = await serializePaymentTransactions();
-    const receipts = await serializeReceipts();
-    const receiptMap = new Map(receipts.map((item) => [item.paymentId, item]));
-
-    let items = payments.map((payment) => {
-      const receipt = receiptMap.get(payment.id) || null;
-      return {
-        id: payment.id,
-        referenceNumber: payment.referenceNumber,
-        studentName: payment.studentName,
-        billingCode: payment.billingCode,
-        receiptNumber: receipt?.receiptNumber || '--',
-        amount: Number(payment.amount || 0),
-        amountFormatted: payment.amountFormatted,
-        paymentMethod: payment.paymentMethod,
-        paymentStatus: payment.status,
-        documentationStatus: receipt?.status || 'Receipt Pending',
-        reportingStatus: payment.reportingStatus,
-        workflowStage: payment.workflowStage,
-        workflowStageLabel: payment.workflowStageLabel,
-        createdAt: payment.paymentDate,
-        allocationSummary: payment.allocationSummary,
-        allocations: payment.allocations
-      };
-    });
-
+    let items = await buildReportTransactionItems();
     if (statusFilter) items = items.filter((item) => item.reportingStatus.toLowerCase() === statusFilter);
+    if (departmentFilter) {
+      items = items.filter((item) =>
+        [item.sourceDepartment, item.targetDepartment, item.operationalTargetDepartment]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(departmentFilter))
+      );
+    }
+    if (categoryFilter) items = items.filter((item) => item.sourceCategory.toLowerCase().includes(categoryFilter));
     if (paymentMethodFilter) items = items.filter((item) => item.paymentMethod.toLowerCase().includes(paymentMethodFilter));
     if (workflowStageFilter) items = items.filter((item) => normalizeWorkflowStage(item.workflowStage, '') === workflowStageFilter);
     if (dateFrom) items = items.filter((item) => String(item.createdAt || '').slice(0, 10) >= dateFrom);
@@ -7105,7 +7833,7 @@ app.get('/api/reports/transactions', requireAuth, requireRole('admin', 'cashier'
       items,
       search,
       (item) =>
-        `${item.referenceNumber} ${item.studentName} ${item.billingCode} ${item.receiptNumber} ${item.paymentStatus} ${item.reportingStatus} ${item.allocationSummary || ''}`
+        `${item.referenceNumber} ${item.studentName} ${item.billingCode} ${item.receiptNumber} ${item.sourceDepartment} ${item.sourceCategory} ${item.targetDepartment} ${item.paymentStatus} ${item.reportingStatus} ${item.handoffReference} ${item.allocationSummary || ''}`
     );
 
     sendOk(res, {
@@ -7218,31 +7946,23 @@ app.get('/api/reports/export', requireAuth, requireRole('admin', 'cashier', 'acc
   try {
     const search = String(_req.query?.search || '').trim().toLowerCase();
     const statusFilter = String(_req.query?.status || '').trim().toLowerCase();
+    const departmentFilter = String(_req.query?.department || '').trim().toLowerCase();
+    const categoryFilter = String(_req.query?.category || '').trim().toLowerCase();
     const paymentMethodFilter = String(_req.query?.payment_method || '').trim().toLowerCase();
     const workflowStageFilter = normalizeWorkflowStage(String(_req.query?.workflow_stage || '').trim(), '');
     const dateFrom = String(_req.query?.date_from || '').trim();
     const dateTo = String(_req.query?.date_to || '').trim();
 
-    const payments = await serializePaymentTransactions();
-    const receipts = await serializeReceipts();
-    const receiptMap = new Map(receipts.map((item) => [item.paymentId, item]));
-
-    let items = payments.map((payment) => ({
-      referenceNumber: payment.referenceNumber,
-      studentName: payment.studentName,
-      billingCode: payment.billingCode,
-      amountFormatted: payment.amountFormatted,
-      paymentStatus: payment.status,
-      documentationStatus: receiptMap.get(payment.id)?.status || 'Receipt Pending',
-      reportingStatus: payment.reportingStatus,
-      paymentMethod: payment.paymentMethod,
-      workflowStage: payment.workflowStage,
-      createdAt: payment.paymentDate,
-      receiptNumber: receiptMap.get(payment.id)?.receiptNumber || '--',
-      allocationSummary: payment.allocationSummary
-    }));
-
+    let items = await buildReportTransactionItems();
     if (statusFilter) items = items.filter((item) => item.reportingStatus.toLowerCase() === statusFilter);
+    if (departmentFilter) {
+      items = items.filter((item) =>
+        [item.sourceDepartment, item.targetDepartment, item.operationalTargetDepartment]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(departmentFilter))
+      );
+    }
+    if (categoryFilter) items = items.filter((item) => item.sourceCategory.toLowerCase().includes(categoryFilter));
     if (paymentMethodFilter) items = items.filter((item) => item.paymentMethod.toLowerCase().includes(paymentMethodFilter));
     if (workflowStageFilter) items = items.filter((item) => normalizeWorkflowStage(item.workflowStage, '') === workflowStageFilter);
     if (dateFrom) items = items.filter((item) => String(item.createdAt || '').slice(0, 10) >= dateFrom);
@@ -7251,13 +7971,20 @@ app.get('/api/reports/export', requireAuth, requireRole('admin', 'cashier', 'acc
       items,
       search,
       (item) =>
-        `${item.referenceNumber} ${item.studentName} ${item.billingCode} ${item.receiptNumber} ${item.paymentStatus} ${item.reportingStatus} ${item.allocationSummary || ''}`
+        `${item.referenceNumber} ${item.studentName} ${item.billingCode} ${item.receiptNumber} ${item.sourceDepartment} ${item.sourceCategory} ${item.targetDepartment} ${item.paymentStatus} ${item.reportingStatus} ${item.handoffReference} ${item.allocationSummary || ''}`
     );
 
     const rows = items.map((row) => [
       row.referenceNumber,
       row.studentName,
       row.billingCode,
+      row.sourceDepartment,
+      row.sourceCategory,
+      row.departmentFlow,
+      row.operationalHandoffStatus,
+      row.targetDepartment,
+      row.handoffReference,
+      row.handoffStatus,
       row.amountFormatted,
       row.paymentStatus,
       row.documentationStatus,
@@ -7265,7 +7992,23 @@ app.get('/api/reports/export', requireAuth, requireRole('admin', 'cashier', 'acc
       row.allocationSummary || ''
     ]);
     const content = [
-      ['Reference Number', 'Student Name', 'Billing Code', 'Amount', 'Payment Status', 'Documentation Status', 'Reporting Status', 'Fee Allocation Summary'].join(','),
+      [
+        'Reference Number',
+        'Student Name',
+        'Billing Code',
+        'Source Department',
+        'Source Category',
+        'Department Flow',
+        'Operational Handoff',
+        'Reporting Target',
+        'Handoff Reference',
+        'Handoff Status',
+        'Amount',
+        'Payment Status',
+        'Documentation Status',
+        'Reporting Status',
+        'Fee Allocation Summary'
+      ].join(','),
       ...rows.map((columns) => columns.map((value) => `"${String(value).replace(/"/g, '""')}"`).join(','))
     ].join('\n');
 
@@ -7276,6 +8019,34 @@ app.get('/api/reports/export', requireAuth, requireRole('admin', 'cashier', 'acc
     });
   } catch (error) {
     sendError(res, 500, error instanceof Error ? error.message : 'Unable to export reports.');
+  }
+});
+
+app.get('/api/integrated-flow', requireAuth, async (req, res) => {
+  try {
+    const requestedDepartment = cleanTextValue(req.query?.department || 'Cashier') || 'Cashier';
+    const graph = buildDepartmentFlowGraph();
+    const departmentKey = requestedDepartment.toLowerCase();
+    const incoming = graph.edges.filter((edge) => edge.to.toLowerCase() === departmentKey);
+    const outgoing = graph.edges.filter((edge) => edge.from.toLowerCase() === departmentKey);
+
+    sendOk(res, {
+      flow: graph,
+      department: requestedDepartment,
+      incoming,
+      outgoing
+    });
+  } catch (error) {
+    sendError(res, 500, error instanceof Error ? error.message : 'Unable to load the integrated flow graph.');
+  }
+});
+
+app.get('/api/cashier/department-handoffs', requireAuth, async (_req, res) => {
+  try {
+    const payload = await buildDepartmentHandoffSnapshot();
+    sendOk(res, payload);
+  } catch (error) {
+    sendError(res, 500, error instanceof Error ? error.message : 'Unable to load cashier department handoffs.');
   }
 });
 
@@ -7587,6 +8358,11 @@ app.post('/api/reporting-reconciliation', requireAuth, async (req, res) => {
           p.payment_status,
           p.workflow_stage,
           b.billing_code,
+          b.source_module,
+          b.source_department,
+          b.source_category,
+          b.integration_profile,
+          b.target_department,
           COALESCE(r.receipt_status, 'queued') AS receipt_status
        FROM payment_transactions p
        INNER JOIN billing_records b ON b.id = p.billing_id
@@ -7617,7 +8393,8 @@ app.post('/api/reporting-reconciliation', requireAuth, async (req, res) => {
       await upsertReconciliationRecord(paymentId, receiptId, 'reconciled', {
         reconciledBy: req.currentUser.id,
         reconciledAt: nowSql(),
-        workflowStage: WORKFLOW_STAGES.REPORTING_RECONCILIATION
+        workflowStage: WORKFLOW_STAGES.REPORTING_RECONCILIATION,
+        handoffStatus: 'ready'
       });
       await pool.query('UPDATE payment_transactions SET workflow_stage = ? WHERE id = ?', [WORKFLOW_STAGES.REPORTING_RECONCILIATION, paymentId]);
       await recordWorkflowEvent({
@@ -7650,11 +8427,35 @@ app.post('/api/reporting-reconciliation', requireAuth, async (req, res) => {
     }
 
     if (action === 'report') {
+      if (String(row.reporting_status || '').toLowerCase() !== 'reconciled') {
+        sendError(res, 409, 'Only reconciled records can be handed off to another department.');
+        return;
+      }
+
+      const integration = resolveCashierIntegrationProfile({
+        billingCode: row.billing_code,
+        sourceModule: row.source_module,
+        sourceDepartment: row.source_department,
+        sourceCategory: row.source_category,
+        integrationProfile: row.integration_profile,
+        targetDepartment: row.target_department
+      });
+      const targetDepartment = cleanTextValue(req.body?.targetDepartment || req.body?.handoffDepartment) || integration.reportingDepartment;
+      const requestReference = cleanTextValue(req.body?.requestReference || req.body?.departmentRequestReference);
+      const handoffReference = nextDepartmentHandoffReference(targetDepartment, paymentId);
+      const handoffArtifact = targetDepartment === integration.operationalTargetDepartment ? integration.operationalArtifact : integration.reportingArtifact;
+
       await pool.query('UPDATE payment_transactions SET reporting_status = ? WHERE id = ?', ['reported', paymentId]);
       const [reconciliationRows] = await pool.query(`SELECT receipt_id FROM reconciliations WHERE payment_id = ? LIMIT 1`, [paymentId]);
       await upsertReconciliationRecord(paymentId, reconciliationRows[0]?.receipt_id || null, 'reported', {
         reportedAt: nowSql(),
-        workflowStage: WORKFLOW_STAGES.REPORTING_RECONCILIATION
+        workflowStage: WORKFLOW_STAGES.REPORTING_RECONCILIATION,
+        handoffDepartment: targetDepartment,
+        handoffArtifact,
+        handoffReference,
+        handoffStatus: 'sent',
+        requestReference: requestReference || null,
+        handoffNotes: note || `${handoffArtifact} sent from Cashier to ${targetDepartment}.`
       });
       await pool.query('UPDATE payment_transactions SET workflow_stage = ? WHERE id = ?', [WORKFLOW_STAGES.REPORTING_RECONCILIATION, paymentId]);
       await recordWorkflowEvent({
@@ -7662,7 +8463,7 @@ app.post('/api/reporting-reconciliation', requireAuth, async (req, res) => {
         ipAddress: req.ip || '127.0.0.1',
         rawAction: 'REPORTING_REPORT',
         action: 'Reporting Published',
-        description: `${row.reference_number} was added to financial reporting.`,
+        description: `${row.reference_number} was sent to ${targetDepartment} as ${handoffReference}.`,
         moduleKey: 'reports',
         entityType: 'reconciliation',
         entityId: paymentId,
@@ -7672,16 +8473,28 @@ app.post('/api/reporting-reconciliation', requireAuth, async (req, res) => {
           row.workflow_stage,
           resolvePaymentWorkflowStage(row.payment_status, null, row.reporting_status)
         ),
-        afterStage: WORKFLOW_STAGES.REPORTING_RECONCILIATION
+        afterStage: WORKFLOW_STAGES.REPORTING_RECONCILIATION,
+        notification: {
+          recipientRole: resolveDepartmentRecipientRole(targetDepartment),
+          recipientName: targetDepartment,
+          type: 'department_handoff',
+          title: `Cashier handoff for ${targetDepartment}`,
+          message: `${row.reference_number} was sent to ${targetDepartment} as ${handoffReference}.${requestReference ? ` Request: ${requestReference}.` : ''}`
+        }
       });
       sendOk(
         res,
-        buildWorkflowActionPayload(
-          `${row.reference_number} was marked as reported and remains in Reporting & Reconciliation.`,
-          'Reported',
-          WORKFLOW_STAGES.REPORTING_RECONCILIATION
-        ),
-        `${row.reference_number} was marked as reported and remains in Reporting & Reconciliation.`
+        {
+          ...buildWorkflowActionPayload(
+            `${row.reference_number} was sent to ${targetDepartment} as ${handoffReference}.`,
+            'Reported',
+            WORKFLOW_STAGES.REPORTING_RECONCILIATION
+          ),
+          next_module: targetDepartment,
+          handoff_department: targetDepartment,
+          handoff_reference: handoffReference
+        },
+        `${row.reference_number} was sent to ${targetDepartment} as ${handoffReference}.`
       );
       return;
     }
@@ -7737,7 +8550,8 @@ app.post('/api/reporting-reconciliation', requireAuth, async (req, res) => {
       const [reconciliationRows] = await pool.query(`SELECT receipt_id FROM reconciliations WHERE payment_id = ? LIMIT 1`, [paymentId]);
       await upsertReconciliationRecord(paymentId, reconciliationRows[0]?.receipt_id || null, 'archived', {
         archivedAt: nowSql(),
-        workflowStage: WORKFLOW_STAGES.COMPLETED
+        workflowStage: WORKFLOW_STAGES.COMPLETED,
+        handoffStatus: 'archived'
       });
       await recordWorkflowEvent({
         actorUser: req.currentUser,
