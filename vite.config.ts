@@ -535,6 +535,41 @@ async function ensureModuleActivityLogsTable(sql: ReturnType<typeof neon>): Prom
   await sql.query(`CREATE INDEX IF NOT EXISTS idx_module_activity_module ON module_activity_logs(module, created_at DESC)`);
 }
 
+async function ensureCashierEnrollmentFeedTable(sql: ReturnType<typeof neon>): Promise<void> {
+  await sql.query(`
+    CREATE TABLE IF NOT EXISTS cashier_registrar_student_enrollment_feed (
+      id BIGSERIAL PRIMARY KEY,
+      batch_id TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'Registrar',
+      office TEXT NOT NULL DEFAULT 'Registrar',
+      student_no TEXT NOT NULL,
+      student_name TEXT NOT NULL,
+      class_code TEXT DEFAULT NULL,
+      subject TEXT DEFAULT NULL,
+      academic_year TEXT DEFAULT NULL,
+      semester TEXT DEFAULT NULL,
+      status TEXT NOT NULL DEFAULT 'Pending',
+      downpayment_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+      payload JSONB DEFAULT NULL,
+      decision_notes TEXT DEFAULT NULL,
+      linked_billing_id INT DEFAULT NULL,
+      linked_billing_code VARCHAR(80) DEFAULT NULL,
+      last_action VARCHAR(60) DEFAULT NULL,
+      action_by INT DEFAULT NULL,
+      action_at TIMESTAMPTZ DEFAULT NULL,
+      sent_at TIMESTAMPTZ DEFAULT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS decision_notes TEXT NULL`);
+  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_id INT NULL`);
+  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_code VARCHAR(80) NULL`);
+  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS last_action VARCHAR(60) NULL`);
+  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_by INT NULL`);
+  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_at TIMESTAMPTZ NULL`);
+}
+
 async function ensureNotificationsTable(sql: ReturnType<typeof neon>): Promise<void> {
   await sql.query(`
     CREATE TABLE IF NOT EXISTS notifications (
@@ -775,6 +810,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           url.pathname !== '/api/admin-auth' &&
           url.pathname !== '/api/admin-profile' &&
           url.pathname !== '/api/student-billing' &&
+          url.pathname !== '/api/cashier-registrar-student-enrollment-feed' &&
           url.pathname !== '/api/process-payment' &&
           url.pathname !== '/api/generate-receipt' &&
           url.pathname !== '/api/reporting-reconciliation' &&
@@ -920,9 +956,10 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
 
         const mapBillingStatusForVerification = (raw: string): 'Draft' | 'Active Billing' | 'Pending Payment' | 'Needs Correction' => {
           const value = String(raw || '').trim().toLowerCase();
-          if (value.includes('correction')) return 'Needs Correction';
+          if (value.includes('correction') || value.includes('hold') || value.includes('reject') || value.includes('failed')) return 'Needs Correction';
           if (value === 'draft') return 'Draft';
-          if (value === 'active' || value === 'active billing') return 'Active Billing';
+          if (value === 'active' || value === 'active billing' || value === 'unpaid') return 'Active Billing';
+          if (value === 'verified' || value === 'partial') return 'Pending Payment';
           return 'Pending Payment';
         };
 
@@ -984,6 +1021,457 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             ]
           );
         }
+
+        const normalizeEnrollmentFeedStatus = (rawStatus: unknown, linkedBillingId: number | null = null): string => {
+          const normalized = toSafeText(rawStatus).toLowerCase();
+          if (!normalized && linkedBillingId) return 'Approved';
+          if (!normalized) return 'Pending Review';
+          if (['pending', 'matched', 'sent to cashier', 'for verification'].includes(normalized)) return 'Pending Review';
+          if (['cleared', 'approved', 'billing created', 'billing ready'].includes(normalized)) return 'Approved';
+          if (normalized.includes('hold')) return 'On Hold';
+          if (normalized.includes('return') || normalized.includes('reject')) return 'Returned To Registrar';
+          if (normalized.includes('approve') || normalized.includes('billing')) return 'Approved';
+          return toSafeText(rawStatus) || 'Pending Review';
+        };
+
+        const resolveEnrollmentFeedBucket = (status: unknown, linkedBillingId: number | null = null): 'pending' | 'approved' | 'hold' | 'returned' => {
+          const normalized = normalizeEnrollmentFeedStatus(status, linkedBillingId).toLowerCase();
+          if (normalized.includes('approve')) return 'approved';
+          if (normalized.includes('hold')) return 'hold';
+          if (normalized.includes('return') || normalized.includes('reject')) return 'returned';
+          return 'pending';
+        };
+
+        const mapEnrollmentBillingStatus = (rawStatus: unknown, balanceAmount: unknown): string => {
+          const value = String(rawStatus || '').trim().toLowerCase();
+          const balance = Number(balanceAmount || 0);
+          if (value === 'paid' || balance <= 0) return 'Fully Paid';
+          if (value === 'partial') return 'Partially Paid';
+          if (value === 'verified') return 'Pending Payment';
+          if (value.includes('correction') || value.includes('hold') || value.includes('reject') || value.includes('failed')) return 'Needs Correction';
+          return 'Active Billing';
+        };
+
+        const resolveEnrollmentFeedNextStep = (status: string, billingCode: string, billingStage: string): string => {
+          if (billingCode) return `${billingCode} is available in ${workflowLabel(billingStage || 'student_portal_billing')}.`;
+          const bucket = resolveEnrollmentFeedBucket(status);
+          if (bucket === 'hold') return 'Await cashier validation before billing activation.';
+          if (bucket === 'returned') return 'Await registrar correction and resend.';
+          return 'Review the registrar submission and decide whether to create billing.';
+        };
+
+        const numberToOrdinalText = (value: number): string => {
+          const normalized = Number(value || 0);
+          if (!normalized) return '';
+          const mod100 = normalized % 100;
+          if (mod100 >= 11 && mod100 <= 13) return `${normalized}th`;
+          const mod10 = normalized % 10;
+          if (mod10 === 1) return `${normalized}st`;
+          if (mod10 === 2) return `${normalized}nd`;
+          if (mod10 === 3) return `${normalized}rd`;
+          return `${normalized}th`;
+        };
+
+        const resolveEnrollmentCourse = (row: Record<string, unknown>): string => {
+          const payload = row.payload && typeof row.payload === 'object' ? (row.payload as Record<string, unknown>) : {};
+          const payloadCourse = toSafeText(payload.course);
+          if (payloadCourse) return payloadCourse;
+          const classCode = toSafeText(row.class_code);
+          if (classCode.includes('-')) return classCode.split('-')[0];
+          return classCode || toSafeText(row.subject) || 'General Enrollment';
+        };
+
+        const resolveEnrollmentYearLevel = (row: Record<string, unknown>): string => {
+          const payload = row.payload && typeof row.payload === 'object' ? (row.payload as Record<string, unknown>) : {};
+          const payloadYear = toSafeText(payload.year_level);
+          if (payloadYear) return payloadYear;
+          const classCode = toSafeText(row.class_code);
+          const match = classCode.match(/-(\d)/);
+          if (match?.[1]) return `${numberToOrdinalText(Number(match[1]))} Year`;
+          return 'Enrolled';
+        };
+
+        const buildEnrollmentBillingCode = (feedId: number): string => `BILL-ENR-${new Date().getFullYear()}-${String(feedId).padStart(4, '0')}`;
+
+        const buildEnrollmentBillingItems = (row: Record<string, unknown>, totalAmount: number) => {
+          if (!(Number(totalAmount || 0) > 0)) return [] as Array<{ code: string; name: string; category: string; amount: number }>;
+          const processingFee = Number(Math.min(Math.max(totalAmount * 0.18, 250), totalAmount).toFixed(2));
+          const reservationAmount = Number(Math.max(0, totalAmount - processingFee).toFixed(2));
+          const termLabel = [toSafeText(row.semester), toSafeText(row.academic_year)].filter(Boolean).join(' ');
+          const subjectLabel = toSafeText(row.subject) || toSafeText(row.class_code) || 'Enrollment';
+          const items: Array<{ code: string; name: string; category: string; amount: number }> = [];
+          if (reservationAmount > 0) {
+            items.push({
+              code: 'ENR-DP',
+              name: `${subjectLabel} Downpayment${termLabel ? ` - ${termLabel}` : ''}`,
+              category: 'Enrollment',
+              amount: reservationAmount
+            });
+          }
+          if (processingFee > 0) {
+            items.push({
+              code: 'REG-PROC',
+              name: 'Registrar Processing Fee',
+              category: 'Registrar',
+              amount: processingFee
+            });
+          }
+          return items;
+        };
+
+        const buildEnrollmentDecisionPayload = (
+          row: Record<string, unknown>,
+          overrides: {
+            action?: string;
+            status?: string;
+            remarks?: string;
+            actorName?: string;
+            actionAt?: string;
+            linkedBillingId?: number | null;
+            linkedBillingCode?: string | null;
+          } = {}
+        ): Record<string, unknown> => {
+          const payload = row.payload && typeof row.payload === 'object' ? ({ ...(row.payload as Record<string, unknown>) } as Record<string, unknown>) : {};
+          const previousDecision =
+            payload.cashier_decision && typeof payload.cashier_decision === 'object'
+              ? ({ ...(payload.cashier_decision as Record<string, unknown>) } as Record<string, unknown>)
+              : {};
+          payload.batch_id = toSafeText(row.batch_id);
+          payload.source = toSafeText(row.source) || 'Registrar';
+          payload.office = toSafeText(row.office) || 'Registrar';
+          payload.student_no = toSafeText(row.student_no);
+          payload.student_name = toSafeText(row.student_name);
+          payload.class_code = toSafeText(row.class_code) || null;
+          payload.subject = toSafeText(row.subject) || null;
+          payload.academic_year = toSafeText(row.academic_year) || null;
+          payload.semester = toSafeText(row.semester) || null;
+          const resolvedLinkedBillingId =
+            overrides.linkedBillingId != null ? Number(overrides.linkedBillingId) : Number(row.linked_billing_id || 0) || null;
+          payload.status = normalizeEnrollmentFeedStatus(overrides.status || row.status, resolvedLinkedBillingId);
+          payload.downpayment_amount = Number(row.downpayment_amount || 0);
+          payload.cashier_decision = {
+            ...previousDecision,
+            action: overrides.action || toSafeText(previousDecision.action),
+            remarks: overrides.remarks || toSafeText(previousDecision.remarks),
+            actor_name: overrides.actorName || toSafeText(previousDecision.actor_name),
+            action_at: overrides.actionAt || toSafeText(previousDecision.action_at) || null,
+            linked_billing_id:
+              overrides.linkedBillingId != null
+                ? Number(overrides.linkedBillingId)
+                : previousDecision.linked_billing_id != null
+                  ? Number(previousDecision.linked_billing_id)
+                  : null,
+            linked_billing_code: overrides.linkedBillingCode || toSafeText(previousDecision.linked_billing_code) || null
+          };
+          return payload;
+        };
+
+        const isEnrollmentBillingLocked = (row: {
+          workflow_stage?: string | null;
+          billing_status?: string | null;
+          balance_amount?: number | string | null;
+          paid_amount?: number | string | null;
+        }): boolean => {
+          const stage = String(row.workflow_stage || '').trim().toLowerCase();
+          return (
+            Number(row.paid_amount || 0) > 0 ||
+            ['payment_processing_gateway', 'compliance_documentation', 'reporting_reconciliation', 'completed'].includes(stage)
+          );
+        };
+
+        const fetchEnrollmentFeedRecordById = async (feedId: number) => {
+          if (!feedId) return null;
+          const rows = (await sql.query(
+            `SELECT
+                f.id,
+                f.batch_id,
+                f.source,
+                f.office,
+                f.student_no,
+                f.student_name,
+                f.class_code,
+                f.subject,
+                f.academic_year,
+                f.semester,
+                f.status,
+                f.downpayment_amount,
+                f.payload,
+                f.decision_notes,
+                f.linked_billing_id,
+                f.linked_billing_code,
+                f.last_action,
+                f.action_by,
+                f.action_at::text AS action_at,
+                f.sent_at::text AS sent_at,
+                f.created_at::text AS created_at,
+                b.id AS billing_id,
+                b.billing_code,
+                b.billing_status,
+                b.workflow_stage AS billing_workflow_stage,
+                b.balance_amount AS billing_balance_amount,
+                p.full_name AS action_by_name,
+                p.username AS action_by_username
+             FROM cashier_registrar_student_enrollment_feed f
+             LEFT JOIN billing_records b ON b.id = f.linked_billing_id
+             LEFT JOIN admin_profiles p ON p.id = f.action_by
+             WHERE f.id = $1
+             LIMIT 1`,
+            [feedId]
+          )) as Array<Record<string, unknown>>;
+          const row = rows[0];
+          if (!row) return null;
+          const linkedBillingId = Number(row.linked_billing_id || row.billing_id || 0) || null;
+          const billingStage = linkedBillingId ? String(row.billing_workflow_stage || '') || 'student_portal_billing' : '';
+          const status = normalizeEnrollmentFeedStatus(row.status, linkedBillingId);
+          return {
+            id: Number(row.id || 0),
+            batchId: toSafeText(row.batch_id),
+            source: toSafeText(row.source) || 'Registrar',
+            office: toSafeText(row.office) || 'Registrar',
+            studentNo: toSafeText(row.student_no),
+            studentName: toSafeText(row.student_name) || 'Unknown Student',
+            classCode: toSafeText(row.class_code),
+            subject: toSafeText(row.subject),
+            academicYear: toSafeText(row.academic_year),
+            semester: toSafeText(row.semester),
+            status,
+            downpaymentAmount: Number(row.downpayment_amount || 0),
+            downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
+            payload: row.payload && typeof row.payload === 'object' ? row.payload : null,
+            decisionNotes: toSafeText(row.decision_notes),
+            actionBy: toSafeText(row.action_by_name) || toSafeText(row.action_by_username),
+            actionAt: row.action_at ? new Date(String(row.action_at)).toISOString() : null,
+            lastAction: toSafeText(row.last_action),
+            billingId: linkedBillingId,
+            billingCode: toSafeText(row.linked_billing_code) || toSafeText(row.billing_code),
+            billingStatus: linkedBillingId ? mapEnrollmentBillingStatus(row.billing_status, row.billing_balance_amount) : '',
+            billingWorkflowStage: billingStage || null,
+            billingWorkflowStageLabel: billingStage ? workflowLabel(billingStage) : '',
+            nextStep: resolveEnrollmentFeedNextStep(status, toSafeText(row.linked_billing_code) || toSafeText(row.billing_code), billingStage),
+            queueBucket: resolveEnrollmentFeedBucket(status, linkedBillingId),
+            sentAt: row.sent_at ? new Date(String(row.sent_at)).toISOString() : null,
+            createdAt: row.created_at ? new Date(String(row.created_at)).toISOString() : null
+          };
+        };
+
+        const upsertEnrollmentFeedBilling = async (
+          row: Record<string, unknown>,
+          actor: { admin_profile_id?: number; full_name?: string; username?: string } | null,
+          remarks: string
+        ) => {
+          const totalAmount = Number(row.downpayment_amount || 0);
+          if (!(totalAmount > 0)) {
+            throw new Error('Downpayment amount must be greater than zero before approval.');
+          }
+
+          const payload = row.payload && typeof row.payload === 'object' ? (row.payload as Record<string, unknown>) : {};
+          const studentNo = toSafeText(row.student_no);
+          const studentName = toSafeText(row.student_name);
+          const course = resolveEnrollmentCourse(row);
+          const yearLevel = resolveEnrollmentYearLevel(row);
+          const email = toSafeText(payload.contact_email) || null;
+          const phone = toSafeText(payload.contact_phone) || null;
+          const semester = toSafeText(row.semester) || 'Current Semester';
+          const schoolYear = toSafeText(row.academic_year) || String(new Date().getFullYear());
+          const items = buildEnrollmentBillingItems(row, totalAmount);
+
+          if (!studentNo || !studentName) {
+            throw new Error('Student number and student name are required before approval.');
+          }
+          if (!items.length) {
+            throw new Error('Unable to build billing items from the enrollment feed.');
+          }
+
+          const studentRows = (await sql.query(
+            `INSERT INTO students (student_no, full_name, course, year_level, email, phone, status)
+             VALUES ($1, $2, $3, $4, $5, $6, 'active')
+             ON CONFLICT (student_no) DO UPDATE
+             SET full_name = EXCLUDED.full_name,
+                 course = EXCLUDED.course,
+                 year_level = EXCLUDED.year_level,
+                 email = COALESCE(EXCLUDED.email, students.email),
+                 phone = COALESCE(EXCLUDED.phone, students.phone),
+                 status = 'active'
+             RETURNING id`,
+            [studentNo, studentName, course || null, yearLevel || null, email, phone]
+          )) as Array<{ id: number }>;
+          const studentId = Number(studentRows[0]?.id || 0);
+          if (!studentId) {
+            throw new Error('Unable to prepare the linked student record.');
+          }
+
+          let existingBilling:
+            | {
+                id: number;
+                billing_code: string;
+                billing_status: string;
+                workflow_stage: string;
+                paid_amount: number;
+                balance_amount: number;
+              }
+            | null = null;
+
+          const linkedBillingId = Number(row.linked_billing_id || 0) || null;
+          const linkedBillingCode = toSafeText(row.linked_billing_code);
+          if (linkedBillingId) {
+            const rows = (await sql.query(
+              `SELECT id, billing_code, billing_status, workflow_stage, paid_amount, balance_amount
+               FROM billing_records
+               WHERE id = $1
+               LIMIT 1`,
+              [linkedBillingId]
+            )) as Array<{ id: number; billing_code: string; billing_status: string; workflow_stage: string; paid_amount: number; balance_amount: number }>;
+            existingBilling = rows[0] || null;
+          } else if (linkedBillingCode) {
+            const rows = (await sql.query(
+              `SELECT id, billing_code, billing_status, workflow_stage, paid_amount, balance_amount
+               FROM billing_records
+               WHERE billing_code = $1
+               LIMIT 1`,
+              [linkedBillingCode]
+            )) as Array<{ id: number; billing_code: string; billing_status: string; workflow_stage: string; paid_amount: number; balance_amount: number }>;
+            existingBilling = rows[0] || null;
+          }
+
+          if (!existingBilling) {
+            const rows = (await sql.query(
+              `SELECT id, billing_code, billing_status, workflow_stage, paid_amount, balance_amount
+               FROM billing_records
+               WHERE student_id = $1
+                 AND semester = $2
+                 AND school_year = $3
+                 AND integration_profile = 'registrar_enrollment_feed'
+               ORDER BY id DESC
+               LIMIT 1`,
+              [studentId, semester, schoolYear]
+            )) as Array<{ id: number; billing_code: string; billing_status: string; workflow_stage: string; paid_amount: number; balance_amount: number }>;
+            existingBilling = rows[0] || null;
+          }
+
+          if (existingBilling && isEnrollmentBillingLocked(existingBilling)) {
+            return {
+              billingId: Number(existingBilling.id),
+              billingCode: toSafeText(existingBilling.billing_code),
+              workflowStage: toSafeText(existingBilling.workflow_stage) || 'student_portal_billing',
+              reused: true,
+              locked: true
+            };
+          }
+
+          const billingCode = toSafeText(existingBilling?.billing_code) || buildEnrollmentBillingCode(Number(row.id || 0));
+          const targetStage = toSafeText(existingBilling?.workflow_stage) === 'pay_bills' ? 'pay_bills' : 'student_portal_billing';
+          let billingId = Number(existingBilling?.id || 0);
+
+          if (!billingId) {
+            const rows = (await sql.query(
+              `INSERT INTO billing_records (
+                 student_id,
+                 billing_code,
+                 source_module,
+                 source_department,
+                 source_category,
+                 integration_profile,
+                 target_department,
+                 semester,
+                 school_year,
+                 total_amount,
+                 paid_amount,
+                 balance_amount,
+                 billing_status,
+                 workflow_stage,
+                 remarks,
+                 action_by,
+                 action_at,
+                 audit_reference,
+                 created_at,
+                 updated_at
+               ) VALUES (
+                 $1, $2, 'Registrar Enrollment Feed', $3, 'Enrollment Downpayment', 'registrar_enrollment_feed', 'Cashier',
+                 $4, $5, $6, 0, $6, 'active', $7, $8, $9, NOW(), $10, NOW(), NOW()
+               )
+               RETURNING id`,
+              [
+                studentId,
+                billingCode,
+                toSafeText(row.office) || 'Registrar',
+                semester,
+                schoolYear,
+                totalAmount,
+                targetStage,
+                remarks || 'Created from registrar enrollment feed approval.',
+                actor?.admin_profile_id || null,
+                `ENR-FEED-${Number(row.id || 0)}-${Date.now()}`
+              ]
+            )) as Array<{ id: number }>;
+            billingId = Number(rows[0]?.id || 0);
+          } else {
+            await sql.query(
+              `UPDATE billing_records
+               SET student_id = $2,
+                   source_module = 'Registrar Enrollment Feed',
+                   source_department = $3,
+                   source_category = 'Enrollment Downpayment',
+                   integration_profile = 'registrar_enrollment_feed',
+                   target_department = 'Cashier',
+                   semester = $4,
+                   school_year = $5,
+                   balance_amount = $6,
+                   billing_status = 'active',
+                   workflow_stage = $7,
+                   remarks = $8,
+                   action_by = $9,
+                   action_at = NOW(),
+                   audit_reference = $10,
+                   is_returned = 0,
+                   needs_correction = 0,
+                   correction_reason = NULL,
+                   correction_notes = NULL,
+                   updated_at = NOW()
+               WHERE id = $1`,
+              [
+                billingId,
+                studentId,
+                toSafeText(row.office) || 'Registrar',
+                semester,
+                schoolYear,
+                totalAmount,
+                targetStage,
+                remarks || 'Updated from registrar enrollment feed approval.',
+                actor?.admin_profile_id || null,
+                `ENR-FEED-${Number(row.id || 0)}-${Date.now()}`
+              ]
+            );
+            await sql.query(`DELETE FROM billing_items WHERE billing_id = $1`, [billingId]);
+          }
+
+          for (const [index, item] of items.entries()) {
+            await sql.query(
+              `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+              [billingId, item.code, item.name, item.category, item.amount, index + 1]
+            );
+          }
+
+          await sql.query(
+            `UPDATE billing_records
+             SET total_amount = $2,
+                 paid_amount = 0,
+                 balance_amount = $2,
+                 billing_status = 'active',
+                 workflow_stage = $3,
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [billingId, totalAmount, targetStage]
+          );
+
+          return {
+            billingId,
+            billingCode,
+            workflowStage: targetStage,
+            reused: Boolean(existingBilling),
+            locked: false
+          };
+        };
 
         async function ensureCashierWorkflowDemoData(): Promise<void> {
           await ensureModuleActivityLogsTable(sql);
@@ -5468,6 +5956,528 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 activityFeed: []
               }
             });
+            return;
+          }
+
+          if (url.pathname === '/api/cashier-registrar-student-enrollment-feed' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await ensureCashierEnrollmentFeedTable(sql);
+            const search = (url.searchParams.get('search') || '').trim().toLowerCase();
+            const statusFilter = (url.searchParams.get('status') || '').trim();
+            const semesterFilter = (url.searchParams.get('semester') || '').trim();
+            const sourceFilter = (url.searchParams.get('source') || '').trim();
+            const officeFilter = (url.searchParams.get('office') || '').trim();
+            const page = Math.max(1, Number(url.searchParams.get('page') || 1));
+            const perPage = Math.min(50, Math.max(1, Number(url.searchParams.get('per_page') || 10)));
+
+            const rows = (await sql.query(
+              `SELECT
+                 f.id,
+                 f.batch_id,
+                 f.source,
+                 f.office,
+                 f.student_no,
+                 f.student_name,
+                 f.class_code,
+                 f.subject,
+                 f.academic_year,
+                 f.semester,
+                 f.status,
+                 f.downpayment_amount,
+                 f.payload,
+                 f.decision_notes,
+                 f.linked_billing_id,
+                 f.linked_billing_code,
+                 f.last_action,
+                 f.action_by,
+                 f.action_at::text AS action_at,
+                 f.sent_at::text AS sent_at,
+                 f.created_at::text AS created_at,
+                 b.id AS billing_id,
+                 b.billing_code,
+                 b.billing_status,
+                 b.workflow_stage AS billing_workflow_stage,
+                 b.balance_amount AS billing_balance_amount,
+                 p.full_name AS action_by_name,
+                 p.username AS action_by_username
+               FROM cashier_registrar_student_enrollment_feed f
+               LEFT JOIN billing_records b ON b.id = f.linked_billing_id
+               LEFT JOIN admin_profiles p ON p.id = f.action_by
+               ORDER BY COALESCE(f.sent_at, f.created_at) DESC, f.id DESC`
+            )) as Array<{
+              id: number | string;
+              batch_id: string | null;
+              source: string | null;
+              office: string | null;
+              student_no: string | null;
+              student_name: string | null;
+              class_code: string | null;
+              subject: string | null;
+              academic_year: string | null;
+              semester: string | null;
+              status: string | null;
+              downpayment_amount: number | string | null;
+              payload: Record<string, unknown> | null;
+              decision_notes: string | null;
+              linked_billing_id: number | string | null;
+              linked_billing_code: string | null;
+              last_action: string | null;
+              action_by: number | string | null;
+              action_at: string | null;
+              sent_at: string | null;
+              created_at: string | null;
+              billing_id: number | string | null;
+              billing_code: string | null;
+              billing_status: string | null;
+              billing_workflow_stage: string | null;
+              billing_balance_amount: number | string | null;
+              action_by_name: string | null;
+              action_by_username: string | null;
+            }>;
+
+            const normalized = (Array.isArray(rows) ? rows : []).map((row) => {
+              const linkedBillingId = Number(row.linked_billing_id || row.billing_id || 0) || null;
+              const billingStage = linkedBillingId ? String(row.billing_workflow_stage || '') || 'student_portal_billing' : '';
+              const normalizedStatus = normalizeEnrollmentFeedStatus(row.status, linkedBillingId);
+              return {
+                id: Number(row.id),
+                batchId: toSafeText(row.batch_id),
+                source: toSafeText(row.source) || 'Registrar',
+                office: toSafeText(row.office) || 'Registrar',
+                studentNo: toSafeText(row.student_no),
+                studentName: toSafeText(row.student_name) || 'Unknown Student',
+                classCode: toSafeText(row.class_code),
+                subject: toSafeText(row.subject),
+                academicYear: toSafeText(row.academic_year),
+                semester: toSafeText(row.semester),
+                status: normalizedStatus,
+                downpaymentAmount: Number(row.downpayment_amount || 0),
+                downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
+                payload: row.payload && typeof row.payload === 'object' ? row.payload : null,
+                decisionNotes: toSafeText(row.decision_notes),
+                actionBy: toSafeText(row.action_by_name) || toSafeText(row.action_by_username),
+                actionAt: row.action_at ? new Date(String(row.action_at)).toISOString() : null,
+                lastAction: toSafeText(row.last_action),
+                billingId: linkedBillingId,
+                billingCode: toSafeText(row.linked_billing_code) || toSafeText(row.billing_code),
+                billingStatus: linkedBillingId ? mapEnrollmentBillingStatus(row.billing_status, row.billing_balance_amount) : '',
+                billingWorkflowStage: billingStage || null,
+                billingWorkflowStageLabel: billingStage ? workflowLabel(billingStage) : '',
+                nextStep: resolveEnrollmentFeedNextStep(normalizedStatus, toSafeText(row.linked_billing_code) || toSafeText(row.billing_code), billingStage),
+                queueBucket: resolveEnrollmentFeedBucket(normalizedStatus, linkedBillingId),
+                sentAt: row.sent_at ? new Date(String(row.sent_at)).toISOString() : null,
+                createdAt: row.created_at ? new Date(String(row.created_at)).toISOString() : null
+              };
+            });
+
+            const filtered = normalized.filter((row) => {
+              const matchesSearch =
+                !search ||
+                [
+                  row.batchId,
+                  row.source,
+                  row.office,
+                  row.studentNo,
+                  row.studentName,
+                  row.classCode,
+                  row.subject,
+                  row.academicYear,
+                  row.semester,
+                  row.status,
+                  row.billingCode,
+                  row.decisionNotes,
+                  row.actionBy
+                ]
+                  .join(' ')
+                  .toLowerCase()
+                  .includes(search);
+              const matchesStatus = !statusFilter || statusFilter === 'All Statuses' || row.status === statusFilter;
+              const matchesSemester = !semesterFilter || semesterFilter === 'All Semesters' || row.semester === semesterFilter;
+              const matchesSource = !sourceFilter || sourceFilter === 'All Sources' || row.source === sourceFilter;
+              const matchesOffice = !officeFilter || officeFilter === 'All Offices' || row.office === officeFilter;
+              return matchesSearch && matchesStatus && matchesSemester && matchesSource && matchesOffice;
+            });
+
+            const total = filtered.length;
+            const totalPages = Math.max(1, Math.ceil(total / perPage));
+            const startIndex = (page - 1) * perPage;
+            const pagedItems = filtered.slice(startIndex, startIndex + perPage);
+            const pendingCount = filtered.filter((row) => row.queueBucket === 'pending').length;
+            const approvedCount = filtered.filter((row) => row.queueBucket === 'approved').length;
+            const holdCount = filtered.filter((row) => row.queueBucket === 'hold').length;
+            const returnedCount = filtered.filter((row) => row.queueBucket === 'returned').length;
+
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                stats: [
+                  {
+                    title: 'Pending Review',
+                    value: String(pendingCount),
+                    subtitle: 'Registrar submissions waiting on cashier action',
+                    icon: 'mdi-clipboard-check-outline',
+                    tone: 'blue'
+                  },
+                  {
+                    title: 'Billing Created',
+                    value: String(approvedCount),
+                    subtitle: 'Approved rows already linked to real billing records',
+                    icon: 'mdi-file-document-check-outline',
+                    tone: 'green'
+                  },
+                  {
+                    title: 'On Hold',
+                    value: String(holdCount),
+                    subtitle: 'Rows paused for validation or missing registrar details',
+                    icon: 'mdi-pause-circle-outline',
+                    tone: 'orange'
+                  },
+                  {
+                    title: 'Returned',
+                    value: String(returnedCount),
+                    subtitle: 'Rows sent back to registrar for correction',
+                    icon: 'mdi-undo-variant',
+                    tone: 'purple'
+                  }
+                ],
+                items: pagedItems,
+                meta: {
+                  page,
+                  perPage,
+                  total,
+                  totalPages
+                },
+                filters: {
+                  statuses: Array.from(new Set(normalized.map((row) => row.status).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                  semesters: Array.from(new Set(normalized.map((row) => row.semester).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                  sources: Array.from(new Set(normalized.map((row) => row.source).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                  offices: Array.from(new Set(normalized.map((row) => row.office).filter(Boolean))).sort((left, right) => left.localeCompare(right))
+                }
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/cashier-registrar-student-enrollment-feed' && (req.method || '').toUpperCase() === 'POST') {
+            await ensureCashierEnrollmentFeedTable(sql);
+            const body = await readJsonBody(req);
+            const action = String(body.action || '').trim().toLowerCase();
+            const id = Number(body.id || 0);
+            const batchId = String(body.batchId || '').trim() || `REG-ENR-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
+            const source = String(body.source || '').trim() || 'Registrar';
+            const office = String(body.office || '').trim() || 'Registrar';
+            const studentNo = String(body.studentNo || '').trim();
+            const studentName = String(body.studentName || '').trim();
+            const classCode = String(body.classCode || '').trim() || null;
+            const subject = String(body.subject || '').trim() || null;
+            const academicYear = String(body.academicYear || '').trim() || null;
+            const semester = String(body.semester || '').trim() || null;
+            const status = String(body.status || '').trim() || 'Pending';
+            const downpaymentAmount = Number(body.downpaymentAmount || 0);
+            const remarks = toSafeText(body.remarks);
+            const reason = toSafeText(body.reason);
+            const payload = {
+              batch_id: batchId,
+              source,
+              office,
+              student_no: studentNo,
+              student_name: studentName,
+              class_code: classCode,
+              subject,
+              academic_year: academicYear,
+              semester,
+              status,
+              downpayment_amount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0
+            };
+
+            if (action === 'create') {
+              if (!studentNo || !studentName) {
+                writeJson(res, 422, { ok: false, message: 'studentNo and studentName are required.' });
+                return;
+              }
+
+              const createdRows = (await sql.query(
+                `INSERT INTO cashier_registrar_student_enrollment_feed (
+                   batch_id, source, office, student_no, student_name, class_code, subject, academic_year, semester, status, downpayment_amount, payload, sent_at, created_at
+                 ) VALUES (
+                   $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, NOW(), NOW()
+                 )
+                 RETURNING id`,
+                [batchId, source, office, studentNo, studentName, classCode, subject, academicYear, semester, status, Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0, JSON.stringify(payload)]
+              )) as Array<{ id: number }>;
+              const row = await fetchEnrollmentFeedRecordById(Number(createdRows[0]?.id || 0));
+              writeJson(res, 200, {
+                ok: true,
+                message: 'Enrollment feed record created.',
+                data: row
+              });
+              return;
+            }
+
+            if (action === 'update') {
+              if (!id) {
+                writeJson(res, 422, { ok: false, message: 'A valid enrollment feed id is required.' });
+                return;
+              }
+              if (!studentNo || !studentName) {
+                writeJson(res, 422, { ok: false, message: 'studentNo and studentName are required.' });
+                return;
+              }
+
+              const updatedRows = (await sql.query(
+                `UPDATE cashier_registrar_student_enrollment_feed
+                 SET batch_id = $1,
+                     source = $2,
+                     office = $3,
+                     student_no = $4,
+                     student_name = $5,
+                     class_code = $6,
+                     subject = $7,
+                     academic_year = $8,
+                     semester = $9,
+                     status = $10,
+                     downpayment_amount = $11,
+                     payload = $12::jsonb,
+                     sent_at = NOW()
+                 WHERE id = $13
+                 RETURNING id`,
+                [batchId, source, office, studentNo, studentName, classCode, subject, academicYear, semester, status, Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0, JSON.stringify(payload), id]
+              )) as Array<{ id: number }>;
+              const rowId = Number(updatedRows[0]?.id || 0);
+              const row = await fetchEnrollmentFeedRecordById(rowId);
+              if (!row) {
+                writeJson(res, 404, { ok: false, message: 'Enrollment feed record not found.' });
+                return;
+              }
+              writeJson(res, 200, {
+                ok: true,
+                message: 'Enrollment feed record updated.',
+                data: row
+              });
+              return;
+            }
+
+            if (action === 'delete') {
+              if (!id) {
+                writeJson(res, 422, { ok: false, message: 'A valid enrollment feed id is required.' });
+                return;
+              }
+              await sql.query(`DELETE FROM cashier_registrar_student_enrollment_feed WHERE id = $1`, [id]);
+              writeJson(res, 200, { ok: true, message: 'Enrollment feed record deleted.', data: { id } });
+              return;
+            }
+
+            if (['approve', 'hold', 'return'].includes(action)) {
+              await ensureCashierWorkflowDemoData();
+              const actor = await resolveAdminSession();
+              if (!actor) {
+                writeJson(res, 401, { ok: false, message: 'Admin authentication required.' });
+                return;
+              }
+              if (!id) {
+                writeJson(res, 422, { ok: false, message: 'A valid enrollment feed id is required.' });
+                return;
+              }
+
+              const feedRows = (await sql.query(
+                `SELECT *
+                 FROM cashier_registrar_student_enrollment_feed
+                 WHERE id = $1
+                 LIMIT 1`,
+                [id]
+              )) as Array<Record<string, unknown>>;
+              const feedRow = feedRows[0];
+              if (!feedRow) {
+                writeJson(res, 404, { ok: false, message: 'Enrollment feed record not found.' });
+                return;
+              }
+
+              const actorName = toSafeText(actor.full_name) || toSafeText(actor.username) || 'Cashier';
+              const finalRemarks =
+                action === 'return' ? [reason || 'Registrar correction required.', remarks].filter(Boolean).join(' ') : remarks;
+              const previousStatus = normalizeEnrollmentFeedStatus(feedRow.status, Number(feedRow.linked_billing_id || 0) || null);
+              const nextStatus = action === 'approve' ? 'Approved' : action === 'hold' ? 'On Hold' : 'Returned To Registrar';
+              let nextStage = 'student_portal_billing';
+              let linkedBillingId = Number(feedRow.linked_billing_id || 0) || null;
+              let linkedBillingCode = toSafeText(feedRow.linked_billing_code);
+              let actionMessage = '';
+
+              if (action === 'approve') {
+                const billingResult = await upsertEnrollmentFeedBilling(feedRow, actor, remarks || 'Approved from registrar enrollment feed.');
+                linkedBillingId = billingResult.billingId;
+                linkedBillingCode = billingResult.billingCode;
+                nextStage = billingResult.workflowStage || 'student_portal_billing';
+                actionMessage = billingResult.locked
+                  ? `${billingResult.billingCode} already exists and remains in ${workflowLabel(nextStage)}.`
+                  : billingResult.reused
+                    ? `${billingResult.billingCode} was refreshed from the registrar feed and remains in ${workflowLabel(nextStage)}.`
+                    : `${billingResult.billingCode} was created and queued in ${workflowLabel(nextStage)}.`;
+              } else {
+                let billingRow:
+                  | {
+                      id: number;
+                      billing_code: string;
+                      billing_status: string;
+                      workflow_stage: string;
+                      paid_amount: number;
+                      balance_amount: number;
+                    }
+                  | null = null;
+
+                if (linkedBillingId) {
+                  const rows = (await sql.query(
+                    `SELECT id, billing_code, billing_status, workflow_stage, paid_amount, balance_amount
+                     FROM billing_records
+                     WHERE id = $1
+                     LIMIT 1`,
+                    [linkedBillingId]
+                  )) as Array<{ id: number; billing_code: string; billing_status: string; workflow_stage: string; paid_amount: number; balance_amount: number }>;
+                  billingRow = rows[0] || null;
+                } else if (linkedBillingCode) {
+                  const rows = (await sql.query(
+                    `SELECT id, billing_code, billing_status, workflow_stage, paid_amount, balance_amount
+                     FROM billing_records
+                     WHERE billing_code = $1
+                     LIMIT 1`,
+                    [linkedBillingCode]
+                  )) as Array<{ id: number; billing_code: string; billing_status: string; workflow_stage: string; paid_amount: number; balance_amount: number }>;
+                  billingRow = rows[0] || null;
+                }
+
+                if (billingRow) {
+                  if (isEnrollmentBillingLocked(billingRow)) {
+                    writeJson(res, 409, {
+                      ok: false,
+                      message: 'Linked billing already progressed beyond cashier review and can no longer be changed from this feed.'
+                    });
+                    return;
+                  }
+
+                  await sql.query(
+                    `UPDATE billing_records
+                     SET billing_status = $2,
+                         workflow_stage = 'student_portal_billing',
+                         remarks = $3,
+                         action_by = $4,
+                         action_at = NOW(),
+                         returned_to = $5,
+                         returned_by = $6,
+                         returned_at = $7,
+                         is_returned = $8,
+                         needs_correction = $9,
+                         correction_reason = $10,
+                         correction_notes = $11,
+                         updated_at = NOW()
+                     WHERE id = $1`,
+                    [
+                      billingRow.id,
+                      action === 'hold' ? 'on_hold' : 'correction',
+                      finalRemarks || (action === 'hold' ? 'Enrollment feed placed on hold.' : 'Registrar correction required.'),
+                      actor.admin_profile_id || null,
+                      action === 'return' ? 'Registrar' : null,
+                      action === 'return' ? actor.admin_profile_id || null : null,
+                      action === 'return' ? new Date().toISOString() : null,
+                      action === 'return',
+                      action === 'return',
+                      action === 'return' ? reason || 'Registrar correction required.' : null,
+                      action === 'return' ? remarks || null : null
+                    ]
+                  );
+                  linkedBillingId = Number(billingRow.id);
+                  linkedBillingCode = toSafeText(billingRow.billing_code);
+                }
+
+                actionMessage =
+                  action === 'hold'
+                    ? `${toSafeText(feedRow.student_name) || 'Enrollment record'} was placed on hold for cashier review.`
+                    : `${toSafeText(feedRow.student_name) || 'Enrollment record'} was returned to registrar for correction.`;
+              }
+
+              await sql.query(
+                `UPDATE cashier_registrar_student_enrollment_feed
+                 SET status = $2,
+                     decision_notes = $3,
+                     linked_billing_id = $4,
+                     linked_billing_code = $5,
+                     last_action = $6,
+                     action_by = $7,
+                     action_at = NOW(),
+                     payload = $8::jsonb
+                 WHERE id = $1`,
+                [
+                  id,
+                  nextStatus,
+                  finalRemarks || null,
+                  linkedBillingId,
+                  linkedBillingCode || null,
+                  action,
+                  actor.admin_profile_id || null,
+                  JSON.stringify(
+                    buildEnrollmentDecisionPayload(feedRow, {
+                      action,
+                      status: nextStatus,
+                      remarks: finalRemarks,
+                      actorName,
+                      actionAt: new Date().toISOString(),
+                      linkedBillingId,
+                      linkedBillingCode
+                    })
+                  )
+                ]
+              );
+
+              await insertModuleActivity(
+                'billing_verification',
+                action === 'approve' ? 'Enrollment Approved' : action === 'hold' ? 'Enrollment On Hold' : 'Enrollment Returned',
+                action === 'approve'
+                  ? `${toSafeText(feedRow.student_name)} approved from registrar feed. ${actionMessage}`
+                  : action === 'hold'
+                    ? `${toSafeText(feedRow.student_name)} placed on hold. ${finalRemarks || 'Awaiting cashier review.'}`
+                    : `${toSafeText(feedRow.student_name)} returned to registrar. ${finalRemarks || 'Awaiting registrar correction.'}`,
+                actorName,
+                'enrollment_feed',
+                toSafeText(feedRow.batch_id) || String(id),
+                {
+                  feedId: id,
+                  action,
+                  previousStatus,
+                  nextStatus,
+                  billingId: linkedBillingId,
+                  billingCode: linkedBillingCode || null
+                }
+              );
+
+              await ensureNotificationsTable(sql);
+              await sql.query(
+                `INSERT INTO notifications (recipient_role, recipient_name, channel, type, title, message, entity_type, entity_id, is_read, created_at)
+                 VALUES ($1, $2, 'in_app', $3, $4, $5, 'enrollment_feed', $6, FALSE, NOW())`,
+                [
+                  'cashier',
+                  actorName,
+                  action === 'approve' ? 'billing_activated' : action === 'hold' ? 'billing_on_hold' : 'billing_returned',
+                  action === 'approve' ? 'Enrollment approved' : action === 'hold' ? 'Enrollment placed on hold' : 'Enrollment returned',
+                  actionMessage,
+                  id
+                ]
+              );
+
+              const item = await fetchEnrollmentFeedRecordById(id);
+              writeJson(res, 200, {
+                ok: true,
+                message: actionMessage,
+                data: {
+                  message: actionMessage,
+                  status: nextStatus,
+                  workflow_stage: nextStage,
+                  next_module: workflowLabel(nextStage),
+                  billingId: linkedBillingId,
+                  billingCode: linkedBillingCode || null,
+                  item
+                }
+              });
+              return;
+            }
+
+            writeJson(res, 400, { ok: false, message: 'Unsupported enrollment feed action.' });
             return;
           }
 

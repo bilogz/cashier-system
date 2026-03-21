@@ -931,6 +931,12 @@ async function ensureSchema() {
       status TEXT NOT NULL DEFAULT 'Pending',
       downpayment_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
       payload JSONB DEFAULT NULL,
+      decision_notes TEXT DEFAULT NULL,
+      linked_billing_id INT DEFAULT NULL,
+      linked_billing_code VARCHAR(80) DEFAULT NULL,
+      last_action VARCHAR(60) DEFAULT NULL,
+      action_by INT DEFAULT NULL,
+      action_at TIMESTAMPTZ DEFAULT NULL,
       sent_at TIMESTAMPTZ DEFAULT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
@@ -1205,6 +1211,12 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS is_returned SMALLINT NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS needs_correction SMALLINT NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS is_completed SMALLINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS decision_notes TEXT NULL`);
+  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_id INT NULL`);
+  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_code VARCHAR(80) NULL`);
+  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS last_action VARCHAR(60) NULL`);
+  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_by INT NULL`);
+  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_at TIMESTAMPTZ NULL`);
   await pool.query(
     `ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(60) NOT NULL DEFAULT 'payment_processing_gateway'`
   );
@@ -2970,29 +2982,17 @@ function mapReportingStatus(rawStatus) {
   return 'Logged';
 }
 
-async function buildCashierRegistrarEnrollmentFeedSnapshot(filters = {}) {
-  const [rows] = await pool.query(
-    `SELECT
-        id,
-        batch_id,
-        source,
-        office,
-        student_no,
-        student_name,
-        class_code,
-        subject,
-        academic_year,
-        semester,
-        status,
-        downpayment_amount,
-        payload,
-        sent_at,
-        created_at
-     FROM cashier_registrar_student_enrollment_feed
-     ORDER BY COALESCE(sent_at, created_at) DESC, id DESC`
-  );
+function normalizeEnrollmentFeedRow(row) {
+  const linkedBillingId = row.linked_billing_id ? Number(row.linked_billing_id) : row.billing_id ? Number(row.billing_id) : null;
+  const billingStage = linkedBillingId
+    ? normalizeWorkflowStage(
+        row.billing_workflow_stage || row.workflow_stage,
+        resolveBillingWorkflowStage(row.billing_status, row.billing_balance_amount, row.billing_workflow_stage || row.workflow_stage)
+      )
+    : null;
+  const status = normalizeEnrollmentFeedStatus(row.status, linkedBillingId);
 
-  const normalizedRows = (Array.isArray(rows) ? rows : []).map((row) => ({
+  return {
     id: Number(row.id),
     batchId: cleanTextValue(row.batch_id),
     source: cleanTextValue(row.source) || 'Registrar',
@@ -3003,13 +3003,493 @@ async function buildCashierRegistrarEnrollmentFeedSnapshot(filters = {}) {
     subject: cleanTextValue(row.subject),
     academicYear: cleanTextValue(row.academic_year),
     semester: cleanTextValue(row.semester),
-    status: cleanTextValue(row.status) || 'Pending',
+    status,
     downpaymentAmount: Number(row.downpayment_amount || 0),
     downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
     payload: row.payload && typeof row.payload === 'object' ? row.payload : row.payload ? safeJsonParse(row.payload, null) : null,
+    decisionNotes: cleanTextValue(row.decision_notes),
+    actionBy: cleanTextValue(row.action_by_name || row.action_by_username),
+    actionAt: toIsoString(row.action_at),
+    lastAction: cleanTextValue(row.last_action),
+    billingId: linkedBillingId,
+    billingCode: cleanTextValue(row.linked_billing_code || row.billing_code),
+    billingStatus: linkedBillingId ? mapBillingWorkflowStatus(row.billing_status, row.billing_balance_amount) : '',
+    billingWorkflowStage: billingStage,
+    billingWorkflowStageLabel: billingStage ? workflowStageLabel(billingStage) : '',
+    nextStep: resolveEnrollmentFeedNextStep(status, cleanTextValue(row.linked_billing_code || row.billing_code), billingStage),
+    queueBucket: resolveEnrollmentFeedBoardBucket(status, linkedBillingId),
     sentAt: toIsoString(row.sent_at),
     createdAt: toIsoString(row.created_at)
-  }));
+  };
+}
+
+function normalizeEnrollmentFeedStatus(rawStatus, linkedBillingId = null) {
+  const normalized = cleanTextValue(rawStatus).toLowerCase();
+  if (!normalized && linkedBillingId) return 'Approved';
+  if (!normalized) return 'Pending Review';
+  if (normalized === 'pending' || normalized === 'matched' || normalized === 'sent to cashier' || normalized === 'for verification') {
+    return 'Pending Review';
+  }
+  if (normalized === 'cleared' || normalized === 'approved' || normalized === 'billing created' || normalized === 'billing ready') {
+    return 'Approved';
+  }
+  if (normalized === 'returned' || normalized === 'returned to registrar' || normalized === 'rejected') {
+    return 'Returned To Registrar';
+  }
+  if (normalized.includes('hold')) return 'On Hold';
+  if (normalized.includes('approve') || normalized.includes('billing')) return 'Approved';
+  if (normalized.includes('return') || normalized.includes('reject')) return 'Returned To Registrar';
+  if (linkedBillingId && normalized === 'pending') return 'Approved';
+  return cleanTextValue(rawStatus);
+}
+
+function resolveEnrollmentFeedBoardBucket(status, linkedBillingId = null) {
+  const normalized = normalizeEnrollmentFeedStatus(status, linkedBillingId).toLowerCase();
+  if (normalized.includes('approve')) return 'approved';
+  if (normalized.includes('hold')) return 'hold';
+  if (normalized.includes('return') || normalized.includes('reject')) return 'returned';
+  return 'pending';
+}
+
+function resolveEnrollmentFeedNextStep(status, billingCode, billingStage) {
+  if (billingCode) {
+    return `${billingCode} is available in ${workflowStageLabel(billingStage || WORKFLOW_STAGES.STUDENT_PORTAL_BILLING)}.`;
+  }
+
+  const bucket = resolveEnrollmentFeedBoardBucket(status);
+  if (bucket === 'hold') return 'Await cashier validation before billing activation.';
+  if (bucket === 'returned') return 'Await registrar correction and resend.';
+  return 'Review the registrar submission and decide whether to create billing.';
+}
+
+function enrollmentPayloadObject(value) {
+  if (value && typeof value === 'object') return value;
+  return safeJsonParse(value, {}) || {};
+}
+
+function numberToOrdinalText(value) {
+  const numeric = Number(value || 0);
+  if (!numeric) return '';
+  const mod100 = numeric % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${numeric}th`;
+  const mod10 = numeric % 10;
+  if (mod10 === 1) return `${numeric}st`;
+  if (mod10 === 2) return `${numeric}nd`;
+  if (mod10 === 3) return `${numeric}rd`;
+  return `${numeric}th`;
+}
+
+function resolveEnrollmentCourse(row) {
+  const payload = enrollmentPayloadObject(row.payload);
+  const payloadCourse = cleanTextValue(payload.course);
+  if (payloadCourse) return payloadCourse;
+  const classCode = cleanTextValue(row.class_code);
+  if (classCode.includes('-')) return classCode.split('-')[0];
+  if (classCode) return classCode;
+  return cleanTextValue(row.subject) || 'General Enrollment';
+}
+
+function resolveEnrollmentYearLevel(row) {
+  const payload = enrollmentPayloadObject(row.payload);
+  const payloadLevel = cleanTextValue(payload.year_level);
+  if (payloadLevel) return payloadLevel;
+
+  const classCode = cleanTextValue(row.class_code);
+  const match = classCode.match(/-(\d)/);
+  if (match?.[1]) return `${numberToOrdinalText(match[1])} Year`;
+  return 'Enrolled';
+}
+
+function buildEnrollmentBillingCode(feedId) {
+  return `BILL-ENR-${new Date().getFullYear()}-${String(feedId).padStart(4, '0')}`;
+}
+
+function buildEnrollmentBillingItems(feedRow, totalAmount) {
+  const amount = Number(totalAmount || 0);
+  if (!(amount > 0)) return [];
+
+  const processingFee = Number(Math.min(Math.max(amount * 0.18, 250), amount).toFixed(2));
+  const reservationAmount = Number(Math.max(0, amount - processingFee).toFixed(2));
+  const termLabel = [cleanTextValue(feedRow.semester), cleanTextValue(feedRow.academic_year)].filter(Boolean).join(' ');
+  const subjectLabel = cleanTextValue(feedRow.subject) || cleanTextValue(feedRow.class_code) || 'Enrollment';
+  const items = [];
+
+  if (reservationAmount > 0) {
+    items.push({
+      code: 'ENR-DP',
+      name: `${subjectLabel} Downpayment${termLabel ? ` - ${termLabel}` : ''}`,
+      category: 'Enrollment',
+      amount: reservationAmount
+    });
+  }
+
+  if (processingFee > 0) {
+    items.push({
+      code: 'REG-PROC',
+      name: 'Registrar Processing Fee',
+      category: 'Registrar',
+      amount: processingFee
+    });
+  }
+
+  return items;
+}
+
+function buildEnrollmentDecisionPayload(feedRow, overrides = {}) {
+  const existingPayload = enrollmentPayloadObject(feedRow.payload);
+  const previousDecision =
+    existingPayload.cashier_decision && typeof existingPayload.cashier_decision === 'object' ? existingPayload.cashier_decision : {};
+
+  return {
+    ...existingPayload,
+    batch_id: cleanTextValue(feedRow.batch_id),
+    source: cleanTextValue(feedRow.source) || 'Registrar',
+    office: cleanTextValue(feedRow.office) || 'Registrar',
+    student_no: cleanTextValue(feedRow.student_no),
+    student_name: cleanTextValue(feedRow.student_name),
+    class_code: cleanTextValue(feedRow.class_code) || null,
+    subject: cleanTextValue(feedRow.subject) || null,
+    academic_year: cleanTextValue(feedRow.academic_year) || null,
+    semester: cleanTextValue(feedRow.semester) || null,
+    status: normalizeEnrollmentFeedStatus(overrides.status || feedRow.status, overrides.linkedBillingId || feedRow.linked_billing_id),
+    downpayment_amount: Number(feedRow.downpayment_amount || 0),
+    cashier_decision: {
+      ...previousDecision,
+      action: cleanTextValue(overrides.action) || cleanTextValue(previousDecision.action),
+      remarks: cleanTextValue(overrides.remarks) || cleanTextValue(previousDecision.remarks),
+      actor_name: cleanTextValue(overrides.actorName) || cleanTextValue(previousDecision.actor_name),
+      action_at: overrides.actionAt || previousDecision.action_at || null,
+      linked_billing_id:
+        overrides.linkedBillingId != null
+          ? Number(overrides.linkedBillingId)
+          : previousDecision.linked_billing_id != null
+            ? Number(previousDecision.linked_billing_id)
+            : null,
+      linked_billing_code: cleanTextValue(overrides.linkedBillingCode) || cleanTextValue(previousDecision.linked_billing_code)
+    }
+  };
+}
+
+function isEnrollmentBillingLocked(row) {
+  const stage = normalizeWorkflowStage(
+    row.workflow_stage,
+    resolveBillingWorkflowStage(row.billing_status, row.balance_amount, row.workflow_stage)
+  );
+  return (
+    Number(row.paid_amount || 0) > 0 ||
+    [WORKFLOW_STAGES.PAYMENT_PROCESSING_GATEWAY, WORKFLOW_STAGES.COMPLIANCE_DOCUMENTATION, WORKFLOW_STAGES.REPORTING_RECONCILIATION, WORKFLOW_STAGES.COMPLETED].includes(
+      stage
+    )
+  );
+}
+
+async function ensureStudentForEnrollmentFeed(feedRow) {
+  const studentNo = cleanTextValue(feedRow.student_no);
+  const studentName = cleanTextValue(feedRow.student_name);
+  if (!studentNo || !studentName) {
+    throw new Error('Student number and student name are required before approving the enrollment feed.');
+  }
+
+  const course = resolveEnrollmentCourse(feedRow);
+  const yearLevel = resolveEnrollmentYearLevel(feedRow);
+  const payload = enrollmentPayloadObject(feedRow.payload);
+  const email = cleanTextValue(payload.contact_email) || null;
+  const phone = cleanTextValue(payload.contact_phone) || null;
+
+  const [existingRows] = await pool.query(`SELECT id FROM students WHERE student_no = ? LIMIT 1`, [studentNo]);
+  if (existingRows[0]?.id) {
+    await pool.query(
+      `UPDATE students
+       SET full_name = ?,
+           course = ?,
+           year_level = ?,
+           email = COALESCE(?, email),
+           phone = COALESCE(?, phone),
+           status = 'active'
+       WHERE id = ?`,
+      [studentName, course || null, yearLevel || null, email, phone, existingRows[0].id]
+    );
+    return Number(existingRows[0].id);
+  }
+
+  const [rows] = await pool.query(
+    `INSERT INTO students (student_no, full_name, course, year_level, email, phone, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+     RETURNING id`,
+    [studentNo, studentName, course || null, yearLevel || null, email, phone, nowSql()]
+  );
+
+  return Number(rows[0]?.id || 0);
+}
+
+async function upsertEnrollmentFeedBilling(feedRow, actorUser, remarks = '') {
+  const totalAmount = Number(feedRow.downpayment_amount || 0);
+  if (!(totalAmount > 0)) {
+    throw new Error('Downpayment amount must be greater than zero before approval.');
+  }
+
+  const studentId = await ensureStudentForEnrollmentFeed(feedRow);
+  const semester = cleanTextValue(feedRow.semester) || 'Current Semester';
+  const schoolYear = cleanTextValue(feedRow.academic_year) || String(new Date().getFullYear());
+  const nextItems = buildEnrollmentBillingItems(feedRow, totalAmount);
+  if (!nextItems.length) {
+    throw new Error('Unable to build billing items from the enrollment feed.');
+  }
+
+  let existingBilling = null;
+  if (feedRow.linked_billing_id) {
+    const [rows] = await pool.query(
+      `SELECT id, billing_code, billing_status, workflow_stage, paid_amount, balance_amount
+       FROM billing_records
+       WHERE id = ?
+       LIMIT 1`,
+      [feedRow.linked_billing_id]
+    );
+    existingBilling = rows[0] || null;
+  }
+
+  if (!existingBilling && cleanTextValue(feedRow.linked_billing_code)) {
+    const [rows] = await pool.query(
+      `SELECT id, billing_code, billing_status, workflow_stage, paid_amount, balance_amount
+       FROM billing_records
+       WHERE billing_code = ?
+       LIMIT 1`,
+      [feedRow.linked_billing_code]
+    );
+    existingBilling = rows[0] || null;
+  }
+
+  if (!existingBilling) {
+    const [rows] = await pool.query(
+      `SELECT id, billing_code, billing_status, workflow_stage, paid_amount, balance_amount
+       FROM billing_records
+       WHERE student_id = ?
+         AND semester = ?
+         AND school_year = ?
+         AND integration_profile = 'registrar_enrollment_feed'
+       ORDER BY id DESC
+       LIMIT 1`,
+      [studentId, semester, schoolYear]
+    );
+    existingBilling = rows[0] || null;
+  }
+
+  if (existingBilling && isEnrollmentBillingLocked(existingBilling)) {
+    return {
+      billingId: Number(existingBilling.id),
+      billingCode: cleanTextValue(existingBilling.billing_code),
+      workflowStage: normalizeWorkflowStage(
+        existingBilling.workflow_stage,
+        resolveBillingWorkflowStage(existingBilling.billing_status, existingBilling.balance_amount, existingBilling.workflow_stage)
+      ),
+      reused: true,
+      locked: true
+    };
+  }
+
+  const billingCode = cleanTextValue(existingBilling?.billing_code) || buildEnrollmentBillingCode(feedRow.id);
+  let billingId = existingBilling ? Number(existingBilling.id) : 0;
+  const targetStage =
+    existingBilling && normalizeWorkflowStage(existingBilling.workflow_stage, existingBilling.workflow_stage) === WORKFLOW_STAGES.PAY_BILLS
+      ? WORKFLOW_STAGES.PAY_BILLS
+      : WORKFLOW_STAGES.STUDENT_PORTAL_BILLING;
+
+  if (!billingId) {
+    const [rows] = await pool.query(
+      `INSERT INTO billing_records (
+        student_id,
+        billing_code,
+        source_module,
+        source_department,
+        source_category,
+        integration_profile,
+        target_department,
+        semester,
+        school_year,
+        total_amount,
+        paid_amount,
+        balance_amount,
+        billing_status,
+        workflow_stage,
+        remarks,
+        action_by,
+        action_at,
+        audit_reference,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id`,
+      [
+        studentId,
+        billingCode,
+        'Registrar Enrollment Feed',
+        cleanTextValue(feedRow.office) || 'Registrar',
+        'Enrollment Downpayment',
+        'registrar_enrollment_feed',
+        'Cashier',
+        semester,
+        schoolYear,
+        totalAmount,
+        totalAmount,
+        targetStage,
+        remarks || 'Created from registrar enrollment feed approval.',
+        actorUser?.id || null,
+        nowSql(),
+        `ENR-FEED-${feedRow.id}-${Date.now()}`,
+        nowSql(),
+        nowSql()
+      ]
+    );
+    billingId = Number(rows[0]?.id || 0);
+  } else {
+    await pool.query(
+      `UPDATE billing_records
+       SET student_id = ?,
+           source_module = ?,
+           source_department = ?,
+           source_category = ?,
+           integration_profile = ?,
+           target_department = ?,
+           semester = ?,
+           school_year = ?,
+           balance_amount = ?,
+           billing_status = 'active',
+           workflow_stage = ?,
+           remarks = ?,
+           action_by = ?,
+           action_at = ?,
+           audit_reference = ?,
+           is_returned = 0,
+           needs_correction = 0,
+           correction_reason = NULL,
+           correction_notes = NULL,
+           updated_at = ?
+       WHERE id = ?`,
+      [
+        studentId,
+        'Registrar Enrollment Feed',
+        cleanTextValue(feedRow.office) || 'Registrar',
+        'Enrollment Downpayment',
+        'registrar_enrollment_feed',
+        'Cashier',
+        semester,
+        schoolYear,
+        totalAmount,
+        targetStage,
+        remarks || 'Updated from registrar enrollment feed approval.',
+        actorUser?.id || null,
+        nowSql(),
+        `ENR-FEED-${feedRow.id}-${Date.now()}`,
+        nowSql(),
+        billingId
+      ]
+    );
+    await pool.query(`DELETE FROM billing_items WHERE billing_id = ?`, [billingId]);
+  }
+
+  for (const [index, item] of nextItems.entries()) {
+    await pool.query(
+      `INSERT INTO billing_items (billing_id, item_code, item_name, category, amount, sort_order, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [billingId, item.code, item.name, item.category, item.amount, index + 1, nowSql()]
+    );
+  }
+
+  const recalculated = await recalculateBillingFinancials(billingId, {
+    workflowStage: targetStage,
+    status: 'active'
+  });
+
+  return {
+    billingId,
+    billingCode,
+    workflowStage: targetStage,
+    reused: Boolean(existingBilling),
+    locked: false,
+    totalAmount: recalculated.totalAmount
+  };
+}
+
+async function fetchEnrollmentFeedRowById(feedId) {
+  const [rows] = await pool.query(
+    `SELECT
+        f.id,
+        f.batch_id,
+        f.source,
+        f.office,
+        f.student_no,
+        f.student_name,
+        f.class_code,
+        f.subject,
+        f.academic_year,
+        f.semester,
+        f.status,
+        f.downpayment_amount,
+        f.payload,
+        f.decision_notes,
+        f.linked_billing_id,
+        f.linked_billing_code,
+        f.last_action,
+        f.action_by,
+        f.action_at,
+        f.sent_at,
+        f.created_at,
+        b.id AS billing_id,
+        b.billing_code,
+        b.billing_status,
+        b.workflow_stage AS billing_workflow_stage,
+        b.balance_amount AS billing_balance_amount,
+        u.full_name AS action_by_name,
+        u.username AS action_by_username
+     FROM cashier_registrar_student_enrollment_feed f
+     LEFT JOIN billing_records b ON b.id = f.linked_billing_id
+     LEFT JOIN admin_users u ON u.id = f.action_by
+     WHERE f.id = ?
+     LIMIT 1`,
+    [feedId]
+  );
+
+  return rows[0] ? normalizeEnrollmentFeedRow(rows[0]) : null;
+}
+
+async function buildCashierRegistrarEnrollmentFeedSnapshot(filters = {}) {
+  const [rows] = await pool.query(
+    `SELECT
+        f.id,
+        f.batch_id,
+        f.source,
+        f.office,
+        f.student_no,
+        f.student_name,
+        f.class_code,
+        f.subject,
+        f.academic_year,
+        f.semester,
+        f.status,
+        f.downpayment_amount,
+        f.payload,
+        f.decision_notes,
+        f.linked_billing_id,
+        f.linked_billing_code,
+        f.last_action,
+        f.action_by,
+        f.action_at,
+        f.sent_at,
+        f.created_at,
+        b.id AS billing_id,
+        b.billing_code,
+        b.billing_status,
+        b.workflow_stage AS billing_workflow_stage,
+        b.balance_amount AS billing_balance_amount,
+        u.full_name AS action_by_name,
+        u.username AS action_by_username
+     FROM cashier_registrar_student_enrollment_feed f
+     LEFT JOIN billing_records b ON b.id = f.linked_billing_id
+     LEFT JOIN admin_users u ON u.id = f.action_by
+     ORDER BY COALESCE(f.sent_at, f.created_at) DESC, f.id DESC`
+  );
+
+  const normalizedRows = (Array.isArray(rows) ? rows : []).map(normalizeEnrollmentFeedRow);
 
   const search = cleanTextValue(filters.search).toLowerCase();
   const statusFilter = cleanTextValue(filters.status);
@@ -3032,7 +3512,10 @@ async function buildCashierRegistrarEnrollmentFeedSnapshot(filters = {}) {
         row.subject,
         row.academicYear,
         row.semester,
-        row.status
+        row.status,
+        row.billingCode,
+        row.decisionNotes,
+        row.actionBy
       ]
         .join(' ')
         .toLowerCase()
@@ -3045,39 +3528,39 @@ async function buildCashierRegistrarEnrollmentFeedSnapshot(filters = {}) {
     return matchesSearch && matchesStatus && matchesSemester && matchesSource && matchesOffice;
   });
 
-  const uniqueStudents = new Set(filtered.map((row) => row.studentNo || row.studentName).filter(Boolean));
-  const uniqueBatches = new Set(filtered.map((row) => row.batchId).filter(Boolean));
-  const totalDownpayment = filtered.reduce((sum, row) => sum + Number(row.downpaymentAmount || 0), 0);
-  const recentlySent = filtered.filter((row) => row.sentAt).length;
+  const pendingCount = filtered.filter((row) => row.queueBucket === 'pending').length;
+  const approvedCount = filtered.filter((row) => row.queueBucket === 'approved').length;
+  const holdCount = filtered.filter((row) => row.queueBucket === 'hold').length;
+  const returnedCount = filtered.filter((row) => row.queueBucket === 'returned').length;
 
   return {
     stats: [
       {
-        title: 'Feed Records',
-        value: String(filtered.length),
-        subtitle: 'Enrollment rows visible from registrar feed',
-        icon: 'mdi-table-account',
+        title: 'Pending Review',
+        value: String(pendingCount),
+        subtitle: 'Registrar submissions waiting on cashier action',
+        icon: 'mdi-clipboard-check-outline',
         tone: 'blue'
       },
       {
-        title: 'Students',
-        value: String(uniqueStudents.size),
-        subtitle: 'Distinct students represented in the feed',
-        icon: 'mdi-account-cash-outline',
+        title: 'Billing Created',
+        value: String(approvedCount),
+        subtitle: 'Approved rows already linked to real billing records',
+        icon: 'mdi-file-document-check-outline',
         tone: 'green'
       },
       {
-        title: 'Batches',
-        value: String(uniqueBatches.size),
-        subtitle: 'Batch groups currently available to cashier',
-        icon: 'mdi-calendar-week-outline',
+        title: 'On Hold',
+        value: String(holdCount),
+        subtitle: 'Rows paused for validation or missing registrar details',
+        icon: 'mdi-pause-circle-outline',
         tone: 'orange'
       },
       {
-        title: 'Downpayment',
-        value: formatCurrency(totalDownpayment),
-        subtitle: `${recentlySent} record(s) already sent from registrar`,
-        icon: 'mdi-currency-php',
+        title: 'Returned',
+        value: String(returnedCount),
+        subtitle: 'Rows sent back to registrar for correction',
+        icon: 'mdi-undo-variant',
         tone: 'purple'
       }
     ],
@@ -8383,6 +8866,325 @@ app.get('/api/cashier-registrar-student-enrollment-feed', requireAuth, async (re
     sendOk(res, payload);
   } catch (error) {
     sendError(res, 500, error instanceof Error ? error.message : 'Unable to load cashier registrar enrollment feed.');
+  }
+});
+
+app.post('/api/cashier-registrar-student-enrollment-feed', requireAuth, async (req, res) => {
+  try {
+    const action = cleanTextValue(req.body?.action).toLowerCase();
+    const id = Number(req.body?.id || 0);
+    const batchId = cleanTextValue(req.body?.batchId) || `REG-ENR-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
+    const source = cleanTextValue(req.body?.source) || 'Registrar';
+    const office = cleanTextValue(req.body?.office) || 'Registrar';
+    const studentNo = cleanTextValue(req.body?.studentNo);
+    const studentName = cleanTextValue(req.body?.studentName);
+    const classCode = cleanTextValue(req.body?.classCode) || null;
+    const subject = cleanTextValue(req.body?.subject) || null;
+    const academicYear = cleanTextValue(req.body?.academicYear) || null;
+    const semester = cleanTextValue(req.body?.semester) || null;
+    const status = cleanTextValue(req.body?.status) || 'Pending';
+    const downpaymentAmount = Number(req.body?.downpaymentAmount || 0);
+    const remarks = cleanTextValue(req.body?.remarks);
+    const reason = cleanTextValue(req.body?.reason);
+    const payloadJson = JSON.stringify({
+      batch_id: batchId,
+      source,
+      office,
+      student_no: studentNo,
+      student_name: studentName,
+      class_code: classCode,
+      subject,
+      academic_year: academicYear,
+      semester,
+      status,
+      downpayment_amount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0
+    });
+
+    if (action === 'create') {
+      if (!studentNo || !studentName) {
+        sendError(res, 422, 'studentNo and studentName are required.');
+        return;
+      }
+
+      const [rows] = await pool.query(
+        `INSERT INTO cashier_registrar_student_enrollment_feed (
+           batch_id, source, office, student_no, student_name, class_code, subject, academic_year, semester, status, downpayment_amount, payload, sent_at, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW(), NOW())
+         RETURNING id`,
+        [batchId, source, office, studentNo, studentName, classCode, subject, academicYear, semester, status, Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0, payloadJson]
+      );
+      const item = await fetchEnrollmentFeedRowById(Number(rows[0]?.id || 0));
+      sendOk(res, item, 'Enrollment feed record created.');
+      return;
+    }
+
+    if (action === 'update') {
+      if (!id) {
+        sendError(res, 422, 'A valid enrollment feed id is required.');
+        return;
+      }
+      if (!studentNo || !studentName) {
+        sendError(res, 422, 'studentNo and studentName are required.');
+        return;
+      }
+
+      const [rows] = await pool.query(
+        `UPDATE cashier_registrar_student_enrollment_feed
+         SET batch_id = ?,
+             source = ?,
+             office = ?,
+             student_no = ?,
+             student_name = ?,
+             class_code = ?,
+             subject = ?,
+             academic_year = ?,
+             semester = ?,
+             status = ?,
+             downpayment_amount = ?,
+             payload = ?::jsonb,
+             sent_at = NOW()
+         WHERE id = ?
+         RETURNING id`,
+        [batchId, source, office, studentNo, studentName, classCode, subject, academicYear, semester, status, Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0, payloadJson, id]
+      );
+      if (!rows[0]) {
+        sendError(res, 404, 'Enrollment feed record not found.');
+        return;
+      }
+      const item = await fetchEnrollmentFeedRowById(id);
+      sendOk(res, item, 'Enrollment feed record updated.');
+      return;
+    }
+
+    if (action === 'delete') {
+      if (!id) {
+        sendError(res, 422, 'A valid enrollment feed id is required.');
+        return;
+      }
+      await pool.query(`DELETE FROM cashier_registrar_student_enrollment_feed WHERE id = ?`, [id]);
+      sendOk(res, { id }, 'Enrollment feed record deleted.');
+      return;
+    }
+
+    if (['approve', 'hold', 'return'].includes(action)) {
+      if (!id) {
+        sendError(res, 422, 'A valid enrollment feed id is required.');
+        return;
+      }
+
+      const [feedRows] = await pool.query(`SELECT * FROM cashier_registrar_student_enrollment_feed WHERE id = ? LIMIT 1`, [id]);
+      const feedRow = feedRows[0];
+      if (!feedRow) {
+        sendError(res, 404, 'Enrollment feed record not found.');
+        return;
+      }
+
+      const actorName = req.currentUser?.full_name || req.currentUser?.username || 'Cashier';
+      const actionAtIso = new Date().toISOString();
+      const previousStatus = normalizeEnrollmentFeedStatus(feedRow.status, feedRow.linked_billing_id);
+      let nextStatus = action === 'approve' ? 'Approved' : action === 'hold' ? 'On Hold' : 'Returned To Registrar';
+      let nextStage = WORKFLOW_STAGES.STUDENT_PORTAL_BILLING;
+      let linkedBillingId = feedRow.linked_billing_id ? Number(feedRow.linked_billing_id) : null;
+      let linkedBillingCode = cleanTextValue(feedRow.linked_billing_code);
+      let actionMessage = '';
+      let beforeStage = linkedBillingId ? WORKFLOW_STAGES.STUDENT_PORTAL_BILLING : null;
+
+      if (action === 'approve') {
+        const billingResult = await upsertEnrollmentFeedBilling(feedRow, req.currentUser, remarks || 'Approved from registrar enrollment feed.');
+        linkedBillingId = billingResult.billingId;
+        linkedBillingCode = billingResult.billingCode;
+        nextStage = billingResult.workflowStage || WORKFLOW_STAGES.STUDENT_PORTAL_BILLING;
+        beforeStage = billingResult.reused ? nextStage : null;
+        actionMessage = billingResult.locked
+          ? `${billingResult.billingCode} already exists and remains in ${workflowStageLabel(nextStage)}.`
+          : billingResult.reused
+            ? `${billingResult.billingCode} was refreshed from the registrar feed and remains in ${workflowStageLabel(nextStage)}.`
+            : `${billingResult.billingCode} was created and queued in ${workflowStageLabel(nextStage)}.`;
+      } else if (linkedBillingId || linkedBillingCode) {
+        let billingRow = null;
+        if (linkedBillingId) {
+          const [billingRows] = await pool.query(
+            `SELECT id, billing_code, billing_status, workflow_stage, paid_amount, balance_amount
+             FROM billing_records
+             WHERE id = ?
+             LIMIT 1`,
+            [linkedBillingId]
+          );
+          billingRow = billingRows[0] || null;
+        } else if (linkedBillingCode) {
+          const [billingRows] = await pool.query(
+            `SELECT id, billing_code, billing_status, workflow_stage, paid_amount, balance_amount
+             FROM billing_records
+             WHERE billing_code = ?
+             LIMIT 1`,
+            [linkedBillingCode]
+          );
+          billingRow = billingRows[0] || null;
+        }
+        if (billingRow) {
+          if (isEnrollmentBillingLocked(billingRow)) {
+            sendError(res, 409, 'Linked billing already progressed beyond cashier review and can no longer be changed from this feed.');
+            return;
+          }
+
+          beforeStage = normalizeWorkflowStage(
+            billingRow.workflow_stage,
+            resolveBillingWorkflowStage(billingRow.billing_status, billingRow.balance_amount, billingRow.workflow_stage)
+          );
+          linkedBillingId = Number(billingRow.id);
+          linkedBillingCode = cleanTextValue(billingRow.billing_code);
+          nextStage = WORKFLOW_STAGES.STUDENT_PORTAL_BILLING;
+          const combinedRemarks =
+            action === 'return'
+              ? [reason || 'Registrar correction required.', remarks].filter(Boolean).join(' ')
+              : remarks || 'Enrollment feed placed on hold for cashier review.';
+
+          await pool.query(
+            `UPDATE billing_records
+             SET billing_status = ?,
+                 workflow_stage = ?,
+                 previous_workflow_stage = ?,
+                 action_by = ?,
+                 action_at = ?,
+                 remarks = ?,
+                 audit_reference = ?,
+                 returned_to = ?,
+                 returned_by = ?,
+                 returned_at = ?,
+                 is_returned = ?,
+                 needs_correction = ?,
+                 correction_reason = ?,
+                 correction_notes = ?,
+                 updated_at = ?
+             WHERE id = ?`,
+            [
+              action === 'hold' ? 'on_hold' : 'correction',
+              WORKFLOW_STAGES.STUDENT_PORTAL_BILLING,
+              beforeStage,
+              req.currentUser?.id || null,
+              nowSql(),
+              combinedRemarks,
+              `ENR-FEED-${action.toUpperCase()}-${id}-${Date.now()}`,
+              action === 'return' ? 'Registrar' : null,
+              action === 'return' ? req.currentUser?.id || null : null,
+              action === 'return' ? nowSql() : null,
+              action === 'return' ? 1 : 0,
+              action === 'return' ? 1 : 0,
+              action === 'return' ? reason || 'Registrar correction required.' : null,
+              action === 'return' ? remarks || null : null,
+              nowSql(),
+              billingRow.id
+            ]
+          );
+        }
+
+        actionMessage =
+          action === 'hold'
+            ? `${feedRow.student_name} was placed on hold for cashier review.`
+            : `${feedRow.student_name} was returned to registrar for correction.`;
+      } else {
+        actionMessage =
+          action === 'hold'
+            ? `${feedRow.student_name} was placed on hold for cashier review.`
+            : `${feedRow.student_name} was returned to registrar for correction.`;
+      }
+
+      const finalRemarks =
+        action === 'return' ? [reason || 'Registrar correction required.', remarks].filter(Boolean).join(' ') : remarks;
+      const decisionPayload = JSON.stringify(
+        buildEnrollmentDecisionPayload(feedRow, {
+          action,
+          status: nextStatus,
+          remarks: finalRemarks,
+          actorName,
+          actionAt: actionAtIso,
+          linkedBillingId,
+          linkedBillingCode
+        })
+      );
+
+      await pool.query(
+        `UPDATE cashier_registrar_student_enrollment_feed
+         SET status = ?,
+             decision_notes = ?,
+             linked_billing_id = ?,
+             linked_billing_code = ?,
+             last_action = ?,
+             action_by = ?,
+             action_at = ?,
+             payload = ?::jsonb
+         WHERE id = ?`,
+        [nextStatus, finalRemarks || null, linkedBillingId, linkedBillingCode || null, action, req.currentUser?.id || null, nowSql(), decisionPayload, id]
+      );
+
+      await recordWorkflowEvent({
+        actorUser: req.currentUser,
+        ipAddress: req.ip || '127.0.0.1',
+        rawAction:
+          action === 'approve'
+            ? 'BILLING_PORTAL_ENROLLMENT_APPROVE'
+            : action === 'hold'
+              ? 'BILLING_PORTAL_ENROLLMENT_HOLD'
+              : 'BILLING_PORTAL_ENROLLMENT_RETURN',
+        action:
+          action === 'approve'
+            ? 'Enrollment Approved'
+            : action === 'hold'
+              ? 'Enrollment On Hold'
+              : 'Enrollment Returned',
+        description:
+          action === 'approve'
+            ? `${feedRow.student_name} enrollment feed was approved. ${actionMessage}`
+            : action === 'hold'
+              ? `${feedRow.student_name} enrollment feed was placed on hold. ${finalRemarks || ''}`.trim()
+              : `${feedRow.student_name} enrollment feed was returned to registrar. ${finalRemarks || ''}`.trim(),
+        moduleKey: 'billing_verification',
+        entityType: 'enrollment_feed',
+        entityId: id,
+        beforeStatus: previousStatus,
+        afterStatus: nextStatus,
+        beforeStage,
+        afterStage: nextStage,
+        notification: {
+          recipientRole: 'cashier',
+          type:
+            action === 'approve'
+              ? 'billing_activated'
+              : action === 'hold'
+                ? 'billing_on_hold'
+                : 'billing_returned',
+          title:
+            action === 'approve'
+              ? 'Enrollment approved'
+              : action === 'hold'
+                ? 'Enrollment placed on hold'
+                : 'Enrollment returned',
+          message:
+            action === 'approve'
+              ? `${feedRow.student_name} is now linked to ${linkedBillingCode || 'a billing record'} in ${workflowStageLabel(nextStage)}.`
+              : action === 'hold'
+                ? `${feedRow.student_name} remains on hold pending cashier validation.`
+                : `${feedRow.student_name} was returned to registrar for correction.`
+        }
+      });
+
+      const item = await fetchEnrollmentFeedRowById(id);
+      sendOk(
+        res,
+        {
+          ...buildWorkflowActionPayload(actionMessage, nextStatus, nextStage),
+          billingId: linkedBillingId,
+          billingCode: linkedBillingCode || null,
+          item
+        },
+        actionMessage
+      );
+      return;
+    }
+
+    sendError(res, 400, 'Unsupported enrollment feed action.');
+  } catch (error) {
+    sendError(res, 500, error instanceof Error ? error.message : 'Unable to update cashier registrar enrollment feed.');
   }
 });
 
