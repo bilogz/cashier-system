@@ -1,6 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
-import { mdiCheckDecagramOutline, mdiDeleteOutline, mdiMagnify, mdiPauseCircleOutline, mdiPencilOutline, mdiUndoVariant } from '@mdi/js';
+import {
+  mdiCheckDecagramOutline,
+  mdiClose,
+  mdiDeleteOutline,
+  mdiFilterRemoveOutline,
+  mdiMagnify,
+  mdiPauseCircleOutline,
+  mdiPencilOutline,
+  mdiPlus,
+  mdiUndoVariant
+} from '@mdi/js';
 import { useRoute } from 'vue-router';
 import CashierAnalyticsCard from '@/components/shared/CashierAnalyticsCard.vue';
 import CashierActionButton from '@/components/shared/CashierActionButton.vue';
@@ -74,6 +84,7 @@ const totalItems = ref(0);
 const loading = ref(false);
 const actionLoading = ref(false);
 const errorMessage = ref('');
+let activeForegroundLoads = 0;
 
 const editorOpen = ref(false);
 const editorMode = ref<'create' | 'edit'>('create');
@@ -263,50 +274,55 @@ function validateForm(): boolean {
 }
 
 async function loadSnapshot(options: { silent?: boolean } = {}): Promise<void> {
-  const payload = await realtime.runLatest(
-    async () =>
-      fetchEnrollmentFeedSnapshot({
-        search: search.value.trim(),
-        status: statusFilter.value,
-        semester: semesterFilter.value,
-        source: sourceFilter.value,
-        office: officeFilter.value,
-        page: currentPage.value,
-        perPage: itemsPerPage.value
-      }),
-    {
-      silent: options.silent,
-      onStart: () => {
-        loading.value = true;
-      },
-      onFinish: () => {
-        loading.value = false;
-      },
-      onError: async (error) => {
-        const message = error instanceof Error ? error.message : 'Unable to load enrollment feed.';
-        if (message.toLowerCase().includes('authentication required')) {
-          await auth.logout();
-          return;
-        }
-        errorMessage.value = message;
-      }
-    }
-  );
-  if (!payload) return;
-  errorMessage.value = '';
-  stats.value = payload.stats;
-  items.value = payload.items;
-  totalPages.value = payload.meta.totalPages;
-  totalItems.value = payload.meta.total;
-  statusOptions.value = payload.filters.statuses;
-  semesterOptions.value = payload.filters.semesters;
-  sourceOptions.value = payload.filters.sources;
-  officeOptions.value = payload.filters.offices;
-  if (!selectedItem.value) {
-    selectedItem.value = payload.items[0] || null;
-    return;
+  if (!options.silent) {
+    activeForegroundLoads += 1;
+    loading.value = true;
   }
-  selectedItem.value = payload.items.find((item) => item.id === selectedItem.value?.id) || payload.items[0] || null;
+  try {
+    const payload = await realtime.runLatest(
+      async () =>
+        fetchEnrollmentFeedSnapshot({
+          search: search.value.trim(),
+          status: statusFilter.value,
+          semester: semesterFilter.value,
+          source: sourceFilter.value,
+          office: officeFilter.value,
+          page: currentPage.value,
+          perPage: itemsPerPage.value
+        }),
+      {
+        silent: options.silent,
+        onError: async (error) => {
+          const message = error instanceof Error ? error.message : 'Unable to load enrollment feed.';
+          if (message.toLowerCase().includes('authentication required')) {
+            await auth.logout();
+            return;
+          }
+          errorMessage.value = message;
+        }
+      }
+    );
+    if (!payload) return;
+    errorMessage.value = '';
+    stats.value = payload.stats;
+    items.value = payload.items;
+    totalPages.value = payload.meta.totalPages;
+    totalItems.value = payload.meta.total;
+    statusOptions.value = payload.filters.statuses;
+    semesterOptions.value = payload.filters.semesters;
+    sourceOptions.value = payload.filters.sources;
+    officeOptions.value = payload.filters.offices;
+    if (!selectedItem.value) {
+      selectedItem.value = payload.items[0] || null;
+      return;
+    }
+    selectedItem.value = payload.items.find((item) => item.id === selectedItem.value?.id) || payload.items[0] || null;
+  } finally {
+    if (!options.silent) {
+      activeForegroundLoads = Math.max(0, activeForegroundLoads - 1);
+      loading.value = activeForegroundLoads > 0;
+    }
+  }
 }
 
 function clearFilters(): void {
@@ -424,7 +440,10 @@ async function submitDecision(formValues: Record<string, string | number>): Prom
 }
 
 watch([statusFilter, semesterFilter, sourceFilter, officeFilter, itemsPerPage], () => {
-  currentPage.value = 1;
+  if (currentPage.value !== 1) {
+    currentPage.value = 1;
+    return;
+  }
   void loadSnapshot();
 });
 watch(currentPage, () => {
@@ -434,7 +453,10 @@ let searchDebounce: ReturnType<typeof setTimeout> | null = null;
 watch(search, () => {
   if (searchDebounce) clearTimeout(searchDebounce);
   searchDebounce = setTimeout(() => {
-    currentPage.value = 1;
+    if (currentPage.value !== 1) {
+      currentPage.value = 1;
+      return;
+    }
     void loadSnapshot();
   }, REALTIME_POLICY.debounce.registrationSearchMs);
 });
@@ -499,8 +521,8 @@ onUnmounted(() => {
                 <div class="d-flex align-center justify-space-between flex-wrap ga-2">
                   <div class="text-body-2 text-medium-emphasis">{{ resultSummary }}</div>
                   <div class="d-flex ga-2 flex-wrap">
-                    <v-btn color="primary" prepend-icon="mdi-plus" rounded="pill" @click="openCreateDialog">Add Record</v-btn>
-                    <v-btn v-if="hasActiveFilters" size="small" variant="text" color="primary" prepend-icon="mdi-filter-remove-outline" @click="clearFilters">Clear Filters</v-btn>
+                    <v-btn color="primary" :prepend-icon="mdiPlus" rounded="pill" @click="openCreateDialog">Add Record</v-btn>
+                    <v-btn v-if="hasActiveFilters" size="small" variant="text" color="primary" :prepend-icon="mdiFilterRemoveOutline" @click="clearFilters">Clear Filters</v-btn>
                   </div>
                 </div>
               </div>
@@ -634,7 +656,7 @@ onUnmounted(() => {
       <v-card class="panel-card">
         <v-card-title class="d-flex align-center justify-space-between">
           <span>{{ editorTitle }}</span>
-          <v-btn icon variant="text" :disabled="actionLoading" @click="editorOpen = false"><v-icon>mdi-close</v-icon></v-btn>
+          <v-btn icon variant="text" :disabled="actionLoading" @click="editorOpen = false"><v-icon :icon="mdiClose" /></v-btn>
         </v-card-title>
         <v-card-text>
           <v-row>
