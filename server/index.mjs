@@ -943,6 +943,27 @@ async function ensureSchema() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS crad_student_list_feed (
+      id BIGSERIAL PRIMARY KEY,
+      enrollment_feed_id BIGINT DEFAULT NULL,
+      billing_id INT DEFAULT NULL,
+      batch_id TEXT DEFAULT NULL,
+      student_no TEXT NOT NULL,
+      student_name TEXT NOT NULL,
+      semester TEXT DEFAULT NULL,
+      academic_year TEXT DEFAULT NULL,
+      downpayment_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+      paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+      status TEXT NOT NULL DEFAULT 'queued',
+      payload JSONB DEFAULT NULL,
+      sent_by INT DEFAULT NULL,
+      sent_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_crad_student_list_feed_enrollment_feed_id ON crad_student_list_feed (enrollment_feed_id)`);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS student_accounts (
       id SERIAL PRIMARY KEY,
       student_id INT NOT NULL UNIQUE,
@@ -9185,6 +9206,202 @@ app.post('/api/cashier-registrar-student-enrollment-feed', requireAuth, async (r
     sendError(res, 400, 'Unsupported enrollment feed action.');
   } catch (error) {
     sendError(res, 500, error instanceof Error ? error.message : 'Unable to update cashier registrar enrollment feed.');
+  }
+});
+
+app.get('/api/crad-student-list-feed', requireAuth, async (_req, res) => {
+  try {
+    const [eligibleRows] = await pool.query(
+      `SELECT
+         f.id AS enrollment_feed_id,
+         f.linked_billing_id AS billing_id,
+         f.batch_id,
+         f.student_no,
+         f.student_name,
+         f.semester,
+         f.academic_year,
+         f.downpayment_amount,
+         b.paid_amount,
+         c.id AS sent_id,
+         c.sent_at::text AS sent_at
+       FROM cashier_registrar_student_enrollment_feed f
+       INNER JOIN billing_records b ON b.id = f.linked_billing_id
+       LEFT JOIN crad_student_list_feed c ON c.enrollment_feed_id = f.id
+       WHERE COALESCE(f.downpayment_amount, 0) > 0
+         AND LOWER(COALESCE(f.last_action, '')) = 'approve'
+         AND COALESCE(b.paid_amount, 0) >= COALESCE(f.downpayment_amount, 0)
+       ORDER BY f.id DESC`
+    );
+
+    const eligibleItems = (Array.isArray(eligibleRows) ? eligibleRows : []).map((row) => ({
+      enrollmentFeedId: Number(row.enrollment_feed_id || 0),
+      billingId: Number(row.billing_id || 0) || null,
+      batchId: cleanTextValue(row.batch_id),
+      studentNo: cleanTextValue(row.student_no),
+      studentName: cleanTextValue(row.student_name),
+      semester: cleanTextValue(row.semester),
+      academicYear: cleanTextValue(row.academic_year),
+      downpaymentAmount: Number(row.downpayment_amount || 0),
+      downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
+      paidAmount: Number(row.paid_amount || 0),
+      paidAmountFormatted: formatCurrency(row.paid_amount || 0),
+      alreadySent: Boolean(row.sent_id),
+      sentAt: row.sent_at ? new Date(String(row.sent_at)).toISOString() : null
+    }));
+
+    const [sentRows] = await pool.query(
+      `SELECT id, enrollment_feed_id, student_no, student_name, semester, academic_year, downpayment_amount, paid_amount, status, sent_at::text AS sent_at
+       FROM crad_student_list_feed
+       ORDER BY sent_at DESC, id DESC
+       LIMIT 200`
+    );
+
+    const sentItems = (Array.isArray(sentRows) ? sentRows : []).map((row) => ({
+      id: Number(row.id || 0),
+      enrollmentFeedId: Number(row.enrollment_feed_id || 0) || null,
+      studentNo: cleanTextValue(row.student_no),
+      studentName: cleanTextValue(row.student_name),
+      semester: cleanTextValue(row.semester),
+      academicYear: cleanTextValue(row.academic_year),
+      downpaymentAmount: Number(row.downpayment_amount || 0),
+      downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
+      paidAmount: Number(row.paid_amount || 0),
+      paidAmountFormatted: formatCurrency(row.paid_amount || 0),
+      status: cleanTextValue(row.status) || 'queued',
+      sentAt: row.sent_at ? new Date(String(row.sent_at)).toISOString() : null
+    }));
+
+    sendOk(res, {
+      stats: [
+        {
+          title: 'Eligible Paid Students',
+          value: String(eligibleItems.filter((item) => !item.alreadySent).length),
+          subtitle: 'Ready for CRAD feed insertion',
+          icon: 'mdi-account-check-outline',
+          tone: 'green'
+        },
+        {
+          title: 'Already Sent',
+          value: String(sentItems.length),
+          subtitle: 'Rows in crad_student_list_feed',
+          icon: 'mdi-send-check-outline',
+          tone: 'blue'
+        },
+        {
+          title: 'Downpayment Cleared',
+          value: String(eligibleItems.length),
+          subtitle: 'Paid >= required downpayment',
+          icon: 'mdi-cash-check',
+          tone: 'purple'
+        },
+        {
+          title: 'Pending Send',
+          value: String(eligibleItems.filter((item) => !item.alreadySent).length),
+          subtitle: 'Eligible rows not yet sent',
+          icon: 'mdi-clock-outline',
+          tone: 'orange'
+        }
+      ],
+      eligibleItems,
+      sentItems
+    });
+  } catch (error) {
+    sendError(res, 500, error instanceof Error ? error.message : 'Unable to load CRAD paid student feed.');
+  }
+});
+
+app.post('/api/crad-student-list-feed', requireAuth, async (req, res) => {
+  try {
+    const action = cleanTextValue(req.body?.action).toLowerCase();
+    if (action !== 'send') {
+      sendError(res, 400, 'Unsupported CRAD student list feed action.');
+      return;
+    }
+
+    const enrollmentFeedId = Number(req.body?.enrollmentFeedId || 0);
+    if (!enrollmentFeedId) {
+      sendError(res, 422, 'A valid enrollmentFeedId is required.');
+      return;
+    }
+
+    const [existingRows] = await pool.query(
+      `SELECT id FROM crad_student_list_feed WHERE enrollment_feed_id = ? LIMIT 1`,
+      [enrollmentFeedId]
+    );
+    if (existingRows[0]) {
+      sendOk(res, { id: Number(existingRows[0].id || 0) }, 'Student already sent to CRAD student list feed.');
+      return;
+    }
+
+    const [eligibleRows] = await pool.query(
+      `SELECT
+         f.id AS enrollment_feed_id,
+         f.linked_billing_id AS billing_id,
+         f.batch_id,
+         f.student_no,
+         f.student_name,
+         f.semester,
+         f.academic_year,
+         f.downpayment_amount,
+         f.payload,
+         b.paid_amount
+       FROM cashier_registrar_student_enrollment_feed f
+       INNER JOIN billing_records b ON b.id = f.linked_billing_id
+       WHERE f.id = ?
+         AND COALESCE(f.downpayment_amount, 0) > 0
+         AND LOWER(COALESCE(f.last_action, '')) = 'approve'
+         AND COALESCE(b.paid_amount, 0) >= COALESCE(f.downpayment_amount, 0)
+       LIMIT 1`,
+      [enrollmentFeedId]
+    );
+
+    const row = eligibleRows[0];
+    if (!row) {
+      sendError(res, 404, 'Eligible paid downpayment student not found.');
+      return;
+    }
+
+    const insertPayload = JSON.stringify({
+      enrollment_feed_id: Number(row.enrollment_feed_id || 0),
+      billing_id: Number(row.billing_id || 0) || null,
+      batch_id: cleanTextValue(row.batch_id),
+      student_no: cleanTextValue(row.student_no),
+      student_name: cleanTextValue(row.student_name),
+      semester: cleanTextValue(row.semester),
+      academic_year: cleanTextValue(row.academic_year),
+      downpayment_amount: Number(row.downpayment_amount || 0),
+      paid_amount: Number(row.paid_amount || 0),
+      source_payload: row.payload && typeof row.payload === 'object' ? row.payload : null
+    });
+
+    const [insertRows] = await pool.query(
+      `INSERT INTO crad_student_list_feed (
+         enrollment_feed_id, billing_id, batch_id, student_no, student_name, semester, academic_year, downpayment_amount, paid_amount, status, payload, sent_by, sent_at, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, NOW(), NOW())
+       RETURNING id`,
+      [
+        Number(row.enrollment_feed_id || 0),
+        Number(row.billing_id || 0) || null,
+        cleanTextValue(row.batch_id),
+        cleanTextValue(row.student_no),
+        cleanTextValue(row.student_name),
+        cleanTextValue(row.semester),
+        cleanTextValue(row.academic_year),
+        Number(row.downpayment_amount || 0),
+        Number(row.paid_amount || 0),
+        'queued',
+        insertPayload,
+        req.currentUser?.id || null
+      ]
+    );
+
+    sendOk(
+      res,
+      { id: Number(insertRows[0]?.id || 0) },
+      `${cleanTextValue(row.student_name)} was sent to crad_student_list_feed.`
+    );
+  } catch (error) {
+    sendError(res, 500, error instanceof Error ? error.message : 'Unable to send paid student to CRAD feed.');
   }
 });
 

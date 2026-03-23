@@ -6157,6 +6157,132 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             return;
           }
 
+          if (url.pathname === '/api/crad-student-list-feed' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await ensureCashierEnrollmentFeedTable(sql);
+            await sql.query(
+              `CREATE TABLE IF NOT EXISTS crad_student_list_feed (
+                 id BIGSERIAL PRIMARY KEY,
+                 enrollment_feed_id BIGINT DEFAULT NULL,
+                 billing_id INT DEFAULT NULL,
+                 batch_id TEXT DEFAULT NULL,
+                 student_no TEXT NOT NULL,
+                 student_name TEXT NOT NULL,
+                 semester TEXT DEFAULT NULL,
+                 academic_year TEXT DEFAULT NULL,
+                 downpayment_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+                 paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+                 status TEXT NOT NULL DEFAULT 'queued',
+                 payload JSONB DEFAULT NULL,
+                 sent_by INT DEFAULT NULL,
+                 sent_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+               )`
+            );
+            await sql.query(
+              `CREATE UNIQUE INDEX IF NOT EXISTS idx_crad_student_list_feed_enrollment_feed_id
+               ON crad_student_list_feed (enrollment_feed_id)`
+            );
+
+            const eligibleRows = (await sql.query(
+              `SELECT
+                 f.id AS enrollment_feed_id,
+                 f.linked_billing_id AS billing_id,
+                 f.batch_id,
+                 f.student_no,
+                 f.student_name,
+                 f.semester,
+                 f.academic_year,
+                 f.downpayment_amount,
+                 b.paid_amount,
+                 c.id AS sent_id,
+                 c.sent_at::text AS sent_at
+               FROM cashier_registrar_student_enrollment_feed f
+               INNER JOIN billing_records b ON b.id = f.linked_billing_id
+               LEFT JOIN crad_student_list_feed c ON c.enrollment_feed_id = f.id
+               WHERE COALESCE(f.downpayment_amount, 0) > 0
+                 AND LOWER(COALESCE(f.last_action, '')) = 'approve'
+                 AND COALESCE(b.paid_amount, 0) >= COALESCE(f.downpayment_amount, 0)
+               ORDER BY f.id DESC`
+            )) as Array<Record<string, unknown>>;
+
+            const eligibleItems = eligibleRows.map((row) => ({
+              enrollmentFeedId: Number(row.enrollment_feed_id || 0),
+              billingId: Number(row.billing_id || 0) || null,
+              batchId: toSafeText(row.batch_id),
+              studentNo: toSafeText(row.student_no),
+              studentName: toSafeText(row.student_name),
+              semester: toSafeText(row.semester),
+              academicYear: toSafeText(row.academic_year),
+              downpaymentAmount: Number(row.downpayment_amount || 0),
+              downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
+              paidAmount: Number(row.paid_amount || 0),
+              paidAmountFormatted: formatCurrency(row.paid_amount || 0),
+              alreadySent: Boolean(row.sent_id),
+              sentAt: row.sent_at ? new Date(String(row.sent_at)).toISOString() : null
+            }));
+
+            const sentRows = (await sql.query(
+              `SELECT id, enrollment_feed_id, student_no, student_name, semester, academic_year, downpayment_amount, paid_amount, status, sent_at::text AS sent_at
+               FROM crad_student_list_feed
+               ORDER BY sent_at DESC, id DESC
+               LIMIT 200`
+            )) as Array<Record<string, unknown>>;
+
+            const sentItems = sentRows.map((row) => ({
+              id: Number(row.id || 0),
+              enrollmentFeedId: Number(row.enrollment_feed_id || 0) || null,
+              studentNo: toSafeText(row.student_no),
+              studentName: toSafeText(row.student_name),
+              semester: toSafeText(row.semester),
+              academicYear: toSafeText(row.academic_year),
+              downpaymentAmount: Number(row.downpayment_amount || 0),
+              downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
+              paidAmount: Number(row.paid_amount || 0),
+              paidAmountFormatted: formatCurrency(row.paid_amount || 0),
+              status: toSafeText(row.status) || 'queued',
+              sentAt: row.sent_at ? new Date(String(row.sent_at)).toISOString() : null
+            }));
+
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                stats: [
+                  {
+                    title: 'Eligible Paid Students',
+                    value: String(eligibleItems.filter((item) => !item.alreadySent).length),
+                    subtitle: 'Ready for CRAD feed insertion',
+                    icon: 'mdi-account-check-outline',
+                    tone: 'green'
+                  },
+                  {
+                    title: 'Already Sent',
+                    value: String(sentItems.length),
+                    subtitle: 'Rows in crad_student_list_feed',
+                    icon: 'mdi-send-check-outline',
+                    tone: 'blue'
+                  },
+                  {
+                    title: 'Downpayment Cleared',
+                    value: String(eligibleItems.length),
+                    subtitle: 'Paid >= required downpayment',
+                    icon: 'mdi-cash-check',
+                    tone: 'purple'
+                  },
+                  {
+                    title: 'Pending Send',
+                    value: String(eligibleItems.filter((item) => !item.alreadySent).length),
+                    subtitle: 'Eligible rows not yet sent',
+                    icon: 'mdi-clock-outline',
+                    tone: 'orange'
+                  }
+                ],
+                eligibleItems,
+                sentItems
+              }
+            });
+            return;
+          }
+
           if (url.pathname === '/api/cashier-registrar-student-enrollment-feed' && (req.method || '').toUpperCase() === 'POST') {
             await ensureCashierEnrollmentFeedTable(sql);
             const body = await readJsonBody(req);
@@ -6478,6 +6604,130 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             }
 
             writeJson(res, 400, { ok: false, message: 'Unsupported enrollment feed action.' });
+            return;
+          }
+
+          if (url.pathname === '/api/crad-student-list-feed' && (req.method || '').toUpperCase() === 'POST') {
+            await ensureCashierEnrollmentFeedTable(sql);
+            await sql.query(
+              `CREATE TABLE IF NOT EXISTS crad_student_list_feed (
+                 id BIGSERIAL PRIMARY KEY,
+                 enrollment_feed_id BIGINT DEFAULT NULL,
+                 billing_id INT DEFAULT NULL,
+                 batch_id TEXT DEFAULT NULL,
+                 student_no TEXT NOT NULL,
+                 student_name TEXT NOT NULL,
+                 semester TEXT DEFAULT NULL,
+                 academic_year TEXT DEFAULT NULL,
+                 downpayment_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+                 paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+                 status TEXT NOT NULL DEFAULT 'queued',
+                 payload JSONB DEFAULT NULL,
+                 sent_by INT DEFAULT NULL,
+                 sent_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+               )`
+            );
+            await sql.query(
+              `CREATE UNIQUE INDEX IF NOT EXISTS idx_crad_student_list_feed_enrollment_feed_id
+               ON crad_student_list_feed (enrollment_feed_id)`
+            );
+
+            const body = await readJsonBody(req);
+            const action = String(body.action || '').trim().toLowerCase();
+            if (action !== 'send') {
+              writeJson(res, 400, { ok: false, message: 'Unsupported CRAD student list feed action.' });
+              return;
+            }
+
+            const enrollmentFeedId = Number(body.enrollmentFeedId || 0);
+            if (!enrollmentFeedId) {
+              writeJson(res, 422, { ok: false, message: 'A valid enrollmentFeedId is required.' });
+              return;
+            }
+
+            const existingRows = (await sql.query(
+              `SELECT id FROM crad_student_list_feed WHERE enrollment_feed_id = $1 LIMIT 1`,
+              [enrollmentFeedId]
+            )) as Array<Record<string, unknown>>;
+            if (existingRows[0]) {
+              writeJson(res, 200, {
+                ok: true,
+                message: 'Student already sent to CRAD student list feed.',
+                data: { id: Number(existingRows[0].id || 0) }
+              });
+              return;
+            }
+
+            const eligibleRows = (await sql.query(
+              `SELECT
+                 f.id AS enrollment_feed_id,
+                 f.linked_billing_id AS billing_id,
+                 f.batch_id,
+                 f.student_no,
+                 f.student_name,
+                 f.semester,
+                 f.academic_year,
+                 f.downpayment_amount,
+                 f.payload,
+                 b.paid_amount
+               FROM cashier_registrar_student_enrollment_feed f
+               INNER JOIN billing_records b ON b.id = f.linked_billing_id
+               WHERE f.id = $1
+                 AND COALESCE(f.downpayment_amount, 0) > 0
+                 AND LOWER(COALESCE(f.last_action, '')) = 'approve'
+                 AND COALESCE(b.paid_amount, 0) >= COALESCE(f.downpayment_amount, 0)
+               LIMIT 1`,
+              [enrollmentFeedId]
+            )) as Array<Record<string, unknown>>;
+            const row = eligibleRows[0];
+            if (!row) {
+              writeJson(res, 404, { ok: false, message: 'Eligible paid downpayment student not found.' });
+              return;
+            }
+
+            const actor = await resolveAdminSession();
+            const insertPayload = {
+              enrollment_feed_id: Number(row.enrollment_feed_id || 0),
+              billing_id: Number(row.billing_id || 0) || null,
+              batch_id: toSafeText(row.batch_id),
+              student_no: toSafeText(row.student_no),
+              student_name: toSafeText(row.student_name),
+              semester: toSafeText(row.semester),
+              academic_year: toSafeText(row.academic_year),
+              downpayment_amount: Number(row.downpayment_amount || 0),
+              paid_amount: Number(row.paid_amount || 0),
+              source_payload: row.payload && typeof row.payload === 'object' ? row.payload : null
+            };
+
+            const insertRows = (await sql.query(
+              `INSERT INTO crad_student_list_feed (
+                 enrollment_feed_id, billing_id, batch_id, student_no, student_name, semester, academic_year, downpayment_amount, paid_amount, status, payload, sent_by, sent_at, created_at
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, NOW(), NOW())
+               RETURNING id`,
+              [
+                Number(row.enrollment_feed_id || 0),
+                Number(row.billing_id || 0) || null,
+                toSafeText(row.batch_id),
+                toSafeText(row.student_no),
+                toSafeText(row.student_name),
+                toSafeText(row.semester),
+                toSafeText(row.academic_year),
+                Number(row.downpayment_amount || 0),
+                Number(row.paid_amount || 0),
+                'queued',
+                JSON.stringify(insertPayload),
+                actor?.id || null
+              ]
+            )) as Array<Record<string, unknown>>;
+
+            writeJson(res, 200, {
+              ok: true,
+              message: `${toSafeText(row.student_name)} was sent to crad_student_list_feed.`,
+              data: {
+                id: Number(insertRows[0]?.id || 0)
+              }
+            });
             return;
           }
 

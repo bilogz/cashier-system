@@ -1,19 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
-  mdiCheckDecagramOutline,
   mdiClose,
-  mdiDeleteOutline,
   mdiFilterRemoveOutline,
   mdiMagnify,
-  mdiPauseCircleOutline,
-  mdiPencilOutline,
-  mdiPlus,
-  mdiUndoVariant
+  mdiPlus
 } from '@mdi/js';
 import { useRoute } from 'vue-router';
 import CashierAnalyticsCard from '@/components/shared/CashierAnalyticsCard.vue';
-import CashierActionButton from '@/components/shared/CashierActionButton.vue';
 import ModuleActivityLogs from '@/components/shared/ModuleActivityLogs.vue';
 import WorkflowActionDialog from '@/components/shared/WorkflowActionDialog.vue';
 import { emitSuccessModal } from '@/composables/useSuccessModal';
@@ -44,8 +38,6 @@ type FeedForm = {
   status: string;
   downpaymentAmount: number;
 };
-
-type DetailField = { label: string; value: string; wide?: boolean };
 type DialogField = {
   key: string;
   label: string;
@@ -124,28 +116,6 @@ const resultSummary = computed(() => {
   return `${totalItems.value} enrollment row${totalItems.value === 1 ? '' : 's'} available`;
 });
 
-const selectedDetails = computed<DetailField[]>(() => {
-  if (!selectedItem.value) return [];
-  return [
-    { label: 'Student Number', value: selectedItem.value.studentNo || '--' },
-    { label: 'Class Code', value: selectedItem.value.classCode || '--' },
-    { label: 'Subject', value: selectedItem.value.subject || '--' },
-    { label: 'Academic Year', value: selectedItem.value.academicYear || '--' },
-    { label: 'Semester', value: selectedItem.value.semester || '--' },
-    { label: 'Feed Status', value: selectedItem.value.status || '--' },
-    { label: 'Downpayment', value: selectedItem.value.downpaymentAmountFormatted || '--' },
-    { label: 'Linked Billing', value: selectedItem.value.billingCode || 'Not created yet' },
-    { label: 'Billing Stage', value: selectedItem.value.billingWorkflowStageLabel || '--' },
-    { label: 'Cashier Note', value: selectedItem.value.decisionNotes || '--', wide: true },
-    { label: 'Handled By', value: selectedItem.value.actionBy || '--' },
-    { label: 'Handled At', value: formatDateTime(selectedItem.value.actionAt || null) },
-    { label: 'Batch ID', value: selectedItem.value.batchId || '--' },
-    { label: 'Source', value: selectedItem.value.source || '--' },
-    { label: 'Office', value: selectedItem.value.office || '--' },
-    { label: 'Next Step', value: selectedItem.value.nextStep || '--', wide: true }
-  ];
-});
-
 const decisionDialogTitle = computed(() => {
   if (decisionAction.value === 'approve') return decisionTarget.value?.billingCode ? 'Refresh Linked Billing' : 'Approve And Create Billing';
   if (decisionAction.value === 'hold') return 'Place Enrollment On Hold';
@@ -166,8 +136,6 @@ const decisionConfirmLabel = computed(() => {
 
 const decisionConfirmColor = computed(() => (decisionAction.value === 'approve' ? 'success' : decisionAction.value === 'hold' ? 'warning' : 'error'));
 const decisionChipLabel = computed(() => (decisionAction.value === 'approve' ? 'Cashier Approval' : decisionAction.value === 'hold' ? 'Validation Hold' : 'Registrar Return'));
-const approveButtonLabel = computed(() => (selectedItem.value?.billingCode ? 'Refresh Billing' : 'Approve & Create Billing'));
-
 const decisionContextFields = computed(() => {
   const item = decisionTarget.value;
   if (!item) return [];
@@ -246,13 +214,6 @@ function fillForm(item: EnrollmentFeedItem): void {
     downpaymentAmount: Number(item.downpaymentAmount || 0)
   };
   formErrors.value = {};
-}
-
-function formatDateTime(value: string | null | undefined): string {
-  if (!value) return '--';
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value;
-  return new Intl.DateTimeFormat('en-US', { month: 'short', day: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }).format(parsed);
 }
 
 function statusColor(status: string): string {
@@ -498,7 +459,7 @@ onUnmounted(() => {
       <CashierAnalyticsCard :title="stat.title" :value="stat.value" :subtitle="stat.subtitle" :icon="stat.icon" :tone="stat.tone" />
     </v-col>
 
-    <v-col cols="12" lg="8">
+    <v-col cols="12">
       <v-card class="panel-card" variant="outlined">
         <v-card-item>
           <div class="d-flex flex-column flex-xl-row justify-space-between ga-4 w-100">
@@ -547,6 +508,7 @@ onUnmounted(() => {
                   <th>STATUS</th>
                   <th>DOWNPAYMENT</th>
                   <th>BILLING</th>
+                  <th class="text-center">ACTION</th>
                   <th class="text-right">MAINTAIN</th>
                 </tr>
               </thead>
@@ -567,6 +529,25 @@ onUnmounted(() => {
                     <div v-if="item.billingCode" class="billing-link">{{ item.billingCode }}</div>
                     <div v-else class="billing-link billing-link--empty">Awaiting approval</div>
                   </td>
+                  <td class="text-center">
+                    <div class="d-inline-flex ga-2 flex-wrap justify-center">
+                      <v-btn
+                        size="small"
+                        variant="tonal"
+                        color="success"
+                        :disabled="actionLoading"
+                        @click.stop="openDecisionDialog('approve', item)"
+                      >
+                        {{ item.billingCode ? 'Refresh Billing' : 'Approve' }}
+                      </v-btn>
+                      <v-btn size="small" variant="tonal" color="warning" :disabled="actionLoading" @click.stop="openDecisionDialog('hold', item)">
+                        Hold
+                      </v-btn>
+                      <v-btn size="small" variant="tonal" color="error" :disabled="actionLoading" @click.stop="openDecisionDialog('return', item)">
+                        Return
+                      </v-btn>
+                    </div>
+                  </td>
                   <td class="text-right">
                     <div class="d-inline-flex ga-2">
                       <v-btn size="small" variant="tonal" color="primary" @click.stop="openEditDialog(item)">Edit</v-btn>
@@ -575,7 +556,7 @@ onUnmounted(() => {
                   </td>
                 </tr>
                 <tr v-if="!loading && items.length === 0">
-                  <td colspan="7" class="text-center text-medium-emphasis py-8">No enrollment rows are available yet in `cashier_registrar_student_enrollment_feed`.</td>
+                  <td colspan="8" class="text-center text-medium-emphasis py-8">No enrollment rows are available yet in `cashier_registrar_student_enrollment_feed`.</td>
                 </tr>
               </tbody>
             </v-table>
@@ -586,50 +567,6 @@ onUnmounted(() => {
             <v-pagination v-model="currentPage" :length="totalPages" density="comfortable" total-visible="5" />
           </div>
         </v-card-text>
-      </v-card>
-    </v-col>
-
-    <v-col cols="12" lg="4" class="focus-column">
-      <v-card class="panel-card mb-6" variant="outlined">
-        <v-card-item>
-          <v-card-title>Cashier Decision Focus</v-card-title>
-          <v-card-subtitle>Apply approval, hold, or return actions to the selected row.</v-card-subtitle>
-        </v-card-item>
-        <v-card-text v-if="selectedItem">
-          <div class="focus-banner mb-4">
-            <div>
-              <div class="text-overline">Selected Student</div>
-              <div class="text-h6 font-weight-bold">{{ selectedItem.studentName }}</div>
-              <div class="text-body-2">{{ selectedItem.studentNo || 'No student number' }} | {{ selectedItem.downpaymentAmountFormatted }}</div>
-            </div>
-            <v-chip size="small" :color="statusColor(selectedItem.status)" variant="tonal">{{ selectedItem.status }}</v-chip>
-          </div>
-
-          <div class="workflow-callout mb-4">
-            <div class="meta-label">Current Path</div>
-            <div class="workflow-callout__title">{{ selectedItem.nextStep || 'Review required.' }}</div>
-            <div class="workflow-callout__meta">{{ selectedItem.billingCode ? `Linked billing: ${selectedItem.billingCode}` : 'No billing link yet. Approval will create one.' }}</div>
-          </div>
-
-          <div class="action-stack mb-4">
-            <CashierActionButton :label="approveButtonLabel" :icon="mdiCheckDecagramOutline" color="success" :disabled="actionLoading" @click="openDecisionDialog('approve', selectedItem)" />
-            <CashierActionButton label="Put On Hold" :icon="mdiPauseCircleOutline" color="warning" :disabled="actionLoading" @click="openDecisionDialog('hold', selectedItem)" />
-            <CashierActionButton label="Return To Registrar" :icon="mdiUndoVariant" color="error" :disabled="actionLoading" @click="openDecisionDialog('return', selectedItem)" />
-          </div>
-
-          <div class="secondary-actions mb-4">
-            <v-btn variant="tonal" color="primary" :prepend-icon="mdiPencilOutline" @click="openEditDialog(selectedItem)">Edit Feed Row</v-btn>
-            <v-btn variant="tonal" color="error" :prepend-icon="mdiDeleteOutline" @click="askDelete(selectedItem)">Delete Feed Row</v-btn>
-          </div>
-
-          <div class="detail-grid">
-            <div v-for="detail in selectedDetails" :key="detail.label" :class="{ 'detail-item--wide': detail.wide }">
-              <div class="meta-label">{{ detail.label }}</div>
-              <div class="meta-value">{{ detail.value }}</div>
-            </div>
-          </div>
-        </v-card-text>
-        <v-card-text v-else class="text-body-2 text-medium-emphasis">Select an enrollment row to review its cashier path.</v-card-text>
       </v-card>
     </v-col>
 

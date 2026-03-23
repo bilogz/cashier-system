@@ -39,6 +39,15 @@ const MainRoutes = {
       }
     },
     {
+      name: 'CRAD Paid Student List Feed',
+      path: '/modules/billing-verification/crad-student-list-feed',
+      component: () => import('@/views/cashier/modules/CradStudentListFeedPage.vue'),
+      meta: {
+        pageTitle: 'CRAD Paid Student List Feed',
+        pageDescription: 'View paid downpayment students and send qualified records to crad_student_list_feed.'
+      }
+    },
+    {
       name: 'Compliance & Documentation',
       path: '/modules/generate-receipt',
       component: () => import('@/views/cashier/modules/GenerateReceiptPage.vue'),

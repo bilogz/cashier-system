@@ -39,6 +39,11 @@ const sidebarItem: menu[] = [
     to: '/modules/process-payment'
   },
   {
+    title: 'Paid Student List Feed',
+    icon: 'mdi-account-cash-outline',
+    to: '/modules/billing-verification/crad-student-list-feed'
+  },
+  {
     title: 'Compliance & Documentation',
     icon: 'mdi-receipt-text-outline',
     to: '/modules/generate-receipt'
