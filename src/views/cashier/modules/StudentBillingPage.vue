@@ -556,7 +556,7 @@ onUnmounted(() => {
                   </td>
                 </tr>
                 <tr v-if="!loading && items.length === 0">
-                  <td colspan="8" class="text-center text-medium-emphasis py-8">No enrollment rows are available yet in `cashier_registrar_student_enrollment_feed`.</td>
+                  <td colspan="8" class="text-center text-medium-emphasis py-8">No enrollment records yet. Incoming registrar rows will appear here automatically.</td>
                 </tr>
               </tbody>
             </v-table>

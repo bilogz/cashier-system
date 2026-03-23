@@ -23,6 +23,35 @@ const studentSessions = new Map();
 
 const pool = createDbPool();
 
+async function warmUpDbConnection() {
+  let retries = 0;
+  const maxRetries = 5;
+  const baseDelayMs = 500;
+
+  while (retries < maxRetries) {
+    try {
+      console.log(`[cashier] Warming up DB connection, attempt ${retries + 1}/${maxRetries}...`);
+      // Perform a simple query to check connectivity
+      await pool.query('SELECT 1');
+      console.log('[cashier] DB connection warmed up successfully.');
+      return;
+    } catch (error) {
+      retries++;
+      const delay = baseDelayMs * Math.pow(2, retries - 1);
+      console.error(`[cashier] DB warmup failed (attempt ${retries}):`, error.message);
+      if (retries < maxRetries) {
+        console.log(`[cashier] Retrying in ${delay}ms...`);
+        await new Promise(res => setTimeout(res, delay));
+      } else {
+        console.error('[cashier] Failed to warm up DB connection after multiple retries. Exiting.');
+        process.exit(1);
+      }
+    }
+  }
+}
+
+warmUpDbConnection();
+
 app.use(
   cors({
     origin(origin, callback) {
@@ -488,6 +517,51 @@ function cleanTextValue(value) {
   return String(value || '').trim();
 }
 
+function splitSchemaAndTable(identifier) {
+  const normalized = cleanTextValue(identifier).replace(/"/g, '');
+  if (!normalized) return { schema: 'public', table: '' };
+  const [schema, table] = normalized.includes('.') ? normalized.split('.', 2) : ['public', normalized];
+  return { schema, table };
+}
+
+async function tableExists(identifier) {
+  const { schema, table } = splitSchemaAndTable(identifier);
+  if (!table) return false;
+  const [rows] = await pool.query(
+    `SELECT 1
+     FROM information_schema.tables
+     WHERE table_schema = ?
+       AND table_name = ?
+     LIMIT 1`,
+    [schema, table]
+  );
+  return Boolean(rows[0]);
+}
+
+async function findFirstExistingTable(candidates = []) {
+  for (const candidate of candidates) {
+    if (await tableExists(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function columnExists(identifier, columnName) {
+  const { schema, table } = splitSchemaAndTable(identifier);
+  if (!table) return false;
+  const [rows] = await pool.query(
+    `SELECT 1
+     FROM information_schema.columns
+     WHERE table_schema = ?
+       AND table_name = ?
+       AND column_name = ?
+     LIMIT 1`,
+    [schema, table, cleanTextValue(columnName)]
+  );
+  return Boolean(rows[0]);
+}
+
 function compactIntegrationText(parts = []) {
   return parts
     .flat()
@@ -917,8 +991,9 @@ async function ensureSchema() {
   `);
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS cashier_registrar_student_enrollment_feed (
+    CREATE TABLE IF NOT EXISTS public.cashier_registrar_student_enrollment_feed (
       id BIGSERIAL PRIMARY KEY,
+      source_enrollment_id BIGINT UNIQUE,
       batch_id TEXT NOT NULL,
       source TEXT NOT NULL DEFAULT 'Registrar',
       office TEXT NOT NULL DEFAULT 'Registrar',
@@ -1232,12 +1307,18 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS is_returned SMALLINT NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS needs_correction SMALLINT NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS is_completed SMALLINT NOT NULL DEFAULT 0`);
-  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS decision_notes TEXT NULL`);
-  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_id INT NULL`);
-  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_code VARCHAR(80) NULL`);
-  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS last_action VARCHAR(60) NULL`);
-  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_by INT NULL`);
-  await pool.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_at TIMESTAMPTZ NULL`);
+  await pool.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS decision_notes TEXT NULL`);
+  await pool.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_id INT NULL`);
+  await pool.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_code VARCHAR(80) NULL`);
+  await pool.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS last_action VARCHAR(60) NULL`);
+  await pool.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_by INT NULL`);
+  await pool.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_at TIMESTAMPTZ NULL`);
+  await pool.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS source_enrollment_id BIGINT NULL`);
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_cashier_registrar_student_enrollment_feed_source_enrollment_id
+     ON public.cashier_registrar_student_enrollment_feed (source_enrollment_id)
+     WHERE source_enrollment_id IS NOT NULL`
+  );
   await pool.query(
     `ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(60) NOT NULL DEFAULT 'payment_processing_gateway'`
   );
@@ -1396,10 +1477,10 @@ async function ensureSchema() {
     );
   }
 
-  const [[enrollmentFeedCountRow]] = await pool.query('SELECT COUNT(*) AS total FROM cashier_registrar_student_enrollment_feed');
+  const [[enrollmentFeedCountRow]] = await pool.query('SELECT COUNT(*) AS total FROM public.cashier_registrar_student_enrollment_feed');
   if (Number(enrollmentFeedCountRow?.total || 0) === 0) {
     await pool.query(
-      `INSERT INTO cashier_registrar_student_enrollment_feed (
+      `INSERT INTO public.cashier_registrar_student_enrollment_feed (
         batch_id, source, office, student_no, student_name, class_code, subject, academic_year, semester, status, downpayment_amount, payload, sent_at, created_at
       )
       VALUES
@@ -3003,6 +3084,27 @@ function mapReportingStatus(rawStatus) {
   return 'Logged';
 }
 
+function resolveEnrollmentDownpaymentAmount(row) {
+  const directAmount = Number(row?.downpayment_amount ?? 0);
+  if (Number.isFinite(directAmount) && directAmount > 0) {
+    return directAmount;
+  }
+
+  const payload = enrollmentPayloadObject(row?.payload);
+  const payloadDirect = Number(payload?.downpayment_amount ?? payload?.downpaymentAmount ?? 0);
+  if (Number.isFinite(payloadDirect) && payloadDirect > 0) {
+    return payloadDirect;
+  }
+
+  const nestedPayload = payload?.payload && typeof payload.payload === 'object' ? payload.payload : null;
+  const nestedAmount = Number(nestedPayload?.downpayment_amount ?? nestedPayload?.downpaymentAmount ?? 0);
+  if (Number.isFinite(nestedAmount) && nestedAmount > 0) {
+    return nestedAmount;
+  }
+
+  return Number.isFinite(directAmount) ? directAmount : 0;
+}
+
 function normalizeEnrollmentFeedRow(row) {
   const linkedBillingId = row.linked_billing_id ? Number(row.linked_billing_id) : row.billing_id ? Number(row.billing_id) : null;
   const billingStage = linkedBillingId
@@ -3012,6 +3114,7 @@ function normalizeEnrollmentFeedRow(row) {
       )
     : null;
   const status = normalizeEnrollmentFeedStatus(row.status, linkedBillingId);
+  const downpaymentAmount = resolveEnrollmentDownpaymentAmount(row);
 
   return {
     id: Number(row.id),
@@ -3025,8 +3128,8 @@ function normalizeEnrollmentFeedRow(row) {
     academicYear: cleanTextValue(row.academic_year),
     semester: cleanTextValue(row.semester),
     status,
-    downpaymentAmount: Number(row.downpayment_amount || 0),
-    downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
+    downpaymentAmount,
+    downpaymentAmountFormatted: formatCurrency(downpaymentAmount),
     payload: row.payload && typeof row.payload === 'object' ? row.payload : row.payload ? safeJsonParse(row.payload, null) : null,
     decisionNotes: cleanTextValue(row.decision_notes),
     actionBy: cleanTextValue(row.action_by_name || row.action_by_username),
@@ -3158,6 +3261,7 @@ function buildEnrollmentBillingItems(feedRow, totalAmount) {
 
 function buildEnrollmentDecisionPayload(feedRow, overrides = {}) {
   const existingPayload = enrollmentPayloadObject(feedRow.payload);
+  const downpaymentAmount = resolveEnrollmentDownpaymentAmount(feedRow);
   const previousDecision =
     existingPayload.cashier_decision && typeof existingPayload.cashier_decision === 'object' ? existingPayload.cashier_decision : {};
 
@@ -3173,7 +3277,7 @@ function buildEnrollmentDecisionPayload(feedRow, overrides = {}) {
     academic_year: cleanTextValue(feedRow.academic_year) || null,
     semester: cleanTextValue(feedRow.semester) || null,
     status: normalizeEnrollmentFeedStatus(overrides.status || feedRow.status, overrides.linkedBillingId || feedRow.linked_billing_id),
-    downpayment_amount: Number(feedRow.downpayment_amount || 0),
+    downpayment_amount: downpaymentAmount,
     cashier_decision: {
       ...previousDecision,
       action: cleanTextValue(overrides.action) || cleanTextValue(previousDecision.action),
@@ -3244,7 +3348,7 @@ async function ensureStudentForEnrollmentFeed(feedRow) {
 }
 
 async function upsertEnrollmentFeedBilling(feedRow, actorUser, remarks = '') {
-  const totalAmount = Number(feedRow.downpayment_amount || 0);
+  const totalAmount = resolveEnrollmentDownpaymentAmount(feedRow);
   if (!(totalAmount > 0)) {
     throw new Error('Downpayment amount must be greater than zero before approval.');
   }
@@ -3462,7 +3566,7 @@ async function fetchEnrollmentFeedRowById(feedId) {
         b.balance_amount AS billing_balance_amount,
         u.full_name AS action_by_name,
         u.username AS action_by_username
-     FROM cashier_registrar_student_enrollment_feed f
+     FROM public.cashier_registrar_student_enrollment_feed f
      LEFT JOIN billing_records b ON b.id = f.linked_billing_id
      LEFT JOIN admin_users u ON u.id = f.action_by
      WHERE f.id = ?
@@ -3473,10 +3577,142 @@ async function fetchEnrollmentFeedRowById(feedId) {
   return rows[0] ? normalizeEnrollmentFeedRow(rows[0]) : null;
 }
 
+async function syncRegistrarEnrollmentsIntoCashierFeed() {
+  const enrollmentsTable = await findFirstExistingTable(['registrar.enrollments', 'registrar_enrollments']);
+  const studentsTable = await findFirstExistingTable(['registrar_students']);
+  const classesTable = await findFirstExistingTable(['registrar_classes']);
+
+  if (!enrollmentsTable || !studentsTable || !classesTable) {
+    return;
+  }
+
+  const [
+    hasDeletedAt,
+    hasAcademicYear,
+    hasSemester,
+    hasDownpaymentAmount,
+    hasCreatedAt
+  ] = await Promise.all([
+    columnExists(enrollmentsTable, 'deleted_at'),
+    columnExists(enrollmentsTable, 'academic_year'),
+    columnExists(enrollmentsTable, 'semester'),
+    columnExists(enrollmentsTable, 'downpayment_amount'),
+    columnExists(enrollmentsTable, 'created_at')
+  ]);
+
+  const [rows] = await pool.query(
+    `SELECT
+        e.id AS enrollment_id,
+        e.status AS enrollment_status,
+        ${hasAcademicYear ? 'e.academic_year' : "''::text AS academic_year"},
+        ${hasSemester ? 'e.semester' : "''::text AS semester"},
+        ${hasDownpaymentAmount ? 'e.downpayment_amount' : '0::numeric AS downpayment_amount'},
+        ${hasCreatedAt ? 'e.created_at' : 'NOW() AS created_at'},
+        s.student_no,
+        s.first_name,
+        s.last_name,
+        c.class_code,
+        c.title
+     FROM ${enrollmentsTable} e
+     INNER JOIN ${studentsTable} s ON s.id = e.student_id
+     INNER JOIN ${classesTable} c ON c.id = e.class_id
+     ${hasDeletedAt ? 'WHERE e.deleted_at IS NULL' : ''}
+     ORDER BY ${hasCreatedAt ? 'e.created_at DESC' : 'e.id DESC'}`,
+    []
+  );
+
+  const syncRows = Array.isArray(rows) ? rows : [];
+  for (const row of syncRows) {
+    const enrollmentId = Number(row.enrollment_id || 0);
+    if (!enrollmentId) continue;
+
+    const studentNo = cleanTextValue(row.student_no);
+    const firstName = cleanTextValue(row.first_name);
+    const lastName = cleanTextValue(row.last_name);
+    const studentName = [firstName, lastName].filter(Boolean).join(' ') || studentNo || 'Unknown Student';
+    const classCode = cleanTextValue(row.class_code) || null;
+    const subject = cleanTextValue(row.title) || null;
+    const academicYear = cleanTextValue(row.academic_year) || null;
+    const semester = cleanTextValue(row.semester) || null;
+    const status = cleanTextValue(row.enrollment_status) || 'Pending';
+    const downpaymentAmount = Number(row.downpayment_amount || 0);
+    const batchSuffix = academicYear ? academicYear.replace(/[^0-9]/g, '').slice(-4) : String(new Date().getFullYear());
+    const batchId = `REG-LIVE-${batchSuffix || String(new Date().getFullYear())}`;
+    const payloadJson = JSON.stringify({
+      source: 'registrar.enrollments',
+      enrollment_id: enrollmentId,
+      student_no: studentNo,
+      student_name: studentName,
+      class_code: classCode,
+      subject,
+      academic_year: academicYear,
+      semester,
+      status,
+      downpayment_amount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0
+    });
+
+    await pool.query(
+      `INSERT INTO public.cashier_registrar_student_enrollment_feed (
+         source_enrollment_id,
+         batch_id,
+         source,
+         office,
+         student_no,
+         student_name,
+         class_code,
+         subject,
+         academic_year,
+         semester,
+         status,
+         downpayment_amount,
+         payload,
+         sent_at,
+         created_at
+       ) VALUES (?, ?, 'Registrar', 'Registrar', ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW(), ?)
+       ON CONFLICT (source_enrollment_id)
+       DO UPDATE SET
+         batch_id = EXCLUDED.batch_id,
+         source = EXCLUDED.source,
+         office = EXCLUDED.office,
+         student_no = EXCLUDED.student_no,
+         student_name = EXCLUDED.student_name,
+         class_code = EXCLUDED.class_code,
+         subject = EXCLUDED.subject,
+         academic_year = EXCLUDED.academic_year,
+         semester = EXCLUDED.semester,
+         downpayment_amount = EXCLUDED.downpayment_amount,
+         payload = EXCLUDED.payload,
+         sent_at = NOW(),
+         status = CASE
+           WHEN COALESCE(TRIM(public.cashier_registrar_student_enrollment_feed.last_action), '') = ''
+             THEN EXCLUDED.status
+           ELSE public.cashier_registrar_student_enrollment_feed.status
+         END`,
+      [
+        enrollmentId,
+        batchId,
+        studentNo,
+        studentName,
+        classCode,
+        subject,
+        academicYear,
+        semester,
+        status,
+        Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0,
+        payloadJson,
+        row.created_at || nowSql()
+      ]
+    );
+  }
+}
+
 async function buildCashierRegistrarEnrollmentFeedSnapshot(filters = {}) {
+  await syncRegistrarEnrollmentsIntoCashierFeed();
+
   const [rows] = await pool.query(
     `SELECT
         f.id,
+        f.source_enrollment_id,
         f.batch_id,
         f.source,
         f.office,
@@ -3504,7 +3740,7 @@ async function buildCashierRegistrarEnrollmentFeedSnapshot(filters = {}) {
         b.balance_amount AS billing_balance_amount,
         u.full_name AS action_by_name,
         u.username AS action_by_username
-     FROM cashier_registrar_student_enrollment_feed f
+     FROM public.cashier_registrar_student_enrollment_feed f
      LEFT JOIN billing_records b ON b.id = f.linked_billing_id
      LEFT JOIN admin_users u ON u.id = f.action_by
      ORDER BY COALESCE(f.sent_at, f.created_at) DESC, f.id DESC`
@@ -8928,7 +9164,7 @@ app.post('/api/cashier-registrar-student-enrollment-feed', requireAuth, async (r
       }
 
       const [rows] = await pool.query(
-        `INSERT INTO cashier_registrar_student_enrollment_feed (
+        `INSERT INTO public.cashier_registrar_student_enrollment_feed (
            batch_id, source, office, student_no, student_name, class_code, subject, academic_year, semester, status, downpayment_amount, payload, sent_at, created_at
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW(), NOW())
          RETURNING id`,
@@ -8950,7 +9186,7 @@ app.post('/api/cashier-registrar-student-enrollment-feed', requireAuth, async (r
       }
 
       const [rows] = await pool.query(
-        `UPDATE cashier_registrar_student_enrollment_feed
+        `UPDATE public.cashier_registrar_student_enrollment_feed
          SET batch_id = ?,
              source = ?,
              office = ?,
@@ -8982,7 +9218,7 @@ app.post('/api/cashier-registrar-student-enrollment-feed', requireAuth, async (r
         sendError(res, 422, 'A valid enrollment feed id is required.');
         return;
       }
-      await pool.query(`DELETE FROM cashier_registrar_student_enrollment_feed WHERE id = ?`, [id]);
+      await pool.query(`DELETE FROM public.cashier_registrar_student_enrollment_feed WHERE id = ?`, [id]);
       sendOk(res, { id }, 'Enrollment feed record deleted.');
       return;
     }
@@ -8993,7 +9229,7 @@ app.post('/api/cashier-registrar-student-enrollment-feed', requireAuth, async (r
         return;
       }
 
-      const [feedRows] = await pool.query(`SELECT * FROM cashier_registrar_student_enrollment_feed WHERE id = ? LIMIT 1`, [id]);
+      const [feedRows] = await pool.query(`SELECT * FROM public.cashier_registrar_student_enrollment_feed WHERE id = ? LIMIT 1`, [id]);
       const feedRow = feedRows[0];
       if (!feedRow) {
         sendError(res, 404, 'Enrollment feed record not found.');
@@ -9125,7 +9361,7 @@ app.post('/api/cashier-registrar-student-enrollment-feed', requireAuth, async (r
       );
 
       await pool.query(
-        `UPDATE cashier_registrar_student_enrollment_feed
+        `UPDATE public.cashier_registrar_student_enrollment_feed
          SET status = ?,
              decision_notes = ?,
              linked_billing_id = ?,
@@ -9224,7 +9460,7 @@ app.get('/api/crad-student-list-feed', requireAuth, async (_req, res) => {
          b.paid_amount,
          c.id AS sent_id,
          c.sent_at::text AS sent_at
-       FROM cashier_registrar_student_enrollment_feed f
+       FROM public.cashier_registrar_student_enrollment_feed f
        INNER JOIN billing_records b ON b.id = f.linked_billing_id
        LEFT JOIN crad_student_list_feed c ON c.enrollment_feed_id = f.id
        WHERE COALESCE(f.downpayment_amount, 0) > 0
@@ -9345,7 +9581,7 @@ app.post('/api/crad-student-list-feed', requireAuth, async (req, res) => {
          f.downpayment_amount,
          f.payload,
          b.paid_amount
-       FROM cashier_registrar_student_enrollment_feed f
+       FROM public.cashier_registrar_student_enrollment_feed f
        INNER JOIN billing_records b ON b.id = f.linked_billing_id
        WHERE f.id = ?
          AND COALESCE(f.downpayment_amount, 0) > 0
@@ -9459,7 +9695,31 @@ app.get('/api/module-activity', requireAuth, async (req, res) => {
       }
     });
   } catch (error) {
-    sendError(res, 500, error instanceof Error ? error.message : 'Unable to load module activity.');
+    const message = error instanceof Error ? error.message : 'Unable to load module activity.';
+    const isConnectivityTimeout = /timeout exceeded when trying to connect|connect etimedout|econnrefused|failed to query database after multiple retries/i.test(
+      message
+    );
+
+    if (isConnectivityTimeout) {
+      const page = Math.max(1, Number(req.query?.page || 1));
+      const perPage = Math.min(25, Math.max(1, Number(req.query?.per_page || 8)));
+      sendOk(
+        res,
+        {
+          items: [],
+          meta: {
+            page,
+            perPage,
+            total: 0,
+            totalPages: 1
+          }
+        },
+        'Activity logs are temporarily unavailable while database connectivity recovers.'
+      );
+      return;
+    }
+
+    sendError(res, 500, message);
   }
 });
 

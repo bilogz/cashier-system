@@ -46,7 +46,16 @@ function createSqlClient(connectionString: string): { query: (sql: string, param
     const { Pool } = pg;
     pool = new Pool({
       connectionString,
+      max: Number(process.env.DB_POOL_MAX || 2),
+      idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS || 10_000),
+      connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS || 8_000),
+      statement_timeout: Number(process.env.DB_STATEMENT_TIMEOUT_MS || 20_000),
       ...(shouldUseSsl(connectionString) ? { ssl: { rejectUnauthorized: false } } : {})
+    });
+    // Prevent Vite dev server from crashing on transient idle pool errors.
+    pool.on('error', (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error ?? 'Unknown SQL pool error');
+      console.error(`[cashier] SQL pool idle error: ${message}`);
     });
     sqlPoolByConnection.set(connectionString, pool);
   }
@@ -537,8 +546,9 @@ async function ensureModuleActivityLogsTable(sql: ReturnType<typeof neon>): Prom
 
 async function ensureCashierEnrollmentFeedTable(sql: ReturnType<typeof neon>): Promise<void> {
   await sql.query(`
-    CREATE TABLE IF NOT EXISTS cashier_registrar_student_enrollment_feed (
+    CREATE TABLE IF NOT EXISTS public.cashier_registrar_student_enrollment_feed (
       id BIGSERIAL PRIMARY KEY,
+      source_enrollment_id BIGINT UNIQUE,
       batch_id TEXT NOT NULL,
       source TEXT NOT NULL DEFAULT 'Registrar',
       office TEXT NOT NULL DEFAULT 'Registrar',
@@ -562,12 +572,18 @@ async function ensureCashierEnrollmentFeedTable(sql: ReturnType<typeof neon>): P
     )
   `);
 
-  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS decision_notes TEXT NULL`);
-  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_id INT NULL`);
-  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_code VARCHAR(80) NULL`);
-  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS last_action VARCHAR(60) NULL`);
-  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_by INT NULL`);
-  await sql.query(`ALTER TABLE cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_at TIMESTAMPTZ NULL`);
+  await sql.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS decision_notes TEXT NULL`);
+  await sql.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_id INT NULL`);
+  await sql.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS linked_billing_code VARCHAR(80) NULL`);
+  await sql.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS last_action VARCHAR(60) NULL`);
+  await sql.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_by INT NULL`);
+  await sql.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS action_at TIMESTAMPTZ NULL`);
+  await sql.query(`ALTER TABLE public.cashier_registrar_student_enrollment_feed ADD COLUMN IF NOT EXISTS source_enrollment_id BIGINT NULL`);
+  await sql.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_cashier_registrar_student_enrollment_feed_source_enrollment_id
+     ON public.cashier_registrar_student_enrollment_feed (source_enrollment_id)
+     WHERE source_enrollment_id IS NOT NULL`
+  );
 }
 
 async function ensureNotificationsTable(sql: ReturnType<typeof neon>): Promise<void> {
@@ -582,7 +598,7 @@ async function ensureNotificationsTable(sql: ReturnType<typeof neon>): Promise<v
       message TEXT NOT NULL,
       entity_type VARCHAR(80) NULL,
       entity_id BIGINT NULL,
-      is_read BOOLEAN NOT NULL DEFAULT FALSE,
+      is_read SMALLINT NOT NULL DEFAULT 0,
       read_at TIMESTAMP NULL,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
@@ -752,6 +768,11 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
       const realtimeClients = new Set<any>();
       let realtimeClientSeq = 0;
       let realtimeHeartbeat: ReturnType<typeof setInterval> | null = null;
+      let databaseInitializationPromise: Promise<void> | null = null;
+      let databaseReady = false;
+      let lastStableEnrollmentFeedRows: any[] = [];
+      let lastPmedReportSyncAt = 0;
+      const PMED_REPORT_SYNC_MIN_INTERVAL_MS = 90_000;
 
       const writeRealtimeEvent = (res: any, payload: Record<string, unknown>): void => {
         res.write(`data: ${JSON.stringify({ at: new Date().toISOString(), ...payload })}\n\n`);
@@ -880,6 +901,98 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
         }
 
         const sql = createSqlClient(databaseUrl) as ReturnType<typeof neon>;
+
+        // Ensure database tables are set up on server startup
+        const initializeDatabase = async () => {
+          let retries = 0;
+          const maxRetries = 5;
+          const baseDelayMs = 500;
+
+          while (retries < maxRetries) {
+            try {
+              console.log(`[cashier] Initializing database, attempt ${retries + 1}/${maxRetries}...`);
+              await ensureAdminProfileTables(sql);
+              await ensureCashierEnrollmentFeedTable(sql);
+              await ensureNotificationsTable(sql);
+              await ensureModuleActivityLogsTable(sql);
+              // Keep startup initialization lightweight to avoid DB timeouts.
+              // Feature-specific tables are ensured lazily in their own routes.
+              console.log('[cashier] Database initialized successfully.');
+              databaseReady = true;
+              return;
+            } catch (error) {
+              databaseReady = false;
+              retries++;
+              const delay = baseDelayMs * Math.pow(2, retries - 1);
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              console.error(`[cashier] Database initialization failed (attempt ${retries}):`, errorMessage);
+              if (retries < maxRetries) {
+                console.log(`[cashier] Retrying database initialization in ${delay}ms...`);
+                await new Promise(res => setTimeout(res, delay));
+              } else {
+                console.error('[cashier] Failed to initialize database after multiple retries. The application may not function correctly.');
+              }
+            }
+          }
+        };
+
+        if (!databaseInitializationPromise) {
+          databaseInitializationPromise = initializeDatabase().catch((error) => {
+            databaseReady = false;
+            console.error('[cashier] Database initialization promise failed:', error);
+          });
+        }
+
+        if (!databaseReady) {
+          if (url.pathname === '/api/admin-auth' && (req.method || 'GET').toUpperCase() === 'GET') {
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                authenticated: false,
+                user: null
+              },
+              message: 'Database connection is warming up.'
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/module-activity' && (req.method || 'GET').toUpperCase() === 'GET') {
+            writeJson(res, 200, {
+              ok: true,
+              data: { items: [], meta: { page: 1, perPage: 20, total: 0, totalPages: 1 } },
+              message: 'Database connection is warming up.'
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/notifications' && (req.method || 'GET').toUpperCase() === 'GET') {
+            writeJson(res, 200, {
+              ok: true,
+              data: { items: [], meta: { page: 1, perPage: 0, total: 0, totalPages: 1, unreadCount: 0, totalUnread: 0 } },
+              message: 'Database connection is warming up.'
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/cashier/department-handoffs' && (req.method || 'GET').toUpperCase() === 'GET') {
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                stats: [
+                  { title: 'Registrar Linked', value: '0', subtitle: 'Cashier records ready for registrar visibility', icon: 'mdi-school-outline', tone: 'blue' },
+                  { title: 'PMED / Admin', value: '0', subtitle: 'Reporting-facing records for PMED and admin reports', icon: 'mdi-domain', tone: 'purple' },
+                  { title: 'Cleared', value: '0', subtitle: 'Payment and official receipt already complete', icon: 'mdi-check-decagram-outline', tone: 'green' },
+                  { title: 'Not Cleared', value: '0', subtitle: 'Records still waiting on payment or receipt completion', icon: 'mdi-alert-circle-outline', tone: 'orange' }
+                ],
+                matrix: [],
+                items: [],
+                latestItems: []
+              },
+              message: 'Database connection is warming up.'
+            });
+            return;
+          }
+        }
         const pharmacyAllowedActions: Record<string, string[]> = {
           Admin: ['create_medicine', 'update_medicine', 'archive_medicine', 'restock', 'dispense', 'adjust_stock', 'fulfill_request', 'save_draft'],
           Pharmacist: ['create_medicine', 'update_medicine', 'restock', 'dispense', 'adjust_stock', 'fulfill_request', 'save_draft'],
@@ -1211,7 +1324,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 b.balance_amount AS billing_balance_amount,
                 p.full_name AS action_by_name,
                 p.username AS action_by_username
-             FROM cashier_registrar_student_enrollment_feed f
+             FROM public.cashier_registrar_student_enrollment_feed f
              LEFT JOIN billing_records b ON b.id = f.linked_billing_id
              LEFT JOIN admin_profiles p ON p.id = f.action_by
              WHERE f.id = $1
@@ -1864,6 +1977,11 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
         }
 
         async function syncPmedReportRequestNotifications(): Promise<void> {
+          const now = Date.now();
+          if (now - lastPmedReportSyncAt < PMED_REPORT_SYNC_MIN_INTERVAL_MS) {
+            return;
+          }
+          lastPmedReportSyncAt = now;
           try {
             await ensureNotificationsTable(sql);
             const requestRows = await fetchPmedCashierRequestRows(50);
@@ -1892,7 +2010,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 `INSERT INTO notifications (
                    recipient_role, recipient_name, channel, type, title, message, entity_type, entity_id, is_read, created_at
                  )
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,$9)`,
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$9)`,
                 [
                   'cashier',
                   'Cashier Reports Desk',
@@ -4663,8 +4781,9 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           }
 
           if (url.pathname === '/api/module-activity' && (req.method || 'GET').toUpperCase() === 'GET') {
-            await ensureCashierWorkflowDemoData();
-            await ensureModuleActivityLogsTable(sql);
+            try {
+              await ensureCashierWorkflowDemoData();
+              await ensureModuleActivityLogsTable(sql);
 
             const moduleFilter = toSafeText(url.searchParams.get('module')).toLowerCase();
             const actorFilter = toSafeText(url.searchParams.get('actor'));
@@ -4759,19 +4878,58 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               rows = Array.isArray(fallbackRows) ? fallbackRows : [];
             }
 
-            writeJson(res, 200, {
-              ok: true,
-              data: {
-                items: Array.isArray(rows) ? rows : [],
-                meta: {
-                  page,
-                  perPage,
-                  total,
-                  totalPages: Math.max(1, Math.ceil(total / perPage))
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  items: Array.isArray(rows) ? rows : [],
+                  meta: {
+                    page,
+                    perPage,
+                    total,
+                    totalPages: Math.max(1, Math.ceil(total / perPage))
+                  }
                 }
+              });
+              return;
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              const isConnectivityTimeout = /timeout exceeded when trying to connect|connect etimedout|econnrefused|failed to query database after multiple retries/i.test(
+                message
+              );
+              if (!isConnectivityTimeout) {
+                writeJson(res, 200, {
+                  ok: true,
+                  data: {
+                    items: [],
+                    meta: {
+                      page: Math.max(1, toSafeInt(url.searchParams.get('page'), 1)),
+                      perPage: Math.min(100, Math.max(1, toSafeInt(url.searchParams.get('per_page'), 12))),
+                      total: 0,
+                      totalPages: 1
+                    }
+                  },
+                  message: 'Activity logs are temporarily unavailable right now.'
+                });
+                return;
               }
-            });
-            return;
+
+              const page = Math.max(1, toSafeInt(url.searchParams.get('page'), 1));
+              const perPage = Math.min(100, Math.max(1, toSafeInt(url.searchParams.get('per_page'), 12)));
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  items: [],
+                  meta: {
+                    page,
+                    perPage,
+                    total: 0,
+                    totalPages: 1
+                  }
+                },
+                message: 'Activity logs are temporarily unavailable while database connectivity recovers.'
+              });
+              return;
+            }
           }
 
           if (url.pathname === '/api/reports' && (req.method || 'GET').toUpperCase() === 'GET') {
@@ -5960,7 +6118,645 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           }
 
           if (url.pathname === '/api/cashier-registrar-student-enrollment-feed' && (req.method || 'GET').toUpperCase() === 'GET') {
+            const buildRegistrarApiSnapshotRows = async () => {
+              const registrarApiBase = String(process.env.REGISTRAR_INTEGRATION_URL || 'http://localhost:3000/api/integrations').trim();
+              const integrationKey = String(process.env.INTEGRATION_API_KEY || process.env.REGISTRAR_INTEGRATION_API_KEY || '').trim();
+              const integrationHeaders: Record<string, string> = { Accept: 'application/json' };
+              if (integrationKey) integrationHeaders['x-integration-key'] = integrationKey;
+
+              const safeFetchJson = async (inputUrl: string) => {
+                try {
+                  const response = await Promise.race([
+                    fetch(inputUrl, { method: 'GET', headers: integrationHeaders }),
+                    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Registrar integration request timed out.')), 25000))
+                  ]);
+                  if (!response.ok) return null;
+                  return (await response.json()) as Record<string, unknown>;
+                } catch {
+                  return null;
+                }
+              };
+
+              const rows: Array<{
+                id: number;
+                batchId: string;
+                source: string;
+                office: string;
+                studentNo: string;
+                studentName: string;
+                classCode: string;
+                subject: string;
+                academicYear: string;
+                semester: string;
+                status: string;
+                downpaymentAmount: number;
+                downpaymentAmountFormatted: string;
+                payload: Record<string, unknown> | null;
+                decisionNotes: string;
+                actionBy: string;
+                actionAt: string | null;
+                lastAction: string;
+                billingId: number | null;
+                billingCode: string;
+                billingStatus: string;
+                billingWorkflowStage: string | null;
+                billingWorkflowStageLabel: string;
+                nextStep: string;
+                queueBucket: 'pending' | 'approved' | 'hold' | 'returned';
+                sentAt: string | null;
+                createdAt: string | null;
+              }> = [];
+
+              const bulkFeedJson = await safeFetchJson(`${registrarApiBase}?resource=enrollment-feed`);
+              const bulkRows = Array.isArray((bulkFeedJson?.data as Record<string, unknown> | undefined)?.rows)
+                ? (((bulkFeedJson?.data as Record<string, unknown>).rows as unknown[]) || [])
+                : [];
+
+              for (const rawRow of bulkRows) {
+                const row = (rawRow || {}) as Record<string, unknown>;
+                const sourceEnrollmentId = Number(row.enrollment_id || 0);
+                if (!sourceEnrollmentId) continue;
+                const studentNo = toSafeText(row.student_no);
+                const studentName =
+                  [toSafeText(row.first_name), toSafeText(row.last_name)].filter(Boolean).join(' ') ||
+                  toSafeText(row.full_name) ||
+                  studentNo ||
+                  'Unknown Student';
+                const classCode = toSafeText(row.class_code);
+                const subject = toSafeText(row.title);
+                const academicYear = toSafeText(row.academic_year);
+                const semester = toSafeText(row.semester);
+                const enrollmentStatus = toSafeText(row.enrollment_status) || 'Pending';
+                const downpaymentAmount = Number(row.downpayment_amount || 0);
+                const createdAt = toSafeText(row.created_at) || new Date().toISOString();
+                const batchSuffix = academicYear ? academicYear.replace(/[^0-9]/g, '').slice(-4) : String(new Date().getFullYear());
+                const batchId = `REG-LIVE-${batchSuffix || String(new Date().getFullYear())}`;
+                const normalizedStatus = normalizeEnrollmentFeedStatus(enrollmentStatus);
+
+                rows.push({
+                  id: sourceEnrollmentId,
+                  batchId,
+                  source: 'Registrar',
+                  office: 'Registrar',
+                  studentNo,
+                  studentName,
+                  classCode,
+                  subject,
+                  academicYear,
+                  semester,
+                  status: normalizedStatus,
+                  downpaymentAmount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0,
+                  downpaymentAmountFormatted: formatCurrency(downpaymentAmount || 0),
+                  payload: {
+                    source: 'registrar.api.enrollment-feed',
+                    enrollment_id: sourceEnrollmentId,
+                    student_no: studentNo,
+                    student_name: studentName,
+                    class_code: classCode,
+                    subject,
+                    academic_year: academicYear,
+                    semester,
+                    status: enrollmentStatus,
+                    downpayment_amount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0
+                  },
+                  decisionNotes: '',
+                  actionBy: '',
+                  actionAt: null,
+                  lastAction: '',
+                  billingId: null,
+                  billingCode: '',
+                  billingStatus: '',
+                  billingWorkflowStage: null,
+                  billingWorkflowStageLabel: '',
+                  nextStep: resolveEnrollmentFeedNextStep(normalizedStatus, '', ''),
+                  queueBucket: resolveEnrollmentFeedBucket(normalizedStatus, null),
+                  sentAt: null,
+                  createdAt
+                });
+              }
+
+              if (rows.length > 0) {
+                return rows;
+              }
+
+              const studentListJson = await safeFetchJson(`${registrarApiBase}?resource=student-list`);
+              const studentRows = Array.isArray((studentListJson?.data as Record<string, unknown> | undefined)?.students)
+                ? (((studentListJson?.data as Record<string, unknown>).students as unknown[]) || [])
+                : [];
+
+              for (const studentRow of studentRows.slice(0, 120)) {
+                const studentNo = toSafeText((studentRow as Record<string, unknown>)?.student_no);
+                if (!studentNo) continue;
+                const enrollmentJson = await safeFetchJson(`${registrarApiBase}?resource=enrollment-data&student_no=${encodeURIComponent(studentNo)}`);
+                const payloadData = (enrollmentJson?.data as Record<string, unknown> | undefined) || {};
+                const enrollments = Array.isArray(payloadData.enrollments) ? (payloadData.enrollments as Array<Record<string, unknown>>) : [];
+                const studentData = (payloadData.student as Record<string, unknown> | undefined) || (studentRow as Record<string, unknown>);
+                const studentName =
+                  [toSafeText(studentData.first_name), toSafeText(studentData.last_name)].filter(Boolean).join(' ') ||
+                  toSafeText(studentData.full_name) ||
+                  studentNo ||
+                  'Unknown Student';
+
+                for (const enrollment of enrollments.slice(0, 6)) {
+                  const sourceEnrollmentId = Number(enrollment.id || 0);
+                  if (!sourceEnrollmentId) continue;
+                  const classCode = toSafeText(enrollment.class_code);
+                  const subject = toSafeText(enrollment.title);
+                  const academicYear = toSafeText(enrollment.academic_year);
+                  const semester = toSafeText(enrollment.semester);
+                  const enrollmentStatus = toSafeText(enrollment.status) || 'Pending';
+                  const downpaymentAmount = Number(enrollment.downpayment_amount || 0);
+                  const createdAt = toSafeText(enrollment.created_at) || new Date().toISOString();
+                  const batchSuffix = academicYear ? academicYear.replace(/[^0-9]/g, '').slice(-4) : String(new Date().getFullYear());
+                  const batchId = `REG-LIVE-${batchSuffix || String(new Date().getFullYear())}`;
+                  const normalizedStatus = normalizeEnrollmentFeedStatus(enrollmentStatus);
+
+                  rows.push({
+                    id: sourceEnrollmentId,
+                    batchId,
+                    source: 'Registrar',
+                    office: 'Registrar',
+                    studentNo,
+                    studentName,
+                    classCode,
+                    subject,
+                    academicYear,
+                    semester,
+                    status: normalizedStatus,
+                    downpaymentAmount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0,
+                    downpaymentAmountFormatted: formatCurrency(downpaymentAmount || 0),
+                    payload: {
+                      source: 'registrar.api.enrollment-data',
+                      enrollment_id: sourceEnrollmentId,
+                      student_no: studentNo,
+                      student_name: studentName,
+                      class_code: classCode,
+                      subject,
+                      academic_year: academicYear,
+                      semester,
+                      status: enrollmentStatus,
+                      downpayment_amount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0
+                    },
+                    decisionNotes: '',
+                    actionBy: '',
+                    actionAt: null,
+                    lastAction: '',
+                    billingId: null,
+                    billingCode: '',
+                    billingStatus: '',
+                    billingWorkflowStage: null,
+                    billingWorkflowStageLabel: '',
+                    nextStep: resolveEnrollmentFeedNextStep(normalizedStatus, '', ''),
+                    queueBucket: resolveEnrollmentFeedBucket(normalizedStatus, null),
+                    sentAt: null,
+                    createdAt
+                  });
+                }
+              }
+
+              return rows;
+            };
+
+            if (!databaseReady) {
+              const apiRows = await buildRegistrarApiSnapshotRows();
+              const fallbackRows = apiRows.sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')));
+              const stableRows = fallbackRows.length ? fallbackRows : lastStableEnrollmentFeedRows;
+              if (fallbackRows.length) lastStableEnrollmentFeedRows = fallbackRows;
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  stats: [
+                    { title: 'Pending Review', value: String(stableRows.filter((row) => row.queueBucket === 'pending').length), subtitle: 'Registrar submissions waiting on cashier action', icon: 'mdi-clipboard-check-outline', tone: 'blue' },
+                    { title: 'Billing Created', value: String(stableRows.filter((row) => row.queueBucket === 'approved').length), subtitle: 'Approved rows already linked to real billing records', icon: 'mdi-file-document-check-outline', tone: 'green' },
+                    { title: 'On Hold', value: String(stableRows.filter((row) => row.queueBucket === 'hold').length), subtitle: 'Rows paused for validation or missing registrar details', icon: 'mdi-pause-circle-outline', tone: 'orange' },
+                    { title: 'Returned', value: String(stableRows.filter((row) => row.queueBucket === 'returned').length), subtitle: 'Rows sent back to registrar for correction', icon: 'mdi-undo-variant', tone: 'purple' }
+                  ],
+                  items: stableRows,
+                  meta: { page: 1, perPage: stableRows.length || 10, total: stableRows.length, totalPages: 1 },
+                  filters: {
+                    statuses: Array.from(new Set(stableRows.map((row) => row.status).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                    semesters: Array.from(new Set(stableRows.map((row) => row.semester).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                    sources: Array.from(new Set(stableRows.map((row) => row.source).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                    offices: Array.from(new Set(stableRows.map((row) => row.office).filter(Boolean))).sort((left, right) => left.localeCompare(right))
+                  }
+                },
+                message: fallbackRows.length
+                  ? 'Showing live registrar enrollment feed while cashier database reconnects.'
+                  : 'Showing last stable registrar snapshot while live sync retries.'
+              });
+              return;
+            }
+
+            try {
+            const queryWithTimeout = async <T>(promise: Promise<T>, ms = 2500): Promise<T> =>
+              await Promise.race([
+                promise,
+                new Promise<never>((_, reject) =>
+                  setTimeout(() => reject(new Error(`Enrollment feed route timed out after ${ms}ms`)), ms)
+                )
+              ]);
+            await queryWithTimeout(sql.query('SELECT 1'), 2500);
             await ensureCashierEnrollmentFeedTable(sql);
+
+            const resolveExistingTable = async (candidates: string[]): Promise<string | null> => {
+              for (const candidate of candidates) {
+                const rows = (await sql.query(`SELECT to_regclass($1)::text AS reg`, [candidate])) as Array<{ reg: string | null }>;
+                const reg = toSafeText(rows[0]?.reg);
+                if (reg) return reg;
+              }
+              return null;
+            };
+            const hasColumn = async (tableName: string, columnName: string): Promise<boolean> => {
+              const normalized = toSafeText(tableName).replace(/"/g, '');
+              const [schemaName, rawTableName] = normalized.includes('.')
+                ? normalized.split('.', 2)
+                : ['public', normalized];
+              const rows = (await sql.query(
+                `SELECT 1
+                 FROM information_schema.columns
+                 WHERE table_schema = $1
+                   AND table_name = $2
+                   AND column_name = $3
+                 LIMIT 1`,
+                [schemaName, rawTableName, columnName]
+              )) as Array<{ '?column?': number }>;
+              return rows.length > 0;
+            };
+
+            const registrarEnrollmentsTable = await resolveExistingTable([
+              'registrar.enrollments',
+              'public.registrar_enrollments',
+              'public.enrollments'
+            ]);
+            const registrarStudentsTable = await resolveExistingTable([
+              'registrar.students',
+              'public.registrar_students',
+              'public.students'
+            ]);
+            const registrarClassesTable = await resolveExistingTable([
+              'registrar.classes',
+              'public.registrar_classes',
+              'public.classes'
+            ]);
+
+            let liveSnapshotRows: Array<{
+              id: number;
+              batchId: string;
+              source: string;
+              office: string;
+              studentNo: string;
+              studentName: string;
+              classCode: string;
+              subject: string;
+              academicYear: string;
+              semester: string;
+              status: string;
+              downpaymentAmount: number;
+              downpaymentAmountFormatted: string;
+              payload: Record<string, unknown> | null;
+              decisionNotes: string;
+              actionBy: string;
+              actionAt: string | null;
+              lastAction: string;
+              billingId: number | null;
+              billingCode: string;
+              billingStatus: string;
+              billingWorkflowStage: string | null;
+              billingWorkflowStageLabel: string;
+              nextStep: string;
+              queueBucket: 'pending' | 'approved' | 'hold' | 'returned';
+              sentAt: string | null;
+              createdAt: string | null;
+            }> = [];
+
+            if (registrarEnrollmentsTable && registrarStudentsTable && registrarClassesTable) {
+              const liveRows = (await queryWithTimeout(sql.query(
+                `SELECT
+                   e.id AS enrollment_id,
+                   e.status AS enrollment_status,
+                   COALESCE(e.academic_year, '')::text AS academic_year,
+                   COALESCE(e.semester, '')::text AS semester,
+                   COALESCE(e.downpayment_amount, 0)::numeric AS downpayment_amount,
+                   COALESCE(e.created_at, NOW())::text AS created_at,
+                   s.student_no,
+                   COALESCE(s.first_name, '')::text AS first_name,
+                   COALESCE(s.last_name, '')::text AS last_name,
+                   trim(concat_ws(' ', COALESCE(s.first_name, ''), COALESCE(s.last_name, '')))::text AS full_name,
+                   c.class_code,
+                   COALESCE(c.title, '')::text AS title
+                 FROM ${registrarEnrollmentsTable} e
+                 INNER JOIN ${registrarStudentsTable} s ON s.id = e.student_id
+                 INNER JOIN ${registrarClassesTable} c ON c.id = e.class_id
+                 ORDER BY e.created_at DESC NULLS LAST, e.id DESC
+                 LIMIT 150`,
+                []
+              ), 9000)) as Array<Record<string, unknown>>;
+
+              for (const row of liveRows) {
+                const sourceEnrollmentId = Number(row.enrollment_id || 0);
+                if (!sourceEnrollmentId) continue;
+
+                const studentNo = toSafeText(row.student_no);
+                const studentName =
+                  [toSafeText(row.first_name), toSafeText(row.last_name)].filter(Boolean).join(' ') ||
+                  toSafeText(row.full_name) ||
+                  studentNo ||
+                  'Unknown Student';
+                const classCode = toSafeText(row.class_code) || null;
+                const subject = toSafeText(row.title) || null;
+                const academicYear = toSafeText(row.academic_year) || null;
+                const semester = toSafeText(row.semester) || null;
+                const enrollmentStatus = toSafeText(row.enrollment_status) || 'Pending';
+                const downpaymentAmount = Number(row.downpayment_amount || 0);
+                const batchSuffix = academicYear ? academicYear.replace(/[^0-9]/g, '').slice(-4) : String(new Date().getFullYear());
+                const batchId = `REG-LIVE-${batchSuffix || String(new Date().getFullYear())}`;
+                const payloadJson = JSON.stringify({
+                  source: 'registrar.enrollments',
+                  enrollment_id: sourceEnrollmentId,
+                  student_no: studentNo,
+                  student_name: studentName,
+                  class_code: classCode,
+                  subject,
+                  academic_year: academicYear,
+                  semester,
+                  status: enrollmentStatus,
+                  downpayment_amount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0
+                });
+                liveSnapshotRows.push({
+                  id: sourceEnrollmentId,
+                  batchId,
+                  source: 'Registrar',
+                  office: 'Registrar',
+                  studentNo,
+                  studentName,
+                  classCode: classCode || '',
+                  subject: subject || '',
+                  academicYear: academicYear || '',
+                  semester: semester || '',
+                  status: normalizeEnrollmentFeedStatus(enrollmentStatus),
+                  downpaymentAmount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0,
+                  downpaymentAmountFormatted: formatCurrency(downpaymentAmount || 0),
+                  payload: JSON.parse(payloadJson) as Record<string, unknown>,
+                  decisionNotes: '',
+                  actionBy: '',
+                  actionAt: null,
+                  lastAction: '',
+                  billingId: null,
+                  billingCode: '',
+                  billingStatus: '',
+                  billingWorkflowStage: null,
+                  billingWorkflowStageLabel: '',
+                  nextStep: resolveEnrollmentFeedNextStep(normalizeEnrollmentFeedStatus(enrollmentStatus), '', ''),
+                  queueBucket: resolveEnrollmentFeedBucket(normalizeEnrollmentFeedStatus(enrollmentStatus), null),
+                  sentAt: null,
+                  createdAt: toSafeText(row.created_at) || null
+                });
+
+                const updatedRows = (await sql.query(
+                  `UPDATE public.cashier_registrar_student_enrollment_feed
+                   SET batch_id = $2,
+                       source = 'Registrar',
+                       office = 'Registrar',
+                       student_no = $3,
+                       student_name = $4,
+                       class_code = $5,
+                       subject = $6,
+                       academic_year = $7,
+                       semester = $8,
+                       downpayment_amount = $10,
+                       payload = $11::jsonb,
+                       sent_at = NOW(),
+                       status = CASE
+                         WHEN COALESCE(TRIM(last_action), '') = ''
+                           THEN $9
+                         ELSE status
+                       END
+                   WHERE source_enrollment_id = $1
+                   RETURNING id`,
+                  [
+                    sourceEnrollmentId,
+                    batchId,
+                    studentNo,
+                    studentName,
+                    classCode,
+                    subject,
+                    academicYear,
+                    semester,
+                    enrollmentStatus,
+                    Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0,
+                    payloadJson
+                  ]
+                )) as Array<{ id: number }>;
+
+                if (!updatedRows.length) {
+                  await sql.query(
+                    `INSERT INTO public.cashier_registrar_student_enrollment_feed (
+                       source_enrollment_id,
+                       batch_id,
+                       source,
+                       office,
+                       student_no,
+                       student_name,
+                       class_code,
+                       subject,
+                       academic_year,
+                       semester,
+                       status,
+                       downpayment_amount,
+                       payload,
+                       sent_at,
+                       created_at
+                     ) VALUES (
+                       $1,$2,'Registrar','Registrar',$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,NOW(),$12::timestamptz
+                     )`,
+                    [
+                      sourceEnrollmentId,
+                      batchId,
+                      studentNo,
+                      studentName,
+                      classCode,
+                      subject,
+                      academicYear,
+                      semester,
+                      enrollmentStatus,
+                      Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0,
+                      payloadJson,
+                      toSafeText(row.created_at) || new Date().toISOString()
+                    ]
+                  );
+                }
+              }
+            }
+
+            if (!liveSnapshotRows.length) {
+              const registrarApiBase = String(process.env.REGISTRAR_INTEGRATION_URL || 'http://localhost:3000/api/integrations').trim();
+              const integrationKey = String(process.env.INTEGRATION_API_KEY || process.env.REGISTRAR_INTEGRATION_API_KEY || '').trim();
+              const integrationHeaders: Record<string, string> = { Accept: 'application/json' };
+              if (integrationKey) integrationHeaders['x-integration-key'] = integrationKey;
+
+              const safeFetchJson = async (inputUrl: string) => {
+                const response = await queryWithTimeout(
+                  fetch(inputUrl, { method: 'GET', headers: integrationHeaders }),
+                  25000
+                );
+                if (!response.ok) return null;
+                try {
+                  return (await response.json()) as Record<string, unknown>;
+                } catch {
+                  return null;
+                }
+              };
+
+              const studentListJson = await safeFetchJson(`${registrarApiBase}?resource=student-list`);
+              const studentRows = Array.isArray((studentListJson?.data as Record<string, unknown> | undefined)?.students)
+                ? (((studentListJson?.data as Record<string, unknown>).students as unknown[]) || [])
+                : [];
+
+              for (const studentRow of studentRows.slice(0, 80)) {
+                const studentNo = toSafeText((studentRow as Record<string, unknown>)?.student_no);
+                if (!studentNo) continue;
+                const enrollmentJson = await safeFetchJson(`${registrarApiBase}?resource=enrollment-data&student_no=${encodeURIComponent(studentNo)}`);
+                const payloadData = (enrollmentJson?.data as Record<string, unknown> | undefined) || {};
+                const enrollments = Array.isArray(payloadData.enrollments) ? (payloadData.enrollments as Array<Record<string, unknown>>) : [];
+                const studentData = (payloadData.student as Record<string, unknown> | undefined) || (studentRow as Record<string, unknown>);
+                const studentName =
+                  [toSafeText(studentData.first_name), toSafeText(studentData.last_name)].filter(Boolean).join(' ') ||
+                  toSafeText(studentData.full_name) ||
+                  studentNo ||
+                  'Unknown Student';
+
+                for (const enrollment of enrollments.slice(0, 4)) {
+                  const sourceEnrollmentId = Number(enrollment.id || 0);
+                  if (!sourceEnrollmentId) continue;
+                  const classCode = toSafeText(enrollment.class_code) || null;
+                  const subject = toSafeText(enrollment.title) || null;
+                  const academicYear = toSafeText(enrollment.academic_year) || null;
+                  const semester = toSafeText(enrollment.semester) || null;
+                  const enrollmentStatus = toSafeText(enrollment.status) || 'Pending';
+                  const downpaymentAmount = Number(enrollment.downpayment_amount || 0);
+                  const createdAt = toSafeText(enrollment.created_at) || new Date().toISOString();
+                  const batchSuffix = academicYear ? academicYear.replace(/[^0-9]/g, '').slice(-4) : String(new Date().getFullYear());
+                  const batchId = `REG-LIVE-${batchSuffix || String(new Date().getFullYear())}`;
+                  const payloadJson = JSON.stringify({
+                    source: 'registrar.api.enrollment-data',
+                    enrollment_id: sourceEnrollmentId,
+                    student_no: studentNo,
+                    student_name: studentName,
+                    class_code: classCode,
+                    subject,
+                    academic_year: academicYear,
+                    semester,
+                    status: enrollmentStatus,
+                    downpayment_amount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0
+                  });
+
+                  liveSnapshotRows.push({
+                    id: sourceEnrollmentId,
+                    batchId,
+                    source: 'Registrar',
+                    office: 'Registrar',
+                    studentNo,
+                    studentName,
+                    classCode: classCode || '',
+                    subject: subject || '',
+                    academicYear: academicYear || '',
+                    semester: semester || '',
+                    status: normalizeEnrollmentFeedStatus(enrollmentStatus),
+                    downpaymentAmount: Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0,
+                    downpaymentAmountFormatted: formatCurrency(downpaymentAmount || 0),
+                    payload: JSON.parse(payloadJson) as Record<string, unknown>,
+                    decisionNotes: '',
+                    actionBy: '',
+                    actionAt: null,
+                    lastAction: '',
+                    billingId: null,
+                    billingCode: '',
+                    billingStatus: '',
+                    billingWorkflowStage: null,
+                    billingWorkflowStageLabel: '',
+                    nextStep: resolveEnrollmentFeedNextStep(normalizeEnrollmentFeedStatus(enrollmentStatus), '', ''),
+                    queueBucket: resolveEnrollmentFeedBucket(normalizeEnrollmentFeedStatus(enrollmentStatus), null),
+                    sentAt: null,
+                    createdAt
+                  });
+
+                  const updatedRows = (await sql.query(
+                    `UPDATE public.cashier_registrar_student_enrollment_feed
+                     SET batch_id = $2,
+                         source = 'Registrar',
+                         office = 'Registrar',
+                         student_no = $3,
+                         student_name = $4,
+                         class_code = $5,
+                         subject = $6,
+                         academic_year = $7,
+                         semester = $8,
+                         downpayment_amount = $10,
+                         payload = $11::jsonb,
+                         sent_at = NOW(),
+                         status = CASE
+                           WHEN COALESCE(TRIM(last_action), '') = ''
+                             THEN $9
+                           ELSE status
+                         END
+                     WHERE source_enrollment_id = $1
+                     RETURNING id`,
+                    [
+                      sourceEnrollmentId,
+                      batchId,
+                      studentNo,
+                      studentName,
+                      classCode,
+                      subject,
+                      academicYear,
+                      semester,
+                      enrollmentStatus,
+                      Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0,
+                      payloadJson
+                    ]
+                  )) as Array<{ id: number }>;
+
+                  if (!updatedRows.length) {
+                    await sql.query(
+                      `INSERT INTO public.cashier_registrar_student_enrollment_feed (
+                         source_enrollment_id,
+                         batch_id,
+                         source,
+                         office,
+                         student_no,
+                         student_name,
+                         class_code,
+                         subject,
+                         academic_year,
+                         semester,
+                         status,
+                         downpayment_amount,
+                         payload,
+                         sent_at,
+                         created_at
+                       ) VALUES (
+                         $1,$2,'Registrar','Registrar',$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,NOW(),$12::timestamptz
+                       )`,
+                      [
+                        sourceEnrollmentId,
+                        batchId,
+                        studentNo,
+                        studentName,
+                        classCode,
+                        subject,
+                        academicYear,
+                        semester,
+                        enrollmentStatus,
+                        Number.isFinite(downpaymentAmount) ? downpaymentAmount : 0,
+                        payloadJson,
+                        createdAt
+                      ]
+                    );
+                  }
+                }
+              }
+            }
+
             const search = (url.searchParams.get('search') || '').trim().toLowerCase();
             const statusFilter = (url.searchParams.get('status') || '').trim();
             const semesterFilter = (url.searchParams.get('semester') || '').trim();
@@ -5999,7 +6795,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                  b.balance_amount AS billing_balance_amount,
                  p.full_name AS action_by_name,
                  p.username AS action_by_username
-               FROM cashier_registrar_student_enrollment_feed f
+               FROM public.cashier_registrar_student_enrollment_feed f
                LEFT JOIN billing_records b ON b.id = f.linked_billing_id
                LEFT JOIN admin_profiles p ON p.id = f.action_by
                ORDER BY COALESCE(f.sent_at, f.created_at) DESC, f.id DESC`
@@ -6068,8 +6864,12 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 createdAt: row.created_at ? new Date(String(row.created_at)).toISOString() : null
               };
             });
+            const effectiveRows = normalized.length > 0 ? normalized : liveSnapshotRows;
+            if (effectiveRows.length > 0) {
+              lastStableEnrollmentFeedRows = effectiveRows;
+            }
 
-            const filtered = normalized.filter((row) => {
+            const filtered = effectiveRows.filter((row) => {
               const matchesSearch =
                 !search ||
                 [
@@ -6147,13 +6947,64 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                   totalPages
                 },
                 filters: {
-                  statuses: Array.from(new Set(normalized.map((row) => row.status).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
-                  semesters: Array.from(new Set(normalized.map((row) => row.semester).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
-                  sources: Array.from(new Set(normalized.map((row) => row.source).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
-                  offices: Array.from(new Set(normalized.map((row) => row.office).filter(Boolean))).sort((left, right) => left.localeCompare(right))
+                  statuses: Array.from(new Set(effectiveRows.map((row) => row.status).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                  semesters: Array.from(new Set(effectiveRows.map((row) => row.semester).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                  sources: Array.from(new Set(effectiveRows.map((row) => row.source).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                  offices: Array.from(new Set(effectiveRows.map((row) => row.office).filter(Boolean))).sort((left, right) => left.localeCompare(right))
                 }
               }
             });
+            } catch (error) {
+              console.warn('[cashier] Enrollment feed route fallback due to error:', error);
+              const message = error instanceof Error ? error.message : String(error);
+              const isConnectivityTimeout = /timed out|timeout exceeded when trying to connect|failed to query database after multiple retries|unable to check out connection from the pool/i.test(
+                message
+              );
+              if (isConnectivityTimeout) {
+                const apiRows = await buildRegistrarApiSnapshotRows();
+                const fallbackRows = apiRows.sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')));
+                const stableRows = fallbackRows.length ? fallbackRows : lastStableEnrollmentFeedRows;
+                if (fallbackRows.length) lastStableEnrollmentFeedRows = fallbackRows;
+                writeJson(res, 200, {
+                  ok: true,
+                  data: {
+                    stats: [
+                      { title: 'Pending Review', value: String(stableRows.filter((row) => row.queueBucket === 'pending').length), subtitle: 'Registrar submissions waiting on cashier action', icon: 'mdi-clipboard-check-outline', tone: 'blue' },
+                      { title: 'Billing Created', value: String(stableRows.filter((row) => row.queueBucket === 'approved').length), subtitle: 'Approved rows already linked to real billing records', icon: 'mdi-file-document-check-outline', tone: 'green' },
+                      { title: 'On Hold', value: String(stableRows.filter((row) => row.queueBucket === 'hold').length), subtitle: 'Rows paused for validation or missing registrar details', icon: 'mdi-pause-circle-outline', tone: 'orange' },
+                      { title: 'Returned', value: String(stableRows.filter((row) => row.queueBucket === 'returned').length), subtitle: 'Rows sent back to registrar for correction', icon: 'mdi-undo-variant', tone: 'purple' }
+                    ],
+                    items: stableRows,
+                    meta: { page: 1, perPage: stableRows.length || 10, total: stableRows.length, totalPages: 1 },
+                    filters: {
+                      statuses: Array.from(new Set(stableRows.map((row) => row.status).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                      semesters: Array.from(new Set(stableRows.map((row) => row.semester).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                      sources: Array.from(new Set(stableRows.map((row) => row.source).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+                      offices: Array.from(new Set(stableRows.map((row) => row.office).filter(Boolean))).sort((left, right) => left.localeCompare(right))
+                    }
+                  },
+                  message: fallbackRows.length
+                    ? 'Showing live registrar enrollment feed while cashier database reconnects.'
+                    : 'Showing last stable registrar snapshot while live sync retries.'
+                });
+                return;
+              }
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  stats: [
+                    { title: 'Pending Review', value: '0', subtitle: 'Registrar submissions waiting on cashier action', icon: 'mdi-clipboard-check-outline', tone: 'blue' },
+                    { title: 'Billing Created', value: '0', subtitle: 'Approved rows already linked to real billing records', icon: 'mdi-file-document-check-outline', tone: 'green' },
+                    { title: 'On Hold', value: '0', subtitle: 'Rows paused for validation or missing registrar details', icon: 'mdi-pause-circle-outline', tone: 'orange' },
+                    { title: 'Returned', value: '0', subtitle: 'Rows sent back to registrar for correction', icon: 'mdi-undo-variant', tone: 'purple' }
+                  ],
+                  items: [],
+                  meta: { page: 1, perPage: 10, total: 0, totalPages: 1 },
+                  filters: { statuses: [], semesters: [], sources: [], offices: [] }
+                },
+                message: 'Enrollment feed is temporarily unavailable. Showing fallback data.'
+              });
+            }
             return;
           }
 
@@ -6196,7 +7047,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                  b.paid_amount,
                  c.id AS sent_id,
                  c.sent_at::text AS sent_at
-               FROM cashier_registrar_student_enrollment_feed f
+               FROM public.cashier_registrar_student_enrollment_feed f
                INNER JOIN billing_records b ON b.id = f.linked_billing_id
                LEFT JOIN crad_student_list_feed c ON c.enrollment_feed_id = f.id
                WHERE COALESCE(f.downpayment_amount, 0) > 0
@@ -6284,7 +7135,6 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           }
 
           if (url.pathname === '/api/cashier-registrar-student-enrollment-feed' && (req.method || '').toUpperCase() === 'POST') {
-            await ensureCashierEnrollmentFeedTable(sql);
             const body = await readJsonBody(req);
             const action = String(body.action || '').trim().toLowerCase();
             const id = Number(body.id || 0);
@@ -6322,7 +7172,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               }
 
               const createdRows = (await sql.query(
-                `INSERT INTO cashier_registrar_student_enrollment_feed (
+                `INSERT INTO public.cashier_registrar_student_enrollment_feed (
                    batch_id, source, office, student_no, student_name, class_code, subject, academic_year, semester, status, downpayment_amount, payload, sent_at, created_at
                  ) VALUES (
                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, NOW(), NOW()
@@ -6350,7 +7200,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               }
 
               const updatedRows = (await sql.query(
-                `UPDATE cashier_registrar_student_enrollment_feed
+                `UPDATE public.cashier_registrar_student_enrollment_feed
                  SET batch_id = $1,
                      source = $2,
                      office = $3,
@@ -6387,13 +7237,12 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 writeJson(res, 422, { ok: false, message: 'A valid enrollment feed id is required.' });
                 return;
               }
-              await sql.query(`DELETE FROM cashier_registrar_student_enrollment_feed WHERE id = $1`, [id]);
+              await sql.query(`DELETE FROM public.cashier_registrar_student_enrollment_feed WHERE id = $1`, [id]);
               writeJson(res, 200, { ok: true, message: 'Enrollment feed record deleted.', data: { id } });
               return;
             }
 
             if (['approve', 'hold', 'return'].includes(action)) {
-              await ensureCashierWorkflowDemoData();
               const actor = await resolveAdminSession();
               if (!actor) {
                 writeJson(res, 401, { ok: false, message: 'Admin authentication required.' });
@@ -6406,7 +7255,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
 
               const feedRows = (await sql.query(
                 `SELECT *
-                 FROM cashier_registrar_student_enrollment_feed
+                 FROM public.cashier_registrar_student_enrollment_feed
                  WHERE id = $1
                  LIMIT 1`,
                 [id]
@@ -6426,9 +7275,27 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               let linkedBillingId = Number(feedRow.linked_billing_id || 0) || null;
               let linkedBillingCode = toSafeText(feedRow.linked_billing_code);
               let actionMessage = '';
+              const isTransientConnectionError = (error: unknown): boolean => {
+                const message = error instanceof Error ? error.message : String(error || '');
+                return /timeout exceeded when trying to connect|unable to check out connection from the pool|connection terminated due to connection timeout|connect etimedout/i.test(
+                  message
+                );
+              };
+              const wait = async (ms: number): Promise<void> => await new Promise((resolve) => setTimeout(resolve, ms));
+              const withTransientRetry = async <T>(task: () => Promise<T>): Promise<T> => {
+                try {
+                  return await task();
+                } catch (error) {
+                  if (!isTransientConnectionError(error)) throw error;
+                  await wait(180);
+                  return await task();
+                }
+              };
 
               if (action === 'approve') {
-                const billingResult = await upsertEnrollmentFeedBilling(feedRow, actor, remarks || 'Approved from registrar enrollment feed.');
+                const billingResult = await withTransientRetry(
+                  async () => await upsertEnrollmentFeedBilling(feedRow, actor, remarks || 'Approved from registrar enrollment feed.')
+                );
                 linkedBillingId = billingResult.billingId;
                 linkedBillingCode = billingResult.billingCode;
                 nextStage = billingResult.workflowStage || 'student_portal_billing';
@@ -6519,7 +7386,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               }
 
               await sql.query(
-                `UPDATE cashier_registrar_student_enrollment_feed
+                `UPDATE public.cashier_registrar_student_enrollment_feed
                  SET status = $2,
                      decision_notes = $3,
                      linked_billing_id = $4,
@@ -6551,40 +7418,51 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 ]
               );
 
-              await insertModuleActivity(
-                'billing_verification',
-                action === 'approve' ? 'Enrollment Approved' : action === 'hold' ? 'Enrollment On Hold' : 'Enrollment Returned',
-                action === 'approve'
-                  ? `${toSafeText(feedRow.student_name)} approved from registrar feed. ${actionMessage}`
-                  : action === 'hold'
-                    ? `${toSafeText(feedRow.student_name)} placed on hold. ${finalRemarks || 'Awaiting cashier review.'}`
-                    : `${toSafeText(feedRow.student_name)} returned to registrar. ${finalRemarks || 'Awaiting registrar correction.'}`,
-                actorName,
-                'enrollment_feed',
-                toSafeText(feedRow.batch_id) || String(id),
-                {
-                  feedId: id,
-                  action,
-                  previousStatus,
-                  nextStatus,
-                  billingId: linkedBillingId,
-                  billingCode: linkedBillingCode || null
+              void (async () => {
+                try {
+                  await insertModuleActivity(
+                    'billing_verification',
+                    action === 'approve' ? 'Enrollment Approved' : action === 'hold' ? 'Enrollment On Hold' : 'Enrollment Returned',
+                    action === 'approve'
+                      ? `${toSafeText(feedRow.student_name)} approved from registrar feed. ${actionMessage}`
+                      : action === 'hold'
+                        ? `${toSafeText(feedRow.student_name)} placed on hold. ${finalRemarks || 'Awaiting cashier review.'}`
+                        : `${toSafeText(feedRow.student_name)} returned to registrar. ${finalRemarks || 'Awaiting registrar correction.'}`,
+                    actorName,
+                    'enrollment_feed',
+                    toSafeText(feedRow.batch_id) || String(id),
+                    {
+                      feedId: id,
+                      action,
+                      previousStatus,
+                      nextStatus,
+                      billingId: linkedBillingId,
+                      billingCode: linkedBillingCode || null
+                    }
+                  );
+                } catch (error) {
+                  console.warn('[cashier] Unable to write enrollment activity log:', error);
                 }
-              );
+              })();
 
-              await ensureNotificationsTable(sql);
-              await sql.query(
-                `INSERT INTO notifications (recipient_role, recipient_name, channel, type, title, message, entity_type, entity_id, is_read, created_at)
-                 VALUES ($1, $2, 'in_app', $3, $4, $5, 'enrollment_feed', $6, FALSE, NOW())`,
-                [
-                  'cashier',
-                  actorName,
-                  action === 'approve' ? 'billing_activated' : action === 'hold' ? 'billing_on_hold' : 'billing_returned',
-                  action === 'approve' ? 'Enrollment approved' : action === 'hold' ? 'Enrollment placed on hold' : 'Enrollment returned',
-                  actionMessage,
-                  id
-                ]
-              );
+              void (async () => {
+                try {
+                  await sql.query(
+                    `INSERT INTO notifications (recipient_role, recipient_name, channel, type, title, message, entity_type, entity_id, is_read, created_at)
+                     VALUES ($1, $2, 'in_app', $3, $4, $5, 'enrollment_feed', $6, FALSE, NOW())`,
+                    [
+                      'cashier',
+                      actorName,
+                      action === 'approve' ? 'billing_activated' : action === 'hold' ? 'billing_on_hold' : 'billing_returned',
+                      action === 'approve' ? 'Enrollment approved' : action === 'hold' ? 'Enrollment placed on hold' : 'Enrollment returned',
+                      actionMessage,
+                      id
+                    ]
+                  );
+                } catch (error) {
+                  console.warn('[cashier] Unable to create enrollment notification:', error);
+                }
+              })();
 
               const item = await fetchEnrollmentFeedRecordById(id);
               writeJson(res, 200, {
@@ -6671,7 +7549,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                  f.downpayment_amount,
                  f.payload,
                  b.paid_amount
-               FROM cashier_registrar_student_enrollment_feed f
+               FROM public.cashier_registrar_student_enrollment_feed f
                INNER JOIN billing_records b ON b.id = f.linked_billing_id
                WHERE f.id = $1
                  AND COALESCE(f.downpayment_amount, 0) > 0
@@ -6717,7 +7595,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 Number(row.paid_amount || 0),
                 'queued',
                 JSON.stringify(insertPayload),
-                actor?.id || null
+                actor?.admin_profile_id || null
               ]
             )) as Array<Record<string, unknown>>;
 
@@ -7064,8 +7942,17 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           }
 
           if (url.pathname === '/api/cashier/department-handoffs' && (req.method || 'GET').toUpperCase() === 'GET') {
+            try {
+            const queryWithTimeout = async <T>(promise: Promise<T>, ms = 2500): Promise<T> =>
+              await Promise.race([
+                promise,
+                new Promise<never>((_, reject) =>
+                  setTimeout(() => reject(new Error(`Department handoffs route timed out after ${ms}ms`)), ms)
+                )
+              ]);
+            await queryWithTimeout(sql.query('SELECT 1'), 2500);
             await ensureCashierWorkflowDemoData();
-            const rows = (await sql.query(
+            const rows = (await queryWithTimeout(sql.query(
               `SELECT p.id, p.billing_id, p.reference_number, p.amount_paid, p.payment_status, p.reporting_status, p.workflow_stage,
                       p.payment_date::text AS payment_date, b.billing_code,
                       COALESCE(s.full_name, 'Unknown Student') AS full_name,
@@ -7081,7 +7968,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                LEFT JOIN receipt_records r ON r.payment_id = p.id
                ORDER BY p.payment_date DESC NULLS LAST, p.created_at DESC, p.id DESC
                LIMIT 120`
-            )) as Array<{
+            ), 4000)) as Array<{
               id: number;
               billing_id: number | null;
               reference_number: string;
@@ -7208,6 +8095,24 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                 latestItems
               }
             });
+            } catch (error) {
+              console.warn('[cashier] Department handoffs route fallback due to error:', error);
+              writeJson(res, 200, {
+                ok: true,
+                data: {
+                  stats: [
+                    { title: 'Registrar Linked', value: '0', subtitle: 'Cashier records ready for registrar visibility', icon: 'mdi-school-outline', tone: 'blue' },
+                    { title: 'PMED / Admin', value: '0', subtitle: 'Reporting-facing records for PMED and admin reports', icon: 'mdi-domain', tone: 'purple' },
+                    { title: 'Cleared', value: '0', subtitle: 'Payment and official receipt already complete', icon: 'mdi-check-decagram-outline', tone: 'green' },
+                    { title: 'Not Cleared', value: '0', subtitle: 'Records still waiting on payment or receipt completion', icon: 'mdi-alert-circle-outline', tone: 'orange' }
+                  ],
+                  matrix: [],
+                  items: [],
+                  latestItems: []
+                },
+                message: 'Department handoffs are temporarily unavailable. Showing fallback data.'
+              });
+            }
             return;
           }
 
@@ -8801,7 +9706,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             const message = toSafeText(body.message) || 'Billing status update.';
             await sql.query(
               `INSERT INTO notifications (recipient_role, recipient_name, channel, type, title, message, entity_type, entity_id, is_read, created_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,NOW())`,
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,NOW())`,
               ['student', recipient, 'in_app', 'billing_update', subject, message, 'billing', billingId]
             );
             writeJson(res, 200, {
@@ -8891,7 +9796,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             }
             await sql.query(
               `UPDATE notifications
-               SET is_read = TRUE, read_at = NOW()
+               SET is_read = 1, read_at = NOW()
                WHERE id = $1`,
               [notificationId]
             );
@@ -8899,7 +9804,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               `SELECT COUNT(*)::int AS total
                FROM notifications
                WHERE LOWER(recipient_role) IN ('cashier', 'admin')
-                 AND is_read = FALSE`
+                 AND is_read = 0`
             )) as Array<{ total: number }>;
             writeJson(res, 200, { ok: true, data: { unreadCount: Number(unreadRows[0]?.total || 0) } });
             return;
@@ -8909,9 +9814,9 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             await ensureNotificationsTable(sql);
             await sql.query(
               `UPDATE notifications
-               SET is_read = TRUE, read_at = NOW()
+               SET is_read = 1, read_at = NOW()
                WHERE LOWER(recipient_role) IN ('cashier', 'admin')
-                 AND is_read = FALSE`
+                 AND is_read = 0`
             );
             writeJson(res, 200, { ok: true, data: { unreadCount: 0 } });
             return;
@@ -8931,7 +9836,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                   `SELECT COUNT(*)::int AS total
                    FROM notifications
                    WHERE LOWER(recipient_role) IN ('cashier', 'admin')
-                     AND is_read = FALSE`
+                     AND is_read = 0`
                 )) as Array<{ total: number }>;
               } catch (error) {
                 console.warn('[cashier] Unable to count unread notifications during auth hydrate:', error);

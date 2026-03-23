@@ -65,8 +65,28 @@ function resolveApiUrl(segment: string): string {
   return `/api/${segment}`;
 }
 
+function resolveLocalApiUrl(segment: string): string {
+  return `/api/${segment}`;
+}
+
 export async function fetchCashierDepartmentHandoffs(): Promise<CashierDepartmentHandoffSnapshot> {
-  return await fetchApiData<CashierDepartmentHandoffSnapshot>(resolveApiUrl('cashier/department-handoffs'), {
-    ttlMs: 8_000
-  });
+  const configuredUrl = resolveApiUrl('cashier/department-handoffs');
+  try {
+    return await fetchApiData<CashierDepartmentHandoffSnapshot>(configuredUrl, {
+      ttlMs: 8_000
+    });
+  } catch (error) {
+    const configured = import.meta.env.VITE_BACKEND_API_BASE_URL?.trim();
+    const message = error instanceof Error ? error.message : String(error);
+    const shouldRetryLocally =
+      Boolean(configured) &&
+      /authentication required|admin authentication required|html instead of json|request failed \(500\)/i.test(message);
+
+    if (!shouldRetryLocally) throw error;
+
+    return await fetchApiData<CashierDepartmentHandoffSnapshot>(resolveLocalApiUrl('cashier/department-handoffs'), {
+      ttlMs: 8_000,
+      forceRefresh: true
+    });
+  }
 }

@@ -76,7 +76,7 @@ export const useAuthStore = defineStore({
       }
       try {
         const sessionUser = await fetchAdminSession();
-        this.user = sessionUser;
+        this.user = sessionUser || (previousUser?.token === 'offline-session' ? previousUser : null);
       } catch {
         this.user = previousUser;
       }

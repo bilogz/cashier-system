@@ -17,13 +17,19 @@ function shouldUseSsl(connectionString) {
 
 function buildDbConfig() {
   const connectionString = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL || '';
-  const max = Number(process.env.DB_POOL_MAX || 10);
+  const max = Number(process.env.DB_POOL_MAX || 2);
+  const connectionTimeoutMillis = Number(process.env.DB_CONNECT_TIMEOUT_MS || 5000);
+  const idleTimeoutMillis = Number(process.env.DB_IDLE_TIMEOUT_MS || 10000);
+  const statementTimeout = Number(process.env.DB_STATEMENT_TIMEOUT_MS || 10000);
   const ssl = shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined;
 
   if (connectionString) {
     return {
       connectionString,
       max,
+      connectionTimeoutMillis,
+      idleTimeoutMillis,
+      statement_timeout: statementTimeout,
       ...(ssl ? { ssl } : {})
     };
   }
@@ -35,6 +41,9 @@ function buildDbConfig() {
     password: process.env.DB_PASSWORD || '',
     database: process.env.DB_NAME || 'postgres',
     max,
+    connectionTimeoutMillis,
+    idleTimeoutMillis,
+    statement_timeout: statementTimeout,
     ...(ssl ? { ssl } : {})
   };
 }
@@ -49,16 +58,32 @@ function toPgQuery(sql, params) {
 
 function createDbPool() {
   const pool = new Pool(buildDbConfig());
-  return {
-    async query(sql, params) {
-      const { text, values } = toPgQuery(sql, params);
-      const result = await pool.query(text, values);
-      return [result.rows];
-    },
-    async end() {
-      await pool.end();
-    }
-  };
+  pool.on('error', (err) => {
+    console.error('Unexpected error on idle client', err);
+  });
+    const client = {
+      async query(sql, params) {
+        let attempt = 0;
+        while (attempt < 3) {
+          try {
+            const { text, values } = toPgQuery(sql, params);
+            const result = await pool.query(text, values);
+            return [result.rows];
+          } catch (error) {
+            console.error(`[cashier] DB query attempt ${attempt + 1} failed:`, error);
+            if (attempt < 2) {
+              await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
+            }
+            attempt++;
+          }
+        }
+        throw new Error('Failed to query database after multiple retries.');
+      },
+      async end() {
+        await pool.end();
+      },
+    };
+    return client;
 }
 
 export { createDbPool, toPgQuery };

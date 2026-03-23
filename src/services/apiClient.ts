@@ -103,6 +103,13 @@ async function executeFetch<T>(url: string, options: FetchApiDataOptions): Promi
       throw new Error(payload.message || `Request failed (${response.status})`);
     }
     return payload.data as T;
+  } catch (error) {
+    const isAbort = error instanceof DOMException && error.name === 'AbortError';
+    if (isAbort) {
+      const seconds = timeoutMs > 0 ? Math.ceil(timeoutMs / 1000) : 0;
+      throw new Error(seconds ? `Request timed out after ${seconds}s. Please try again.` : 'Request timed out. Please try again.');
+    }
+    throw error;
   } finally {
     if (timer) clearTimeout(timer);
   }
