@@ -298,7 +298,7 @@ onMounted(() => {
 <template>
   <v-card class="hero-banner mb-4" elevation="0">
     <v-card-text class="pa-5">
-      <div class="d-flex flex-wrap align-center justify-space-between ga-4">
+      <div class="d-flex flex-wrap align-start justify-space-between ga-4">
         <div>
           <div class="hero-kicker">Cashier Operations</div>
           <h1 class="text-h4 font-weight-black mb-1">Cashier System Dashboard</h1>
@@ -306,10 +306,23 @@ onMounted(() => {
             Live cashier flow overview based on the current process chart, from Student Portal & Billing up to Completed Transactions.
           </p>
         </div>
-        <div class="hero-side-card">
-          <div class="hero-side-label">Flow Window</div>
-          <div class="hero-side-value">Cashier Online Payment System Flow</div>
-          <div class="hero-side-note">Student Portal & Billing -> Pay Bills -> Payment Processing & Gateway -> Compliance & Documentation -> Completed Transactions</div>
+        <div class="hero-actions-column d-flex flex-column align-stretch ga-3">
+          <v-btn
+            color="white"
+            variant="flat"
+            class="hero-hr-request-btn text-primary font-weight-bold"
+            prepend-icon="mdi-account-plus-outline"
+            rounded="lg"
+            size="large"
+            @click="router.push('/modules/hr-staff-request')"
+          >
+            Request Employee from HR
+          </v-btn>
+          <div class="hero-side-card">
+            <div class="hero-side-label">Flow Window</div>
+            <div class="hero-side-value">Cashier Online Payment System Flow</div>
+            <div class="hero-side-note">Student Portal & Billing -> Pay Bills -> Payment Processing & Gateway -> Compliance & Documentation -> Completed Transactions</div>
+          </div>
         </div>
       </div>
     </v-card-text>
@@ -650,6 +663,16 @@ onMounted(() => {
   color: #fff;
   background: linear-gradient(120deg, #162d84 0%, #2f63cc 54%, #3ea8f0 100%);
   box-shadow: 0 14px 30px rgba(19, 45, 126, 0.22);
+}
+
+.hero-actions-column {
+  flex: 1 1 280px;
+  min-width: min(100%, 280px);
+  max-width: 360px;
+}
+
+.hero-hr-request-btn {
+  box-shadow: 0 4px 14px rgba(8, 20, 52, 0.18);
 }
 
 .hero-kicker {

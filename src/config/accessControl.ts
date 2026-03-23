@@ -131,6 +131,7 @@ export function allowedModuleRoutesForUser(user: AdminUser | null): string[] {
 function isRouteAlwaysAllowed(path: string): boolean {
   return (
     path === '/dashboard/default' ||
+    path === '/modules/hr-staff-request' ||
     path === '/modules/settings' ||
     path === '/profile' ||
     path === '/logout' ||

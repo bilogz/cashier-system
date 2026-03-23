@@ -93,6 +93,15 @@ const MainRoutes = {
       }
     },
     {
+      name: 'HR Staff Request',
+      path: '/modules/hr-staff-request',
+      component: () => import('@/views/cashier/modules/HrStaffRequestPage.vue'),
+      meta: {
+        pageTitle: 'HR Staff Request',
+        pageDescription: 'Submit staffing requests to HR and monitor approval status for cashier and billing staff.'
+      }
+    },
+    {
       name: 'My Profile',
       path: '/profile',
       component: () => import('@/views/profile/MyProfilePage.vue')
