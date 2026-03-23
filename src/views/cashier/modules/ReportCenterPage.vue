@@ -165,9 +165,16 @@ function openSendDialog(item: ReadyCashierReportItem) {
   sendDialog.value = true;
 }
 
-function openSendDialogFromFocus() {
+async function openSendDialogFromFocus() {
   if (!selectedReadyItem.value) {
-    snackbarMessage.value = 'No reconciled cashier record is ready yet. Reconcile a reporting record first, then send it to the selected PMED request.';
+    if (selectedCandidateItem.value && selectedCandidateNeedsReconcile.value) {
+      await reconcileSelectedCandidate();
+      if (selectedReadyItem.value) {
+        sendDialog.value = true;
+        return;
+      }
+    }
+    snackbarMessage.value = 'No reconciled cashier record is ready yet. Select a candidate record and reconcile it first, then send to PMED.';
     snackbar.value = true;
     return;
   }

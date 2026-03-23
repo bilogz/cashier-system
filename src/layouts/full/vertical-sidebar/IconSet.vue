@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import {
+  mdiAccountCheckOutline,
   mdiAccountHeartOutline,
   mdiAccountOutline,
   mdiAccountSearchOutline,
@@ -35,6 +36,7 @@ const props = defineProps<{
 const mdiPathByName: Record<string, string> = {
   'mdi-view-dashboard-outline': mdiViewDashboardOutline,
   'mdi-account-search-outline': mdiAccountSearchOutline,
+  'mdi-account-check-outline': mdiAccountCheckOutline,
   'mdi-file-document-edit-outline': mdiFileDocumentEditOutline,
   'mdi-file-chart-outline': mdiFileChartOutline,
   'mdi-cash-fast': mdiWalletOutline,

@@ -9458,32 +9458,56 @@ app.get('/api/crad-student-list-feed', requireAuth, async (_req, res) => {
          f.academic_year,
          f.downpayment_amount,
          b.paid_amount,
+         b.balance_amount,
+         b.billing_status,
+          CASE
+            WHEN COALESCE(b.paid_amount, 0) >= COALESCE(f.downpayment_amount, 0) THEN TRUE
+            ELSE FALSE
+          END AS ready_to_send,
          c.id AS sent_id,
          c.sent_at::text AS sent_at
        FROM public.cashier_registrar_student_enrollment_feed f
        INNER JOIN billing_records b ON b.id = f.linked_billing_id
        LEFT JOIN crad_student_list_feed c ON c.enrollment_feed_id = f.id
        WHERE COALESCE(f.downpayment_amount, 0) > 0
-         AND LOWER(COALESCE(f.last_action, '')) = 'approve'
-         AND COALESCE(b.paid_amount, 0) >= COALESCE(f.downpayment_amount, 0)
+         AND f.linked_billing_id IS NOT NULL
+         AND LOWER(COALESCE(f.last_action, '')) NOT IN ('hold', 'return')
        ORDER BY f.id DESC`
     );
 
-    const eligibleItems = (Array.isArray(eligibleRows) ? eligibleRows : []).map((row) => ({
-      enrollmentFeedId: Number(row.enrollment_feed_id || 0),
-      billingId: Number(row.billing_id || 0) || null,
-      batchId: cleanTextValue(row.batch_id),
-      studentNo: cleanTextValue(row.student_no),
-      studentName: cleanTextValue(row.student_name),
-      semester: cleanTextValue(row.semester),
-      academicYear: cleanTextValue(row.academic_year),
-      downpaymentAmount: Number(row.downpayment_amount || 0),
-      downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
-      paidAmount: Number(row.paid_amount || 0),
-      paidAmountFormatted: formatCurrency(row.paid_amount || 0),
-      alreadySent: Boolean(row.sent_id),
-      sentAt: row.sent_at ? new Date(String(row.sent_at)).toISOString() : null
-    }));
+    const eligibleItems = (Array.isArray(eligibleRows) ? eligibleRows : []).map((row) => {
+      const downpaymentAmount = Number(row.downpayment_amount || 0);
+      const totalPaidAmount = Number(row.paid_amount || 0);
+      const paidAmount = Math.max(0, Math.min(totalPaidAmount, Math.max(0, downpaymentAmount)));
+      const downpaymentBalanceAmount = Math.max(0, downpaymentAmount - paidAmount);
+      const billingBalanceAmount = downpaymentBalanceAmount;
+      const normalizedBillingStatus = String(row.billing_status || '').trim().toLowerCase();
+      const hasUnpaidBilling = billingBalanceAmount > 0 || ['unpaid', 'partial', 'active', 'verified'].includes(normalizedBillingStatus);
+
+      return {
+        enrollmentFeedId: Number(row.enrollment_feed_id || 0),
+        billingId: Number(row.billing_id || 0) || null,
+        batchId: cleanTextValue(row.batch_id),
+        studentNo: cleanTextValue(row.student_no),
+        studentName: cleanTextValue(row.student_name),
+        semester: cleanTextValue(row.semester),
+        academicYear: cleanTextValue(row.academic_year),
+        downpaymentAmount,
+        downpaymentAmountFormatted: formatCurrency(downpaymentAmount),
+        totalPaidAmount,
+        totalPaidAmountFormatted: formatCurrency(totalPaidAmount),
+        paidAmount,
+        paidAmountFormatted: formatCurrency(paidAmount),
+        downpaymentBalanceAmount,
+        downpaymentBalanceAmountFormatted: formatCurrency(downpaymentBalanceAmount),
+        billingBalanceAmount,
+        billingBalanceAmountFormatted: formatCurrency(billingBalanceAmount),
+        hasUnpaidBilling,
+        readyToSend: true,
+        alreadySent: Boolean(row.sent_id),
+        sentAt: row.sent_at ? new Date(String(row.sent_at)).toISOString() : null
+      };
+    });
 
     const [sentRows] = await pool.query(
       `SELECT id, enrollment_feed_id, student_no, student_name, semester, academic_year, downpayment_amount, paid_amount, status, sent_at::text AS sent_at
@@ -9510,9 +9534,9 @@ app.get('/api/crad-student-list-feed', requireAuth, async (_req, res) => {
     sendOk(res, {
       stats: [
         {
-          title: 'Eligible Paid Students',
-          value: String(eligibleItems.filter((item) => !item.alreadySent).length),
-          subtitle: 'Ready for CRAD feed insertion',
+          title: 'Approved Students',
+          value: String(eligibleItems.length),
+          subtitle: 'Approved registrar rows with billing linked',
           icon: 'mdi-account-check-outline',
           tone: 'green'
         },
@@ -9524,16 +9548,16 @@ app.get('/api/crad-student-list-feed', requireAuth, async (_req, res) => {
           tone: 'blue'
         },
         {
-          title: 'Downpayment Cleared',
+          title: 'Approved Ready',
           value: String(eligibleItems.length),
-          subtitle: 'Paid >= required downpayment',
+          subtitle: 'Approved rows eligible for CRAD',
           icon: 'mdi-cash-check',
           tone: 'purple'
         },
         {
           title: 'Pending Send',
           value: String(eligibleItems.filter((item) => !item.alreadySent).length),
-          subtitle: 'Eligible rows not yet sent',
+          subtitle: 'Approved rows not yet sent',
           icon: 'mdi-clock-outline',
           tone: 'orange'
         }
@@ -9580,13 +9604,14 @@ app.post('/api/crad-student-list-feed', requireAuth, async (req, res) => {
          f.academic_year,
          f.downpayment_amount,
          f.payload,
-         b.paid_amount
+         b.paid_amount,
+         b.balance_amount
        FROM public.cashier_registrar_student_enrollment_feed f
        INNER JOIN billing_records b ON b.id = f.linked_billing_id
        WHERE f.id = ?
          AND COALESCE(f.downpayment_amount, 0) > 0
-         AND LOWER(COALESCE(f.last_action, '')) = 'approve'
-         AND COALESCE(b.paid_amount, 0) >= COALESCE(f.downpayment_amount, 0)
+         AND f.linked_billing_id IS NOT NULL
+         AND LOWER(COALESCE(f.last_action, '')) NOT IN ('hold', 'return')
        LIMIT 1`,
       [enrollmentFeedId]
     );
@@ -9607,6 +9632,7 @@ app.post('/api/crad-student-list-feed', requireAuth, async (req, res) => {
       academic_year: cleanTextValue(row.academic_year),
       downpayment_amount: Number(row.downpayment_amount || 0),
       paid_amount: Number(row.paid_amount || 0),
+      balance_amount: Number(row.balance_amount || 0),
       source_payload: row.payload && typeof row.payload === 'object' ? row.payload : null
     });
 

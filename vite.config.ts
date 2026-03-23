@@ -826,12 +826,14 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
           url.pathname !== '/api/realtime-stream' &&
           url.pathname !== '/api/clinic-sync/status' &&
           url.pathname !== '/api/report-center' &&
+          url.pathname !== '/api/dashboard/hr-requests' &&
           url.pathname !== '/api/cashier/department-handoffs' &&
           url.pathname !== '/api/appointments' &&
           url.pathname !== '/api/admin-auth' &&
           url.pathname !== '/api/admin-profile' &&
           url.pathname !== '/api/student-billing' &&
           url.pathname !== '/api/cashier-registrar-student-enrollment-feed' &&
+          url.pathname !== '/api/crad-student-list-feed' &&
           url.pathname !== '/api/process-payment' &&
           url.pathname !== '/api/generate-receipt' &&
           url.pathname !== '/api/reporting-reconciliation' &&
@@ -7045,32 +7047,56 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                  f.academic_year,
                  f.downpayment_amount,
                  b.paid_amount,
+                 b.balance_amount,
+                 b.billing_status,
+                 CASE
+                   WHEN COALESCE(b.paid_amount, 0) >= COALESCE(f.downpayment_amount, 0) THEN TRUE
+                   ELSE FALSE
+                 END AS ready_to_send,
                  c.id AS sent_id,
                  c.sent_at::text AS sent_at
                FROM public.cashier_registrar_student_enrollment_feed f
                INNER JOIN billing_records b ON b.id = f.linked_billing_id
                LEFT JOIN crad_student_list_feed c ON c.enrollment_feed_id = f.id
                WHERE COALESCE(f.downpayment_amount, 0) > 0
-                 AND LOWER(COALESCE(f.last_action, '')) = 'approve'
-                 AND COALESCE(b.paid_amount, 0) >= COALESCE(f.downpayment_amount, 0)
+                 AND f.linked_billing_id IS NOT NULL
+                 AND LOWER(COALESCE(f.last_action, '')) NOT IN ('hold', 'return')
                ORDER BY f.id DESC`
             )) as Array<Record<string, unknown>>;
 
-            const eligibleItems = eligibleRows.map((row) => ({
-              enrollmentFeedId: Number(row.enrollment_feed_id || 0),
-              billingId: Number(row.billing_id || 0) || null,
-              batchId: toSafeText(row.batch_id),
-              studentNo: toSafeText(row.student_no),
-              studentName: toSafeText(row.student_name),
-              semester: toSafeText(row.semester),
-              academicYear: toSafeText(row.academic_year),
-              downpaymentAmount: Number(row.downpayment_amount || 0),
-              downpaymentAmountFormatted: formatCurrency(row.downpayment_amount || 0),
-              paidAmount: Number(row.paid_amount || 0),
-              paidAmountFormatted: formatCurrency(row.paid_amount || 0),
-              alreadySent: Boolean(row.sent_id),
-              sentAt: row.sent_at ? new Date(String(row.sent_at)).toISOString() : null
-            }));
+            const eligibleItems = eligibleRows.map((row) => {
+              const downpaymentAmount = Number(row.downpayment_amount || 0);
+              const totalPaidAmount = Number(row.paid_amount || 0);
+              const paidAmount = Math.max(0, Math.min(totalPaidAmount, Math.max(0, downpaymentAmount)));
+              const downpaymentBalanceAmount = Math.max(0, downpaymentAmount - paidAmount);
+              const billingBalanceAmount = downpaymentBalanceAmount;
+              const normalizedBillingStatus = String(row.billing_status || '').trim().toLowerCase();
+              const hasUnpaidBilling = billingBalanceAmount > 0 || ['unpaid', 'partial', 'active', 'verified'].includes(normalizedBillingStatus);
+
+              return {
+                enrollmentFeedId: Number(row.enrollment_feed_id || 0),
+                billingId: Number(row.billing_id || 0) || null,
+                batchId: toSafeText(row.batch_id),
+                studentNo: toSafeText(row.student_no),
+                studentName: toSafeText(row.student_name),
+                semester: toSafeText(row.semester),
+                academicYear: toSafeText(row.academic_year),
+                downpaymentAmount,
+                downpaymentAmountFormatted: formatCurrency(downpaymentAmount),
+                totalPaidAmount,
+                totalPaidAmountFormatted: formatCurrency(totalPaidAmount),
+                paidAmount,
+                paidAmountFormatted: formatCurrency(paidAmount),
+                downpaymentBalanceAmount,
+                downpaymentBalanceAmountFormatted: formatCurrency(downpaymentBalanceAmount),
+                billingBalanceAmount,
+                billingBalanceAmountFormatted: formatCurrency(billingBalanceAmount),
+                hasUnpaidBilling,
+                readyToSend: true,
+                alreadySent: Boolean(row.sent_id),
+                sentAt: row.sent_at ? new Date(String(row.sent_at)).toISOString() : null
+              };
+            });
 
             const sentRows = (await sql.query(
               `SELECT id, enrollment_feed_id, student_no, student_name, semester, academic_year, downpayment_amount, paid_amount, status, sent_at::text AS sent_at
@@ -7099,9 +7125,9 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               data: {
                 stats: [
                   {
-                    title: 'Eligible Paid Students',
-                    value: String(eligibleItems.filter((item) => !item.alreadySent).length),
-                    subtitle: 'Ready for CRAD feed insertion',
+                    title: 'Approved Students',
+                    value: String(eligibleItems.length),
+                    subtitle: 'Approved registrar rows with billing linked',
                     icon: 'mdi-account-check-outline',
                     tone: 'green'
                   },
@@ -7113,16 +7139,16 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                     tone: 'blue'
                   },
                   {
-                    title: 'Downpayment Cleared',
+                    title: 'Approved Ready',
                     value: String(eligibleItems.length),
-                    subtitle: 'Paid >= required downpayment',
+                    subtitle: 'Approved rows eligible for CRAD',
                     icon: 'mdi-cash-check',
                     tone: 'purple'
                   },
                   {
                     title: 'Pending Send',
                     value: String(eligibleItems.filter((item) => !item.alreadySent).length),
-                    subtitle: 'Eligible rows not yet sent',
+                    subtitle: 'Approved rows not yet sent',
                     icon: 'mdi-clock-outline',
                     tone: 'orange'
                   }
@@ -7548,13 +7574,14 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                  f.academic_year,
                  f.downpayment_amount,
                  f.payload,
-                 b.paid_amount
+                 b.paid_amount,
+                 b.balance_amount
                FROM public.cashier_registrar_student_enrollment_feed f
                INNER JOIN billing_records b ON b.id = f.linked_billing_id
                WHERE f.id = $1
                  AND COALESCE(f.downpayment_amount, 0) > 0
-                 AND LOWER(COALESCE(f.last_action, '')) = 'approve'
-                 AND COALESCE(b.paid_amount, 0) >= COALESCE(f.downpayment_amount, 0)
+                 AND f.linked_billing_id IS NOT NULL
+                 AND LOWER(COALESCE(f.last_action, '')) NOT IN ('hold', 'return')
                LIMIT 1`,
               [enrollmentFeedId]
             )) as Array<Record<string, unknown>>;
@@ -7575,6 +7602,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               academic_year: toSafeText(row.academic_year),
               downpayment_amount: Number(row.downpayment_amount || 0),
               paid_amount: Number(row.paid_amount || 0),
+              balance_amount: Number(row.balance_amount || 0),
               source_payload: row.payload && typeof row.payload === 'object' ? row.payload : null
             };
 
@@ -8126,8 +8154,11 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
                LEFT JOIN billing_records b ON b.id = p.billing_id
                LEFT JOIN students s ON s.id = b.student_id
                LEFT JOIN receipt_records r ON r.payment_id = p.id
-               WHERE LOWER(COALESCE(p.workflow_stage, '')) = 'reporting_reconciliation'
-                 AND LOWER(COALESCE(p.reporting_status, '')) IN ('logged', 'with_discrepancy', 'reconciled', 'reported')
+               WHERE LOWER(COALESCE(p.reporting_status, '')) IN ('logged', 'with_discrepancy', 'reconciled', 'reported')
+                 AND (
+                   LOWER(COALESCE(p.workflow_stage, '')) IN ('reporting_reconciliation', 'compliance_documentation', 'payment_processing_gateway')
+                   OR LOWER(COALESCE(p.payment_status, '')) IN ('paid', 'posted')
+                 )
                ORDER BY p.payment_date DESC NULLS LAST, p.created_at DESC, p.id DESC
                LIMIT 60`
             )) as Array<{
@@ -8249,6 +8280,16 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               };
             });
 
+            const sentRequestRefs = new Set(
+              mappedSent
+                .map((item) => toSafeText(item.requestReference).toLowerCase())
+                .filter(Boolean)
+            );
+            const mappedRequestsWithStatus = mappedRequests.map((item) => ({
+              ...item,
+              status: sentRequestRefs.has(toSafeText(item.requestReference).toLowerCase()) ? 'matched' : item.status
+            }));
+
             const activityFeed = [
               ...mappedRequests.slice(0, 6).map((item) => ({
                 title: `PMED Request: ${item.reportName}`,
@@ -8271,17 +8312,156 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               ok: true,
               data: {
                 stats: [
-                  { title: 'PMED Requests', value: String(mappedRequests.length), subtitle: 'Inbound financial report requests from PMED', icon: 'mdi-alert-circle-outline', tone: 'purple' },
+                  { title: 'PMED Requests', value: String(mappedRequestsWithStatus.length), subtitle: 'Inbound financial report requests from PMED', icon: 'mdi-alert-circle-outline', tone: 'purple' },
                   { title: 'Ready to Send', value: String(mappedReady.length), subtitle: 'Reconciled cashier reports ready for PMED handoff', icon: 'mdi-file-document-check-outline', tone: 'green' },
                   { title: 'Sent to PMED', value: String(mappedSent.length), subtitle: 'Cashier report packages already delivered to PMED', icon: 'mdi-bank-transfer', tone: 'blue' },
-                  { title: 'Pending Match', value: String(Math.max(mappedRequests.length - mappedReady.length, 0)), subtitle: 'PMED requests waiting for a reconciled cashier record', icon: 'mdi-timer-sand', tone: 'orange' }
+                  {
+                    title: 'Pending Match',
+                    value: String(mappedRequestsWithStatus.filter((item) => String(item.status || '').toLowerCase() !== 'matched').length),
+                    subtitle: 'PMED requests waiting for a reconciled cashier record',
+                    icon: 'mdi-timer-sand',
+                    tone: 'orange'
+                  }
                 ],
-                requests: mappedRequests,
+                requests: mappedRequestsWithStatus,
                 candidateItems: mappedCandidates,
                 readyItems: mappedReady,
                 sentItems: mappedSent,
                 activityFeed
               }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/dashboard/hr-requests' && (req.method || 'GET').toUpperCase() === 'GET') {
+            await sql.query(
+              `CREATE TABLE IF NOT EXISTS cashier_hr_employee_requests (
+                 id BIGSERIAL PRIMARY KEY,
+                 request_reference TEXT NOT NULL UNIQUE,
+                 employee_id BIGINT NULL,
+                 employee_name TEXT NOT NULL,
+                 employee_department TEXT NOT NULL DEFAULT 'Cashier',
+                 request_type TEXT NOT NULL,
+                 details TEXT NULL,
+                 status TEXT NOT NULL DEFAULT 'pending',
+                 requested_by TEXT NULL,
+                 target_department TEXT NOT NULL DEFAULT 'HR',
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+               )`
+            );
+
+            const employeeRows = (await sql.query(
+              `SELECT id, full_name, role, department
+               FROM admin_users
+               WHERE LOWER(COALESCE(department, '')) = 'cashier'
+                 AND LOWER(COALESCE(status, 'active')) = 'active'
+               ORDER BY full_name ASC`
+            )) as Array<{ id: number; full_name: string; role: string; department: string }>;
+
+            const requestRows = (await sql.query(
+              `SELECT id, request_reference, employee_id, employee_name, employee_department, request_type, details, status, requested_by, target_department, created_at::text AS created_at
+               FROM cashier_hr_employee_requests
+               ORDER BY created_at DESC, id DESC
+               LIMIT 60`
+            )) as Array<{
+              id: number;
+              request_reference: string;
+              employee_id: number | null;
+              employee_name: string;
+              employee_department: string;
+              request_type: string;
+              details: string | null;
+              status: string;
+              requested_by: string | null;
+              target_department: string;
+              created_at: string;
+            }>;
+
+            writeJson(res, 200, {
+              ok: true,
+              data: {
+                employees: employeeRows.map((row) => ({
+                  id: Number(row.id),
+                  name: toSafeText(row.full_name),
+                  role: toSafeText(row.role),
+                  department: toSafeText(row.department) || 'Cashier'
+                })),
+                requests: requestRows.map((row) => ({
+                  id: Number(row.id),
+                  requestReference: toSafeText(row.request_reference),
+                  employeeId: Number(row.employee_id || 0) || null,
+                  employeeName: toSafeText(row.employee_name),
+                  employeeDepartment: toSafeText(row.employee_department) || 'Cashier',
+                  requestType: toSafeText(row.request_type),
+                  details: toSafeText(row.details),
+                  status: toSafeText(row.status) || 'pending',
+                  requestedBy: toSafeText(row.requested_by) || 'Cashier',
+                  targetDepartment: toSafeText(row.target_department) || 'HR',
+                  createdAt: toSafeText(row.created_at),
+                  createdAtLabel: formatDateTimeLabel(toSafeText(row.created_at)),
+                  createdAtRelative: formatRelativeTime(row.created_at)
+                }))
+              }
+            });
+            return;
+          }
+
+          if (url.pathname === '/api/dashboard/hr-requests' && (req.method || '').toUpperCase() === 'POST') {
+            await sql.query(
+              `CREATE TABLE IF NOT EXISTS cashier_hr_employee_requests (
+                 id BIGSERIAL PRIMARY KEY,
+                 request_reference TEXT NOT NULL UNIQUE,
+                 employee_id BIGINT NULL,
+                 employee_name TEXT NOT NULL,
+                 employee_department TEXT NOT NULL DEFAULT 'Cashier',
+                 request_type TEXT NOT NULL,
+                 details TEXT NULL,
+                 status TEXT NOT NULL DEFAULT 'pending',
+                 requested_by TEXT NULL,
+                 target_department TEXT NOT NULL DEFAULT 'HR',
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+               )`
+            );
+            const body = await readJsonBody(req);
+            const employeeId = Number(body.employeeId || 0) || null;
+            const employeeName = toSafeText(body.employeeName);
+            const requestType = toSafeText(body.requestType);
+            const details = toSafeText(body.details);
+            if (!employeeName || !requestType) {
+              writeJson(res, 422, { ok: false, message: 'employeeName and requestType are required.' });
+              return;
+            }
+            const actor = await resolveAdminSession();
+            const requestReference = `HR-REQ-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
+            await sql.query(
+              `INSERT INTO cashier_hr_employee_requests (
+                 request_reference, employee_id, employee_name, employee_department, request_type, details, status, requested_by, target_department, created_at, updated_at
+               ) VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,'HR',NOW(),NOW())`,
+              [requestReference, employeeId, employeeName, 'Cashier', requestType, details || null, toSafeText(actor?.full_name || actor?.username || 'Cashier')]
+            );
+            await ensureModuleActivityLogsTable(sql);
+            await insertModuleActivity(
+              'department_reports',
+              'HR Employee Request',
+              `${employeeName} request submitted to HR (${requestType}).`,
+              toSafeText(actor?.full_name || actor?.username || 'Cashier'),
+              'hr_request',
+              requestReference,
+              {
+                source_department: 'cashier',
+                target_department: 'hr',
+                request_reference: requestReference,
+                employee_name: employeeName,
+                request_type: requestType,
+                details: details || null
+              }
+            );
+            writeJson(res, 200, {
+              ok: true,
+              message: `${requestReference} submitted to HR.`,
+              data: { requestReference }
             });
             return;
           }
@@ -9211,6 +9391,7 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
             }
             const nextPaid = Math.min(Number(row.total_amount || 0), Number(row.paid_amount || 0) + Number(row.amount_paid || 0));
             const nextBalance = Math.max(0, Number(row.total_amount || 0) - nextPaid);
+            const receiptNumber = `RCPT-${new Date().getFullYear()}-${String(paymentId).padStart(6, '0')}`;
             await sql.query(
               `UPDATE payment_transactions
                SET payment_status = 'paid',
@@ -9251,18 +9432,19 @@ function neonAppointmentsApiPlugin(databaseUrl?: string): Plugin {
               await sql.query(
                 `UPDATE receipt_records
                  SET workflow_stage = 'compliance_documentation',
+                     receipt_number = COALESCE(NULLIF(TRIM(receipt_number), ''), $2),
                      issued_date = COALESCE(issued_date, NOW()),
-                     remarks = $2
+                     remarks = $3
                  WHERE id = $1`,
-                [existingReceipt[0].id, 'Ready for receipt generation.']
+                [existingReceipt[0].id, receiptNumber, 'Ready for receipt generation.']
               );
             } else {
               await sql.query(
                 `INSERT INTO receipt_records (
                    payment_id, receipt_number, issued_date, receipt_status, workflow_stage, remarks, created_at
                  )
-                 VALUES ($1,NULL,NOW(),'','compliance_documentation',$2,NOW())`,
-                [paymentId, 'Ready for receipt generation.']
+                 VALUES ($1,$2,NOW(),'generated','compliance_documentation',$3,NOW())`,
+                [paymentId, receiptNumber, 'Ready for receipt generation.']
               );
             }
             writeJson(res, 200, {

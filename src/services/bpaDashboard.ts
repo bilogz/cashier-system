@@ -75,6 +75,29 @@ export type DashboardAlertItem = {
   createdAt: string | null;
 };
 
+export type DashboardHrEmployee = {
+  id: number;
+  name: string;
+  role: string;
+  department: string;
+};
+
+export type DashboardHrRequestItem = {
+  id: number;
+  requestReference: string;
+  employeeId: number | null;
+  employeeName: string;
+  employeeDepartment: string;
+  requestType: string;
+  details: string;
+  status: string;
+  requestedBy: string;
+  targetDepartment: string;
+  createdAt: string;
+  createdAtLabel: string;
+  createdAtRelative: string;
+};
+
 function trimTrailingSlashes(value: string): string {
   return value.replace(/\/+$/, '');
 }
@@ -99,4 +122,23 @@ export async function fetchDashboardAlerts(): Promise<{ items: DashboardAlertIte
 
 export async function fetchDashboardCharts(): Promise<DashboardChartsSnapshot> {
   return await fetchApiData<DashboardChartsSnapshot>('/api/dashboard/charts', { ttlMs: 8_000 });
+}
+
+export async function fetchDashboardHrRequestsSnapshot(): Promise<{
+  employees: DashboardHrEmployee[];
+  requests: DashboardHrRequestItem[];
+}> {
+  return await fetchApiData<{ employees: DashboardHrEmployee[]; requests: DashboardHrRequestItem[] }>('/api/dashboard/hr-requests', { ttlMs: 5_000 });
+}
+
+export async function createDashboardHrRequest(payload: {
+  employeeId?: number | null;
+  employeeName: string;
+  requestType: string;
+  details?: string;
+}): Promise<{ requestReference: string; message?: string }> {
+  return await fetchApiData<{ requestReference: string; message?: string }>('/api/dashboard/hr-requests', {
+    method: 'POST',
+    body: payload
+  });
 }

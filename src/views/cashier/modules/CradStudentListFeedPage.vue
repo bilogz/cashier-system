@@ -84,7 +84,7 @@ onMounted(() => {
       <v-card variant="outlined">
         <v-card-item>
           <v-card-title>Eligible Paid Students</v-card-title>
-          <v-card-subtitle>Students whose paid amount reached required downpayment.</v-card-subtitle>
+          <v-card-subtitle>Approved registrar enrollment feed students are eligible to send to CRAD.</v-card-subtitle>
         </v-card-item>
         <v-card-text>
           <v-alert v-if="errorMessage" type="error" variant="tonal" class="mb-4">{{ errorMessage }}</v-alert>
@@ -108,6 +108,9 @@ onMounted(() => {
                 <th>Semester</th>
                 <th>Downpayment</th>
                 <th>Paid Amount</th>
+                <th>Downpayment Balance</th>
+                <th>Billing Balance</th>
+                <th>Billing</th>
                 <th>Status</th>
                 <th class="text-right">Action</th>
               </tr>
@@ -119,6 +122,13 @@ onMounted(() => {
                 <td>{{ item.semester || '--' }}</td>
                 <td>{{ item.downpaymentAmountFormatted }}</td>
                 <td>{{ item.paidAmountFormatted }}</td>
+                <td>{{ item.downpaymentBalanceAmountFormatted }}</td>
+                <td>{{ item.billingBalanceAmountFormatted }}</td>
+                <td>
+                  <v-chip :color="item.hasUnpaidBilling ? 'error' : 'success'" size="small" variant="tonal">
+                    {{ item.hasUnpaidBilling ? 'Unpaid Billing' : 'No Unpaid Billing' }}
+                  </v-chip>
+                </td>
                 <td>
                   <v-chip :color="item.alreadySent ? 'success' : 'warning'" size="small" variant="tonal">
                     {{ item.alreadySent ? 'Sent' : 'Ready to Send' }}
@@ -128,7 +138,7 @@ onMounted(() => {
                   <v-btn
                     color="primary"
                     size="small"
-                    :disabled="item.alreadySent"
+                    :disabled="item.alreadySent || !item.readyToSend"
                     :loading="actionLoadingId === item.enrollmentFeedId"
                     @click="sendToCrad(item)"
                   >
@@ -137,7 +147,7 @@ onMounted(() => {
                 </td>
               </tr>
               <tr v-if="!filteredEligibleItems.length">
-                <td colspan="7" class="text-center text-medium-emphasis py-6">No paid downpayment students found.</td>
+                <td colspan="10" class="text-center text-medium-emphasis py-6">No approved students found.</td>
               </tr>
             </tbody>
           </v-table>

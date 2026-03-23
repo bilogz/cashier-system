@@ -19,13 +19,17 @@ import {
 import CashierAnalyticsCard from '@/components/shared/CashierAnalyticsCard.vue';
 import {
   fetchBpaDashboardSnapshot,
+  fetchDashboardHrRequestsSnapshot,
   fetchDashboardAlerts,
   fetchDashboardCharts,
   fetchDashboardRecentActivities,
+  createDashboardHrRequest,
   type BpaDashboardSnapshot,
   type DashboardActivityItem,
   type DashboardAlertItem,
-  type DashboardChartsSnapshot
+  type DashboardChartsSnapshot,
+  type DashboardHrEmployee,
+  type DashboardHrRequestItem
 } from '@/services/bpaDashboard';
 import {
   fetchCashierDepartmentHandoffs,
@@ -46,6 +50,14 @@ const chartData = ref<DashboardChartsSnapshot>({
 const departmentStats = ref<CashierDepartmentHandoffSnapshot['stats']>([]);
 const departmentMatrix = ref<CashierDepartmentHandoffSnapshot['matrix']>([]);
 const departmentLatestItems = ref<CashierDepartmentHandoffItem[]>([]);
+const hrEmployees = ref<DashboardHrEmployee[]>([]);
+const hrRequests = ref<DashboardHrRequestItem[]>([]);
+const selectedHrEmployeeId = ref<number | null>(null);
+const hrRequestType = ref('Certification Request');
+const hrRequestDetails = ref('');
+const hrRequestSubmitting = ref(false);
+const hrRequestSnackbar = ref(false);
+const hrRequestSnackbarMessage = ref('');
 
 const dashboardIconMap: Record<string, string> = {
   'mdi-arrow-right-thick': mdiArrowRightThick,
@@ -125,12 +137,13 @@ function handoffLabel(status: string): string {
 }
 
 async function loadSnapshot() {
-  const [snapshot, activities, alerts, charts, handoffs] = await Promise.all([
+  const [snapshot, activities, alerts, charts, handoffs, hrSnapshot] = await Promise.all([
     fetchBpaDashboardSnapshot(),
     fetchDashboardRecentActivities(),
     fetchDashboardAlerts(),
     fetchDashboardCharts(),
-    fetchCashierDepartmentHandoffs()
+    fetchCashierDepartmentHandoffs(),
+    fetchDashboardHrRequestsSnapshot()
   ]);
   summaryCards.value = snapshot.summaryCards;
   moduleCards.value = snapshot.moduleCards;
@@ -141,6 +154,46 @@ async function loadSnapshot() {
   departmentStats.value = handoffs.stats;
   departmentMatrix.value = handoffs.matrix;
   departmentLatestItems.value = handoffs.latestItems;
+  hrEmployees.value = hrSnapshot.employees || [];
+  hrRequests.value = hrSnapshot.requests || [];
+  if (!selectedHrEmployeeId.value && hrEmployees.value.length) {
+    selectedHrEmployeeId.value = hrEmployees.value[0].id;
+  }
+}
+
+async function submitHrRequest() {
+  const employee = hrEmployees.value.find((item) => item.id === selectedHrEmployeeId.value);
+  if (!employee) {
+    hrRequestSnackbarMessage.value = 'Select a cashier employee first.';
+    hrRequestSnackbar.value = true;
+    return;
+  }
+  if (!hrRequestType.value.trim()) {
+    hrRequestSnackbarMessage.value = 'Request type is required.';
+    hrRequestSnackbar.value = true;
+    return;
+  }
+
+  hrRequestSubmitting.value = true;
+  try {
+    const response = await createDashboardHrRequest({
+      employeeId: employee.id,
+      employeeName: employee.name,
+      requestType: hrRequestType.value.trim(),
+      details: hrRequestDetails.value.trim()
+    });
+    hrRequestSnackbarMessage.value = response.message || `${employee.name} request submitted to HR.`;
+    hrRequestSnackbar.value = true;
+    hrRequestDetails.value = '';
+    const hrSnapshot = await fetchDashboardHrRequestsSnapshot();
+    hrEmployees.value = hrSnapshot.employees || [];
+    hrRequests.value = hrSnapshot.requests || [];
+  } catch (error) {
+    hrRequestSnackbarMessage.value = error instanceof Error ? error.message : 'Unable to submit HR request.';
+    hrRequestSnackbar.value = true;
+  } finally {
+    hrRequestSubmitting.value = false;
+  }
 }
 
 const collectionChartSeries = computed(() => [
@@ -403,6 +456,75 @@ onMounted(() => {
       </v-card>
     </v-col>
 
+    <v-col cols="12" lg="6">
+      <v-card variant="outlined" class="h-100">
+        <v-card-item>
+          <v-card-title>HR Employee Request (Cashier Department)</v-card-title>
+          <v-card-subtitle>Send employee-related requests from Cashier to HR.</v-card-subtitle>
+        </v-card-item>
+        <v-card-text>
+          <v-row>
+            <v-col cols="12" md="6">
+              <v-select
+                v-model="selectedHrEmployeeId"
+                :items="hrEmployees.map((item) => ({ title: `${item.name} (${item.role})`, value: item.id }))"
+                label="Cashier Employee"
+                variant="outlined"
+                density="comfortable"
+                hide-details
+              />
+            </v-col>
+            <v-col cols="12" md="6">
+              <v-select
+                v-model="hrRequestType"
+                :items="['Certification Request', 'Payroll Concern', 'Leave Validation', 'Employment Record Update']"
+                label="Request Type"
+                variant="outlined"
+                density="comfortable"
+                hide-details
+              />
+            </v-col>
+            <v-col cols="12">
+              <v-textarea
+                v-model="hrRequestDetails"
+                label="Details"
+                variant="outlined"
+                density="comfortable"
+                rows="3"
+                auto-grow
+                hide-details
+              />
+            </v-col>
+            <v-col cols="12" class="pt-0">
+              <v-btn color="primary" :loading="hrRequestSubmitting" @click="submitHrRequest">Send Request to HR</v-btn>
+            </v-col>
+          </v-row>
+        </v-card-text>
+      </v-card>
+    </v-col>
+
+    <v-col cols="12" lg="6">
+      <v-card variant="outlined" class="h-100">
+        <v-card-item>
+          <v-card-title>Recent HR Requests</v-card-title>
+          <v-card-subtitle>Latest requests sent from Cashier to HR.</v-card-subtitle>
+        </v-card-item>
+        <v-card-text>
+          <div v-if="hrRequests.length">
+            <div v-for="item in hrRequests.slice(0, 6)" :key="item.id" class="insight-card">
+              <div class="d-flex justify-space-between ga-3">
+                <div class="font-weight-bold">{{ item.requestReference }}</div>
+                <v-chip size="x-small" color="warning" variant="tonal">{{ item.status }}</v-chip>
+              </div>
+              <div class="text-body-2 text-medium-emphasis mt-1">{{ item.employeeName }} | {{ item.requestType }}</div>
+              <div class="text-caption text-medium-emphasis mt-1">{{ item.createdAtLabel }} | {{ item.createdAtRelative }}</div>
+            </div>
+          </div>
+          <div v-else class="text-body-2 text-medium-emphasis py-4 text-center">No HR requests sent yet.</div>
+        </v-card-text>
+      </v-card>
+    </v-col>
+
     <v-col cols="12" lg="5">
       <v-card variant="outlined" class="h-100">
         <v-card-item>
@@ -519,6 +641,7 @@ onMounted(() => {
       </v-card>
     </v-col>
   </v-row>
+  <v-snackbar v-model="hrRequestSnackbar" color="primary">{{ hrRequestSnackbarMessage }}</v-snackbar>
 </template>
 
 <style scoped>

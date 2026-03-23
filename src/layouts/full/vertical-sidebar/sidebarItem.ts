@@ -40,7 +40,7 @@ const sidebarItem: menu[] = [
   },
   {
     title: 'Paid Student List Feed',
-    icon: 'mdi-account-cash-outline',
+    icon: 'mdi-account-check-outline',
     to: '/modules/billing-verification/crad-student-list-feed'
   },
   {

@@ -10,8 +10,16 @@ export type CradPaidStudentItem = {
   academicYear: string;
   downpaymentAmount: number;
   downpaymentAmountFormatted: string;
+  totalPaidAmount: number;
+  totalPaidAmountFormatted: string;
   paidAmount: number;
   paidAmountFormatted: string;
+  downpaymentBalanceAmount: number;
+  downpaymentBalanceAmountFormatted: string;
+  billingBalanceAmount: number;
+  billingBalanceAmountFormatted: string;
+  hasUnpaidBilling: boolean;
+  readyToSend: boolean;
   alreadySent: boolean;
   sentAt: string | null;
 };
