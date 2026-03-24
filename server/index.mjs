@@ -9667,6 +9667,265 @@ app.post('/api/crad-student-list-feed', requireAuth, async (req, res) => {
   }
 });
 
+app.get('/api/crad/research-payments', async (_req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT
+         b.id                        AS billing_id,
+         b.billing_code,
+         b.semester,
+         b.school_year,
+         b.billing_status,
+         b.total_amount,
+         b.paid_amount               AS billing_paid_amount,
+         b.balance_amount,
+         b.created_at                AS billing_created_at,
+         s.student_no,
+         s.full_name                 AS student_name,
+         s.course,
+         s.year_level,
+         bi.id                       AS item_id,
+         bi.item_code,
+         bi.item_name,
+         bi.category                 AS item_category,
+         bi.amount                   AS item_amount,
+         COALESCE(SUM(pt.amount_paid) FILTER (WHERE pt.payment_status = 'paid'), 0) AS total_paid_amount,
+         COUNT(pt.id) FILTER (WHERE pt.payment_status = 'paid')                     AS paid_tx_count,
+         MIN(pt.payment_date) FILTER (WHERE pt.payment_status = 'paid')             AS first_payment_date,
+         MAX(pt.payment_date) FILTER (WHERE pt.payment_status = 'paid')             AS last_payment_date,
+         STRING_AGG(DISTINCT pt.payment_method, ', ')
+           FILTER (WHERE pt.payment_status = 'paid')                                AS payment_methods,
+         STRING_AGG(DISTINCT rr.receipt_number, ', ')
+           FILTER (WHERE rr.receipt_number IS NOT NULL)                             AS receipt_numbers
+       FROM billing_items bi
+       INNER JOIN billing_records b  ON b.id = bi.billing_id
+       INNER JOIN students s         ON s.id = b.student_id
+       LEFT JOIN payment_transactions pt ON pt.billing_id = b.id
+       LEFT JOIN receipt_records rr      ON rr.payment_id = pt.id
+       WHERE (
+         bi.item_code = 'RESEARCH'
+         OR LOWER(bi.item_name) LIKE '%research%'
+         OR LOWER(bi.item_name) LIKE '%capstone%'
+         OR LOWER(bi.category) = 'research'
+       )
+       GROUP BY
+         b.id, b.billing_code, b.semester, b.school_year, b.billing_status,
+         b.total_amount, b.paid_amount, b.balance_amount, b.created_at,
+         s.student_no, s.full_name, s.course, s.year_level,
+         bi.id, bi.item_code, bi.item_name, bi.category, bi.amount
+       ORDER BY MAX(pt.payment_date) DESC NULLS LAST, b.id DESC
+       LIMIT 300`
+    );
+
+    const items = (Array.isArray(rows) ? rows : []).map((row) => {
+      const itemAmount      = Number(row.item_amount   || 0);
+      const totalPaid       = Number(row.total_paid_amount || 0);
+      const billingPaid     = Number(row.billing_paid_amount || 0);
+      const balance         = Number(row.balance_amount || 0);
+      const billingStatus   = cleanTextValue(row.billing_status) || 'unpaid';
+      const paidTxCount     = Number(row.paid_tx_count || 0);
+
+      // Determine payment type
+      let paymentType;
+      if (paidTxCount > 0 || billingStatus === 'paid') {
+        const effectivePaid = totalPaid > 0 ? totalPaid : billingPaid;
+        if (balance <= 0 || billingStatus === 'paid' || effectivePaid >= itemAmount) {
+          paymentType = 'full_paid';
+        } else {
+          paymentType = 'partial';   // downpayment / partial
+        }
+      } else if (billingStatus === 'partial') {
+        paymentType = 'partial';
+      } else {
+        paymentType = 'unpaid';
+      }
+
+      const effectivePaid = totalPaid > 0 ? totalPaid : billingPaid;
+
+      return {
+        billingId:            Number(row.billing_id || 0),
+        billingCode:          cleanTextValue(row.billing_code),
+        semester:             cleanTextValue(row.semester),
+        schoolYear:           cleanTextValue(row.school_year),
+        billingStatus,
+        totalAmount:          Number(row.total_amount || 0),
+        totalAmountFormatted: formatCurrency(row.total_amount || 0),
+        paidAmount:           effectivePaid,
+        paidAmountFormatted:  formatCurrency(effectivePaid),
+        balanceAmount:        balance,
+        balanceAmountFormatted: formatCurrency(balance),
+        studentNo:            cleanTextValue(row.student_no),
+        studentName:          cleanTextValue(row.student_name),
+        course:               cleanTextValue(row.course),
+        yearLevel:            cleanTextValue(row.year_level),
+        itemId:               Number(row.item_id || 0),
+        itemCode:             cleanTextValue(row.item_code),
+        itemName:             cleanTextValue(row.item_name),
+        itemCategory:         cleanTextValue(row.item_category),
+        itemAmount,
+        itemAmountFormatted:  formatCurrency(itemAmount),
+        paymentType,           // 'full_paid' | 'partial' | 'unpaid'
+        isPaid:               paymentType === 'full_paid',
+        isPartial:            paymentType === 'partial',
+        paymentMethods:       cleanTextValue(row.payment_methods),
+        receiptNumbers:       cleanTextValue(row.receipt_numbers),
+        firstPaymentDate:     row.first_payment_date ? new Date(String(row.first_payment_date)).toISOString() : null,
+        lastPaymentDate:      row.last_payment_date  ? new Date(String(row.last_payment_date)).toISOString()  : null,
+        billingCreatedAt:     row.billing_created_at ? new Date(String(row.billing_created_at)).toISOString() : null,
+      };
+    });
+
+    const paidCount    = items.filter((i) => i.paymentType === 'full_paid').length;
+    const partialCount = items.filter((i) => i.paymentType === 'partial').length;
+    const unpaidCount  = items.filter((i) => i.paymentType === 'unpaid').length;
+
+    // Also build a by-student-no lookup map for quick matching on the CRAD side
+    const byStudentNo = {};
+    for (const item of items) {
+      if (item.studentNo && !byStudentNo[item.studentNo]) {
+        byStudentNo[item.studentNo] = item;
+      }
+    }
+
+    sendOk(res, {
+      stats: [
+        { title: 'Total Records', value: String(items.length),  subtitle: 'Research/capstone fee billing items' },
+        { title: 'Fully Paid',    value: String(paidCount),     subtitle: 'Complete payment confirmed' },
+        { title: 'Downpayment',   value: String(partialCount),  subtitle: 'Partial payment made' },
+        { title: 'Unpaid',        value: String(unpaidCount),   subtitle: 'No payment yet' },
+      ],
+      items,
+      byStudentNo,
+    });
+  } catch (error) {
+    sendError(res, 500, error instanceof Error ? error.message : 'Unable to load CRAD research payments from cashier.');
+  }
+});
+
+// Returns billing + payment status for every student, indexed by student_no.
+// CRAD uses this to show whether students have paid (full / downpayment / partial / unpaid).
+app.get('/api/crad/student-billing-status', async (_req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT
+         s.student_no,
+         s.full_name                         AS student_name,
+         s.course,
+         s.year_level,
+         b.id                                AS billing_id,
+         b.billing_code,
+         b.semester,
+         b.school_year,
+         b.billing_status,
+         b.total_amount,
+         b.paid_amount                       AS billing_paid_amount,
+         b.balance_amount,
+         b.created_at                        AS billing_created_at,
+         COALESCE(f.downpayment_amount, 0)   AS downpayment_required,
+         f.semester                          AS feed_semester,
+         f.academic_year,
+         COALESCE(SUM(pt.amount_paid) FILTER (WHERE pt.payment_status = 'paid'), 0) AS total_paid,
+         COUNT(pt.id) FILTER (WHERE pt.payment_status = 'paid')                     AS paid_tx_count,
+         MAX(pt.payment_date) FILTER (WHERE pt.payment_status = 'paid')             AS last_payment_date,
+         STRING_AGG(DISTINCT pt.payment_method, ', ')
+           FILTER (WHERE pt.payment_status = 'paid')                                AS payment_methods,
+         STRING_AGG(DISTINCT rr.receipt_number, ', ')
+           FILTER (WHERE rr.receipt_number IS NOT NULL)                             AS receipt_numbers
+       FROM students s
+       INNER JOIN billing_records b    ON b.student_id = s.id
+       LEFT JOIN cashier_registrar_student_enrollment_feed f
+              ON LOWER(TRIM(f.student_no)) = LOWER(TRIM(s.student_no))
+       LEFT JOIN payment_transactions pt ON pt.billing_id = b.id
+       LEFT JOIN receipt_records rr      ON rr.payment_id = pt.id
+       GROUP BY
+         s.student_no, s.full_name, s.course, s.year_level,
+         b.id, b.billing_code, b.semester, b.school_year, b.billing_status,
+         b.total_amount, b.paid_amount, b.balance_amount, b.created_at,
+         f.downpayment_amount, f.semester, f.academic_year
+       ORDER BY s.student_no, b.id DESC`
+    );
+
+    // Build by-student-no map (keep the latest / most relevant billing per student)
+    const byStudentNo = {};
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const studentNo      = cleanTextValue(row.student_no);
+      if (!studentNo) continue;
+
+      const totalPaid        = Number(row.total_paid || 0);
+      const billingPaid      = Number(row.billing_paid_amount || 0);
+      const effectivePaid    = totalPaid > 0 ? totalPaid : billingPaid;
+      const balance          = Number(row.balance_amount || 0);
+      const totalAmount      = Number(row.total_amount || 0);
+      const downpayReq       = Number(row.downpayment_required || 0);
+      const billingStatus    = cleanTextValue(row.billing_status) || 'unpaid';
+      const paidTxCount      = Number(row.paid_tx_count || 0);
+
+      let paymentType;
+      if (billingStatus === 'paid' || (effectivePaid > 0 && balance <= 0)) {
+        paymentType = 'full_paid';
+      } else if (effectivePaid > 0 && downpayReq > 0 && effectivePaid >= downpayReq) {
+        paymentType = 'downpayment';   // met the downpayment threshold
+      } else if (effectivePaid > 0 || billingStatus === 'partial') {
+        paymentType = 'partial';       // some payment but below downpayment threshold
+      } else {
+        paymentType = 'unpaid';
+      }
+
+      const entry = {
+        studentNo,
+        studentName:          cleanTextValue(row.student_name),
+        course:               cleanTextValue(row.course),
+        yearLevel:            cleanTextValue(row.year_level),
+        billingId:            Number(row.billing_id || 0),
+        billingCode:          cleanTextValue(row.billing_code),
+        semester:             cleanTextValue(row.feed_semester) || cleanTextValue(row.semester),
+        schoolYear:           cleanTextValue(row.academic_year) || cleanTextValue(row.school_year),
+        billingStatus,
+        totalAmount,
+        totalAmountFormatted:      formatCurrency(totalAmount),
+        paidAmount:                effectivePaid,
+        paidAmountFormatted:       formatCurrency(effectivePaid),
+        balanceAmount:             balance,
+        balanceAmountFormatted:    formatCurrency(balance),
+        downpaymentRequired:       downpayReq,
+        downpaymentRequiredFormatted: formatCurrency(downpayReq),
+        paymentType,
+        isPaid:     paymentType === 'full_paid',
+        isDownpayment: paymentType === 'downpayment',
+        isPartial:  paymentType === 'partial',
+        paymentMethods:  cleanTextValue(row.payment_methods),
+        receiptNumbers:  cleanTextValue(row.receipt_numbers),
+        lastPaymentDate: row.last_payment_date ? new Date(String(row.last_payment_date)).toISOString() : null,
+        billingCreatedAt: row.billing_created_at ? new Date(String(row.billing_created_at)).toISOString() : null,
+      };
+
+      // Keep the entry with the highest paidAmount per student
+      const existing = byStudentNo[studentNo];
+      if (!existing || entry.paidAmount > existing.paidAmount) {
+        byStudentNo[studentNo] = entry;
+      }
+    }
+
+    const items = Object.values(byStudentNo);
+    const paidCount       = items.filter((i) => i.paymentType === 'full_paid').length;
+    const downpayCount    = items.filter((i) => i.paymentType === 'downpayment').length;
+    const partialCount    = items.filter((i) => i.paymentType === 'partial').length;
+    const unpaidCount     = items.filter((i) => i.paymentType === 'unpaid').length;
+
+    sendOk(res, {
+      stats: [
+        { title: 'Fully Paid',   value: String(paidCount),    subtitle: 'Complete payment confirmed' },
+        { title: 'Downpayment',  value: String(downpayCount), subtitle: 'Met downpayment threshold' },
+        { title: 'Partial',      value: String(partialCount), subtitle: 'Some payment, below threshold' },
+        { title: 'Unpaid',       value: String(unpaidCount),  subtitle: 'No payment recorded' },
+      ],
+      byStudentNo,
+    });
+  } catch (error) {
+    sendError(res, 500, error instanceof Error ? error.message : 'Unable to load CRAD student billing status.');
+  }
+});
+
 app.get('/api/module-activity', requireAuth, async (req, res) => {
   try {
     const moduleFilter = String(req.query?.module || 'all').trim().toLowerCase();
